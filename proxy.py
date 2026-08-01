@@ -10,7 +10,7 @@ Includes an integrated web chat UI (llama.cpp's llama-ui) served at /.
 If `textual` is not installed, it is installed automatically via pip.
 
 Usage:
-  python proxy.py              # listens on 0.0.0.0:8080
+  python proxy.py              # listens on 0.0.0.0:8090
   python proxy.py 9090         # listens on 0.0.0.0:9090
   python proxy.py 9090 127.0.0.1   # custom bind address
 """
@@ -25,7 +25,7 @@ import threading
 import subprocess
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 # ── Config file path ──────────────────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -98,10 +98,6 @@ DEFAULTS = {
 # ── Runtime models list (loaded from config) ─────────────────────────────
 MODELS = list(DEFAULTS["models"])
 
-# ── Track which model the web UI has selected ───────────────────────────
-_webui_selected_model = None
-_webui_model_lock = threading.Lock()
-
 # ── Thread-safe shared config ──────────────────────────────────────────────
 _config_lock = threading.Lock()
 _config = dict(DEFAULTS)
@@ -140,7 +136,7 @@ def save_config():
 
 def get_config(key: str):
     with _config_lock:
-        return _config[key]
+        return _config.get(key, DEFAULTS.get(key))
 
 
 def set_config(key: str, value):
@@ -150,7 +146,8 @@ def set_config(key: str, value):
 
 def get_current_model() -> str:
     with _config_lock:
-        return MODELS[_config["model_index"]]
+        idx = max(0, min(_config["model_index"], len(MODELS) - 1))
+        return MODELS[idx]
 
 
 # ── Path rewrite: prefix /api/v1 if not already present ───────────────────
@@ -190,6 +187,12 @@ MIME_TYPES = {
     ".ttf":  "font/ttf",
 }
 
+# ── Request body size limit ────────────────────────────────────────────────
+_MAX_BODY_SIZE = 50 * 1024 * 1024  # 50MB
+
+# ── Shared SSL context for upstream connections ────────────────────────────
+_upstream_ssl_ctx = ssl.create_default_context()
+
 
 class ProxyHandler(BaseHTTPRequestHandler):
     # Reference to the TUI log (set at runtime) so proxy activity shows in the UI.
@@ -218,7 +221,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/props":
             # Parse query params for model-specific props
-            query_params = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in parsed.query and "=" in p) if parsed.query else {}
+            query_params = {k: v[0] for k, v in parse_qs(parsed.query).items()} if parsed.query else {}
             self._handle_props(query_params.get("model"))
             return
         if path == "/health" or path == "/v1/health":
@@ -435,17 +438,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── API: /models/load, /models/unload ──────────────────────────────────
     def _handle_model_load(self):
-        """Track model selection from web UI (all models always available via OpenRouter)."""
-        global _webui_selected_model
+        """Stub for model load/unload (all models always available via OpenRouter)."""
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > _MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b""
         if body:
             try:
                 data = json.loads(body)
                 model = data.get("model", "")
                 if model:
-                    with _webui_model_lock:
-                        _webui_selected_model = model
                     self._log(f"Web UI selected model: {model}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
@@ -464,8 +467,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── Core proxy logic ───────────────────────────────────────────────────
     def _proxy(self):
-        # 1. Read body
+        # 1. Read body (with size limit)
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > _MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
         # 2. Inject current model if missing / empty
@@ -473,9 +479,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 if isinstance(data, dict) and ("model" not in data or not data["model"]):
-                    data["model"] = get_current_model()
+                    current = get_current_model()
+                    data["model"] = current
                     body = json.dumps(data).encode("utf-8")
-                    self._log(f"Injected model: {get_current_model()}")
+                    self._log(f"Injected model: {current}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
 
@@ -496,10 +503,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # 5. Forward to upstream
         host = get_config("host")
-        use_ssl = host not in ("localhost:1234", "localhost:8080") and not host.startswith("localhost:")
+        _local_hosts = ("localhost", "127.0.0.1", "[::1]")
+        use_ssl = not any(host == h or host.startswith(h + ":") for h in _local_hosts)
         if use_ssl:
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(host, context=ctx, timeout=180)
+            conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=180)
         else:
             conn = http.client.HTTPConnection(host, timeout=180)
 
@@ -527,8 +534,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             self._log(f"Error: {e}")
-            if not self.headers_sent:
+            try:
                 self.send_error(502, f"Bad Gateway: {e}")
+            except Exception:
+                pass  # Headers already sent or connection broken
         finally:
             conn.close()
 
@@ -556,56 +565,82 @@ class SettingsScreen(Screen):
         yield Header(show_clock=True)
         with ScrollableContainer(id="settings-screen"):
             yield Static("Settings", classes="screen-title")
+            yield Static("Endpoint Settings", classes="section-title")
+            yield Label("Endpoint")
+            current_host = get_config("host")
+            preset_values = [v for _, v in ENDPOINTS]
+            endpoint_options = [(label, value) for label, value in ENDPOINTS]
+            endpoint_options.append(("Custom", "__custom__"))
+            select_value = current_host if current_host in preset_values else "__custom__"
+            yield Select(
+                endpoint_options,
+                value=select_value,
+                id="endpoint-select",
+            )
+            yield Label("Endpoint Address (host[:port])")
+            yield Input(
+                value=current_host,
+                placeholder="e.g. openrouter.ai or 192.168.1.10:1234",
+                id="host-input",
+            )
+            yield Label("Model")
             yield Select(
                 [(m, m) for m in MODELS],
                 value=MODELS[get_config("model_index")],
                 id="model-select",
             )
+            yield Label("API Key")
             yield Input(
                 value=get_config("api_key"),
                 placeholder="API Key (not needed for local endpoints)",
                 password=True,
                 id="api-key-input",
             )
-            # Endpoint presets dropdown
-            current_host = get_config("host")
-            yield Select(
-                [(label, host) for label, host in ENDPOINTS],
-                value=None,
-                allow_blank=True,
-                id="endpoint-preset",
-                prompt="Quick select endpoint...",
-            )
-            # Editable host input (pre-filled from config)
-            yield Input(
-                value=current_host,
-                placeholder="Endpoint host (e.g. openrouter.ai or localhost:1234)",
-                id="host-input",
-            )
+            yield Static("Server Settings", classes="section-title")
             yield Horizontal(
-                Input(
-                    value=str(get_config("port")),
-                    placeholder="Port",
-                    id="port-input",
+                Vertical(
+                    Label("Port"),
+                    Input(
+                        value=str(get_config("port")),
+                        placeholder="Port (e.g. 8090)",
+                        id="port-input",
+                    ),
                 ),
-                Input(
-                    value=get_config("addr"),
-                    placeholder="Bind Address",
-                    id="addr-input",
+                Vertical(
+                    Label("Bind Address"),
+                    Input(
+                        value=get_config("addr"),
+                        placeholder="Bind address (e.g. 0.0.0.0)",
+                        id="addr-input",
+                    ),
                 ),
             )
             yield Horizontal(
-                Button("💾 Save", id="apply-btn", variant="success"),
-                Button("✕ Cancel", id="back-btn", variant="default"),
-                Button("↻ Restart Server", id="restart-btn", variant="warning"),
+                Button("💾 Save", id="apply-btn", variant="success", compact=True),
+                Button("✕ Cancel", id="back-btn", variant="default", compact=True),
+                Button("↻ Restart Server", id="restart-btn", variant="warning", compact=True),
+                id="settings-buttons",
             )
         yield Footer()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        """When a preset is selected, fill the host input field."""
-        if event.select.id == "endpoint-preset" and event.value is not None:
-            host_input = self.query_one("#host-input", Input)
-            host_input.value = str(event.value)
+        # Picking a preset endpoint fills the editable host field.
+        if event.select.id == "endpoint-select":
+            value = event.select.value
+            if value and value != "__custom__":
+                self.query_one("#host-input", Input).value = str(value)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Typing a custom address flips the dropdown to "Custom".
+        if event.input.id == "host-input":
+            preset_values = [v for _, v in ENDPOINTS]
+            endpoint_select = self.query_one("#endpoint-select", Select)
+            text = event.input.value.strip()
+            if text in preset_values:
+                if endpoint_select.value != text:
+                    endpoint_select.value = text
+            elif endpoint_select.value != "__custom__":
+                endpoint_select.value = "__custom__"
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-btn":
@@ -676,8 +711,8 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Horizontal(
-            Button("⚙ Settings", id="menu-settings", variant="primary"),
-            Button("✕ Quit", id="menu-quit", variant="error"),
+            Button("⚙ Settings", id="menu-settings", variant="primary", compact=True),
+            Button("✕ Quit", id="menu-quit", variant="error", compact=True),
             id="main-toolbar",
         )
         yield Vertical(
@@ -716,8 +751,10 @@ class ProxyTUI(App):
         height: auto;
         padding: 0 1;
     }
+    /* compact=True on the buttons keeps them 1 line tall (like the settings
+       screen buttons) instead of Textual's default 3-line bordered buttons. */
     #main-toolbar Button {
-        min-width: 12;
+        min-width: 10;
         margin-right: 1;
     }
     #log-panel {
@@ -733,15 +770,43 @@ class ProxyTUI(App):
         height: 1fr;
         overflow-y: auto;
     }
-    #settings-screen > Label {
-        margin-top: 0;
+    #settings-screen Label {
+        margin-top: 1;
+        height: 1;
+        color: $text-muted;
+    }
+    #settings-screen Input {
+        height: 1;
+        border: none;
+        padding: 0 1;
+        margin: 0;
+    }
+    #settings-screen Select {
+        height: 1;
+        border: none;
+        margin: 0;
+    }
+    #settings-screen Select > SelectCurrent {
+        height: 1;
+        padding: 0 1;
+        border: none;
+    }
+    #settings-screen Select > SelectOverlay {
+        max-height: 10;
     }
     #settings-screen > Horizontal {
         height: auto;
         margin-top: 0;
     }
+    /* IMPORTANT: inner Verticals MUST stay height: auto.
+       Textual's Vertical/Horizontal containers default to height: 1fr, and an
+       auto-height parent with fr-height children expands to fill ALL available
+       space (Textual issue #3063). Without `height: auto` here, the Port/Bind
+       row stretches to fill the whole screen, pushing the buttons to the
+       bottom and leaving a huge gap. Do not remove this rule. */
     #settings-screen > Horizontal > Vertical {
         width: 1fr;
+        height: auto;
         margin-right: 1;
     }
     #settings-screen > Horizontal > Vertical:last-child {
@@ -749,12 +814,23 @@ class ProxyTUI(App):
     }
     #settings-screen Button {
         width: auto;
-        min-width: 12;
+        min-width: 10;
         margin-right: 1;
+    }
+    #settings-buttons {
+        height: auto;
+        margin-top: 1;
     }
     .screen-title {
         text-style: bold;
-        margin-bottom: 1;
+        height: 1;
+        margin-bottom: 0;
+    }
+    .section-title {
+        text-style: bold;
+        color: $accent;
+        height: 1;
+        margin-top: 1;
     }
     """
 
@@ -771,7 +847,12 @@ def _start_server():
     global _server, _server_thread
     port = get_config("port")
     addr = get_config("addr")
-    _server = ThreadingHTTPServer((addr, port), ProxyHandler)
+    try:
+        _server = ThreadingHTTPServer((addr, port), ProxyHandler)
+    except OSError as e:
+        print(f"[proxy] ERROR: Cannot bind to {addr}:{port} — {e}")
+        print(f"[proxy] Is another instance already running?")
+        sys.exit(1)
     _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _server_thread.start()
     print(f"[proxy] Listening on http://{addr}:{port}")
@@ -786,7 +867,12 @@ if __name__ == "__main__":
     # Load saved config (if any), then allow CLI overrides.
     load_config()
     if len(sys.argv) > 1:
-        set_config("port", int(sys.argv[1]))
+        try:
+            set_config("port", int(sys.argv[1]))
+        except ValueError:
+            print(f"[proxy] ERROR: Invalid port number: {sys.argv[1]}")
+            print(f"[proxy] Usage: python proxy.py [port] [bind_address]")
+            sys.exit(1)
     if len(sys.argv) > 2:
         set_config("addr", sys.argv[2])
 
@@ -795,8 +881,13 @@ if __name__ == "__main__":
         print(f"[proxy] WARNING: Web UI directory not found: {WEBUI_DIR}")
         print(f"[proxy] The web UI will not be available. Run the build first.")
 
-    # Fetch model metadata from OpenRouter (non-blocking for server, blocks startup briefly)
-    fetch_model_metadata()
+    # Fetch model metadata from OpenRouter in background (non-blocking)
+    threading.Thread(target=fetch_model_metadata, daemon=True).start()
 
     _start_server()
-    ProxyTUI().run()
+    try:
+        ProxyTUI().run()
+    finally:
+        if _server:
+            _server.shutdown()
+            _server.server_close()
