@@ -75,6 +75,13 @@ from textual.widgets import (
     Header, Footer, Input, Select, Static, Button, Label, Log,
 )
 
+# ── Available upstream endpoints ──────────────────────────────────────────
+ENDPOINTS = [
+    ("OpenRouter", "openrouter.ai"),
+    ("LM Studio (localhost:1234)", "localhost:1234"),
+    ("llama-server (localhost:8080)", "localhost:8080"),
+]
+
 # ── Default values (used if config.json doesn't exist) ────────────────────
 DEFAULTS = {
     "model_index": 0,
@@ -487,9 +494,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body:
             fwd_headers["Content-Length"] = str(len(body))
 
-        # 5. Forward to OpenRouter
-        ctx = ssl.create_default_context()
-        conn = http.client.HTTPSConnection(get_config("host"), context=ctx, timeout=180)
+        # 5. Forward to upstream
+        host = get_config("host")
+        use_ssl = host not in ("localhost:1234", "localhost:8080") and not host.startswith("localhost:")
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(host, context=ctx, timeout=180)
+        else:
+            conn = http.client.HTTPConnection(host, timeout=180)
 
         try:
             conn.request(self.command, path, body=body, headers=fwd_headers)
@@ -551,14 +563,17 @@ class SettingsScreen(Screen):
             )
             yield Input(
                 value=get_config("api_key"),
-                placeholder="OpenRouter API Key",
+                placeholder="API Key (not needed for local endpoints)",
                 password=True,
                 id="api-key-input",
             )
-            yield Input(
-                value=get_config("host"),
-                placeholder="Target Host",
-                id="host-input",
+            # Find matching endpoint or use first as default
+            current_host = get_config("host")
+            endpoint_value = next((h for _, h in ENDPOINTS if h == current_host), current_host)
+            yield Select(
+                [(label, host) for label, host in ENDPOINTS],
+                value=endpoint_value,
+                id="host-select",
             )
             yield Horizontal(
                 Input(
@@ -604,8 +619,9 @@ class SettingsScreen(Screen):
             set_config("api_key", api_key)
             log.write_line("API key updated.")
         # Host
-        host = self.query_one("#host-input", Input).value.strip()
-        if host:
+        host_select = self.query_one("#host-select", Select)
+        if host_select.value is not None:
+            host = str(host_select.value)
             set_config("host", host)
             log.write_line(f"Target host → {host}")
         # Port / addr are applied on restart
