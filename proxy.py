@@ -88,6 +88,9 @@ DEFAULTS = {
     "models": [
         "xiaomi/mimo-v2.5-pro",
         "deepseek/deepseek-v4-flash-0731",
+        "qwen/qwen3.7-max",
+        "google/gemini-3.5-flash",
+        "moonshotai/kimi-k3",
     ],
     "api_key": "",
     "port": 8090,
