@@ -29,6 +29,12 @@ A quick-to-launch proxy that serves any OpenAI-compatible AI endpoint to your en
 
 **One proxy, many clients, zero client configuration.**
 
+### Screenshots
+
+| Terminal TUI | Web Chat UI |
+|:---:|:---:|
+| ![Terminal TUI](ss01.png) | ![Web Chat UI](ss02.png) |
+
 ### For AI Agent Users (Cline, etc.)
 Just change the API base URL to `http://YOUR_PC_IP:8090/v1` — the proxy handles the API key, model selection, and OpenRouter routing. Switch models from the TUI and all connected agents instantly use the new model.
 
