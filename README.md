@@ -5,14 +5,14 @@ A quick-to-launch proxy that serves any OpenAI-compatible AI endpoint to your en
 **Use cases:**
 - **Homes** — Share a single paid OpenRouter account with all family devices
 - **Testing environments** — Developers and QA can access AI without managing individual API keys
-- **Cline / AI agents** — Point any agent client to `http://YOUR_PC:8080` and it just works
+- **Cline / AI agents** — Point any agent client to `http://YOUR_PC:8090` and it just works
 - **Private chat** — Anyone on the LAN gets a full chat UI without needing their own account
 
 ## What It Does
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Your PC (192.168.1.100:8080)                   │
+│  Your PC (192.168.1.100:8090)                   │
 │                                                  │
 │  proxy.py ──► OpenRouter API ──► AI Models       │
 │      │                                           │
@@ -30,10 +30,10 @@ A quick-to-launch proxy that serves any OpenAI-compatible AI endpoint to your en
 **One proxy, many clients, zero client configuration.**
 
 ### For AI Agent Users (Cline, etc.)
-Just change the API base URL to `http://YOUR_PC_IP:8080/v1` — the proxy handles the API key, model selection, and OpenRouter routing. Switch models from the TUI and all connected agents instantly use the new model.
+Just change the API base URL to `http://YOUR_PC_IP:8090/v1` — the proxy handles the API key, model selection, and OpenRouter routing. Switch models from the TUI and all connected agents instantly use the new model.
 
 ### For Chat Users
-Open `http://YOUR_PC_IP:8080/` in any browser on the network. Full chat interface with conversation management, file attachments, markdown rendering, and model switching — no account needed.
+Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interface with conversation management, file attachments, markdown rendering, and model switching — no account needed.
 
 ## Quick Start
 
@@ -44,8 +44,8 @@ Open `http://YOUR_PC_IP:8080/` in any browser on the network. Full chat interfac
 # 3. Run:
 python proxy.py
 
-# That's it. Open http://localhost:8080/ for the chat UI.
-# Other devices: http://YOUR_IP:8080/
+# That's it. Open http://localhost:8090/ for the chat UI.
+# Other devices: http://YOUR_IP:8090/
 ```
 
 ## Features
@@ -86,7 +86,7 @@ Edit `config.json`:
     "google/gemini-2.5-pro"
   ],
   "api_key": "sk-or-v1-YOUR_OPENROUTER_KEY",
-  "port": 8080,
+  "port": 8090,
   "addr": "0.0.0.0",
   "host": "openrouter.ai"
 }
@@ -97,7 +97,7 @@ Edit `config.json`:
 | `models` | List of OpenRouter model IDs available in the web UI |
 | `model_index` | Default model (0-based index into `models`) |
 | `api_key` | Your OpenRouter API key |
-| `port` | HTTP port (default: 8080) |
+| `port` | HTTP port (default: 8090) |
 | `addr` | Bind address (`0.0.0.0` = all interfaces) |
 | `host` | Upstream API host |
 
@@ -106,16 +106,16 @@ Edit `config.json`:
 ### Cline / AI Agents
 Set the API base URL to:
 ```
-http://YOUR_PC_IP:8080/v1
+http://YOUR_PC_IP:8090/v1
 ```
 No API key needed in the client — the proxy handles it.
 
 ### Any OpenAI-compatible client
-- **Base URL**: `http://YOUR_PC_IP:8080/v1`
+- **Base URL**: `http://YOUR_PC_IP:8090/v1`
 - **API Key**: Leave empty or use anything — the proxy uses its own key
 
 ### Web Browser
-Open `http://YOUR_PC_IP:8080/`
+Open `http://YOUR_PC_IP:8090/`
 
 ## Building the Web UI
 
@@ -151,6 +151,16 @@ build-webui.cmd
 ## How Model Metadata Works
 
 On startup, the proxy fetches the full model catalog from OpenRouter and caches it. The web UI shows real context sizes, max tokens, and capabilities for each model.
+
+## Tested Backends
+
+| Backend | Status | Notes |
+|---------|--------|-------|
+| OpenRouter | ✅ Tested | Full support — streaming, model switching, metadata |
+| LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint |
+| llama.cpp server | ⏳ Pending | Expected to work (OpenAI-compatible API) |
+| Ollama | ⏳ Pending | Expected to work (OpenAI-compatible API) |
+| vLLM | ⏳ Pending | Expected to work (OpenAI-compatible API) |
 
 ## LM Studio Compatible
 

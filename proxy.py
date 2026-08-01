@@ -83,7 +83,7 @@ DEFAULTS = {
         "deepseek/deepseek-v4-flash-0731",
     ],
     "api_key": "",
-    "port": 8080,
+    "port": 8090,
     "addr": "0.0.0.0",
     "host": "openrouter.ai",
 }
