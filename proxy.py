@@ -567,13 +567,20 @@ class SettingsScreen(Screen):
                 password=True,
                 id="api-key-input",
             )
-            # Find matching endpoint or use first as default
+            # Endpoint presets dropdown
             current_host = get_config("host")
-            endpoint_value = next((h for _, h in ENDPOINTS if h == current_host), current_host)
             yield Select(
                 [(label, host) for label, host in ENDPOINTS],
-                value=endpoint_value,
-                id="host-select",
+                value=None,
+                allow_blank=True,
+                id="endpoint-preset",
+                prompt="Quick select endpoint...",
+            )
+            # Editable host input (pre-filled from config)
+            yield Input(
+                value=current_host,
+                placeholder="Endpoint host (e.g. openrouter.ai or localhost:1234)",
+                id="host-input",
             )
             yield Horizontal(
                 Input(
@@ -593,6 +600,12 @@ class SettingsScreen(Screen):
                 Button("↻ Restart Server", id="restart-btn", variant="warning"),
             )
         yield Footer()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """When a preset is selected, fill the host input field."""
+        if event.select.id == "endpoint-preset" and event.value is not None:
+            host_input = self.query_one("#host-input", Input)
+            host_input.value = str(event.value)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "apply-btn":
@@ -618,10 +631,9 @@ class SettingsScreen(Screen):
         if api_key:
             set_config("api_key", api_key)
             log.write_line("API key updated.")
-        # Host
-        host_select = self.query_one("#host-select", Select)
-        if host_select.value is not None:
-            host = str(host_select.value)
+        # Host — use the editable input (presets just fill it)
+        host = self.query_one("#host-input", Input).value.strip()
+        if host:
             set_config("host", host)
             log.write_line(f"Target host → {host}")
         # Port / addr are applied on restart
