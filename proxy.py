@@ -306,10 +306,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── API: /v1/models ────────────────────────────────────────────────────
     def _handle_models(self):
-        """Return model list in OpenAI-compatible format with llama.cpp extensions."""
+        """Return model list in OpenAI-compatible format with context size info."""
         entries = []
         for m in MODELS:
             meta = get_model_meta(m)
+            context_length = meta.get("context_length", 128000)
             entries.append({
                 "id": m,
                 "name": meta.get("name", m),
@@ -318,6 +319,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "owned_by": m.split("/")[0] if "/" in m else "openrouter",
                 "in_cache": True,
                 "path": m,
+                "context_length": context_length,
+                "context_window": context_length,
+                "max_model_len": context_length,
                 "status": {
                     "value": "loaded",
                 },
