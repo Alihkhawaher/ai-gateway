@@ -37,10 +37,23 @@ WEBUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 _model_meta_lock = threading.Lock()
 _model_meta = {}  # model_id -> dict from OpenRouter /api/v1/models
 
+# ── Local backend metadata cache (LM Studio, llama-server) ───────────────
+_local_backend_meta_lock = threading.Lock()
+_local_backend_meta = {}  # Cached props/models from local backends
+
 
 def fetch_model_metadata():
     """Fetch model metadata from OpenRouter and cache it."""
     global _model_meta
+    host = get_config("host")
+    _local_hosts = ("localhost", "127.0.0.1", "[::1]")
+    is_local = any(host == h or host.startswith(h + ":") for h in _local_hosts)
+
+    if is_local:
+        # Skip OpenRouter fetch; fetch from local backend instead
+        fetch_local_backend_metadata()
+        return
+
     try:
         ctx = ssl.create_default_context()
         conn = http.client.HTTPSConnection("openrouter.ai", context=ctx, timeout=30)
@@ -55,10 +68,99 @@ def fetch_model_metadata():
         print(f"[proxy] Could not fetch model metadata: {e}")
 
 
+def fetch_local_backend_metadata():
+    """Fetch model metadata from local backends (LM Studio, llama-server).
+
+    Queries the upstream server's own endpoints to discover model capabilities
+    (vision, audio, etc.) so the web UI can enable multimodal features.
+
+    - llama-server: GET /props → modalities {vision, audio}
+    - LM Studio:    GET /v1/models → model list with details
+    """
+    global _local_backend_meta
+    host = get_config("host")
+
+    try:
+        # ── Try llama-server /props endpoint ──────────────────────────────
+        try:
+            if not any(c in host for c in ("1234",)):  # Avoid for LM Studio
+                conn = http.client.HTTPConnection(host, timeout=10)
+                conn.request("GET", "/props")
+                resp = conn.getresponse()
+                if resp.status == 200:
+                    props = json.loads(resp.read())
+                    with _local_backend_meta_lock:
+                        _local_backend_meta["props"] = props
+                    modalities = props.get("modalities", {})
+                    model_path = props.get("model_path", "unknown")
+                    print(f"[proxy] llama-server model: {model_path}")
+                    print(f"[proxy] llama-server modalities: vision={modalities.get('vision', False)}, "
+                          f"audio={modalities.get('audio', False)}, video={modalities.get('video', False)}")
+                conn.close()
+        except Exception:
+            pass
+
+        # ── Try LM Studio /v1/models endpoint ────────────────────────────
+        try:
+            conn = http.client.HTTPConnection(host, timeout=10)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            if resp.status == 200:
+                data = json.loads(resp.read())
+                models_data = data.get("data", [])
+                with _local_backend_meta_lock:
+                    _local_backend_meta["models"] = models_data
+                    for model in models_data:
+                        mid = model.get("id", "")
+                        if mid:
+                            _local_backend_meta[f"model:{mid}"] = model
+                print(f"[proxy] LM Studio: found {len(models_data)} model(s)")
+            conn.close()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[proxy] Could not fetch local backend metadata: {e}")
+
+
 def get_model_meta(model_id: str) -> dict:
-    """Get cached metadata for a model, or empty dict if not found."""
+    """Get cached metadata for a model, or empty dict if not found.
+
+    Checks OpenRouter metadata first, then falls back to local backend metadata.
+    """
     with _model_meta_lock:
-        return _model_meta.get(model_id, {})
+        meta = _model_meta.get(model_id)
+        if meta:
+            return meta
+
+    # Fallback: check local backend metadata
+    with _local_backend_meta_lock:
+        # Direct model lookup
+        local = _local_backend_meta.get(f"model:{model_id}")
+        if local:
+            return local
+
+        # llama-server props → synthesize metadata for any model
+        props = _local_backend_meta.get("props")
+        if props:
+            modalities = props.get("modalities", {})
+            input_mods = ["text"]
+            if modalities.get("vision"):
+                input_mods.append("image")
+            if modalities.get("audio"):
+                input_mods.append("audio")
+            if modalities.get("video"):
+                input_mods.append("video")
+            return {
+                "id": model_id,
+                "name": model_id,
+                "context_length": props.get("default_generation_settings", {}).get("n_ctx", 128000),
+                "architecture": {
+                    "input_modalities": input_mods,
+                },
+            }
+
+    return {}
 
 # ── Auto-install textual if missing ────────────────────────────────────────
 try:
@@ -306,12 +408,37 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── API: /v1/models ────────────────────────────────────────────────────
     def _handle_models(self):
-        """Return model list in OpenAI-compatible format with context size info."""
+        """Return model list in OpenAI-compatible format with context size and capability info.
+
+        Includes capability metadata in the formats expected by:
+        - Open WebUI: meta.capabilities.{vision, function_calling}
+        - llama.cpp web UI: tags + architecture.input_modalities
+        """
         entries = []
         for m in MODELS:
             meta = get_model_meta(m)
             context_length = meta.get("context_length", 128000)
-            entries.append({
+
+            # Extract capabilities from upstream metadata
+            # OpenRouter provides architecture.input_modalities (e.g. ["text", "image"])
+            # llama-server provides modalities via /props
+            input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
+            output_mods = meta.get("architecture", {}).get("output_modalities", ["text"])
+            has_vision = any(mod in input_mods for mod in ("image", "vision"))
+            has_audio = "audio" in input_mods
+            has_video = "video" in input_mods
+            has_tools = any(mod in input_mods for mod in ("tools", "tool_use"))
+
+            # Build tags array (llama.cpp web UI uses this for modality detection)
+            tags = []
+            if has_vision:
+                tags.append("vision")
+            if has_audio:
+                tags.append("audio")
+            if has_video:
+                tags.append("video")
+
+            entry = {
                 "id": m,
                 "name": meta.get("name", m),
                 "object": "model",
@@ -325,7 +452,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "status": {
                     "value": "loaded",
                 },
-            })
+                # ── llama.cpp web UI format ─────────────────────────────
+                "tags": tags,
+                "architecture": {
+                    "input_modalities": input_mods,
+                    "output_modalities": output_mods,
+                },
+                # ── Open WebUI format ───────────────────────────────────
+                "meta": {
+                    "capabilities": {
+                        "vision": has_vision,
+                        "audio": has_audio,
+                        "video": has_video,
+                        "function_calling": has_tools,
+                    },
+                },
+            }
+
+            entries.append(entry)
         self._send_json({"object": "list", "data": entries})
 
     # ── API: /props ────────────────────────────────────────────────────────
