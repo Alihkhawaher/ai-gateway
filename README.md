@@ -67,6 +67,7 @@ python proxy.py
 - Live proxy log showing all requests
 - Model selection (applies to all connected agent clients)
 - Settings: API key, host, port, bind address
+- Optional: Fetch top intelligent models from OpenRouter (merges with your models)
 - Save/load settings from `config.json`
 
 ### Web Chat UI
@@ -86,15 +87,16 @@ Edit `config.json`:
 {
   "model_index": 0,
   "models": [
+    "xiaomi/mimo-v2.5-pro",
     "deepseek/deepseek-v4-flash-0731",
-    "openai/gpt-4o",
-    "anthropic/claude-sonnet-4",
-    "google/gemini-2.5-pro"
+    "openai/gpt-5.6-luna",
+    "google/gemini-3.5-flash"
   ],
   "api_key": "sk-or-v1-YOUR_OPENROUTER_KEY",
   "port": 8090,
   "addr": "0.0.0.0",
-  "host": "openrouter.ai"
+  "host": "openrouter.ai",
+  "fetch_top_models": false
 }
 ```
 
@@ -106,6 +108,7 @@ Edit `config.json`:
 | `port` | HTTP port (default: 8090) |
 | `addr` | Bind address (`0.0.0.0` = all interfaces) |
 | `host` | Upstream API host |
+| `fetch_top_models` | When `true`, fetches top 20 intelligent models from OpenRouter and merges with your models |
 
 ## Connecting Clients
 
@@ -172,7 +175,7 @@ On startup, the proxy fetches the full model catalog from OpenRouter and caches 
 
 This proxy also works as an LM Studio-compatible API server with a web UI. Any client that expects an OpenAI-compatible endpoint (like LM Studio, Ollama, or LocalAI) can point to this proxy and get access to cloud models through OpenRouter — with the same web chat UI that llama.cpp provides.
 
-**Coming soon:** Model information integration — display model details, capabilities, and parameters directly in the web UI for each configured model.
+Model information (context size, capabilities, modalities) is fetched from OpenRouter and displayed in the web UI for each configured model.
 
 ## License
 
