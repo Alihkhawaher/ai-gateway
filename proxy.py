@@ -68,6 +68,46 @@ def fetch_model_metadata():
         print(f"[proxy] Could not fetch model metadata: {e}")
 
 
+def fetch_top_intelligent_models(limit: int = 20):
+    """Fetch top intelligent models from OpenRouter by intelligence index.
+
+    Uses the /api/v1/models endpoint with sort=intelligence-high-to-low.
+    Merges results with user models (user models first, no duplicates).
+    """
+    global _top_intelligent_models, MODELS
+    host = get_config("host")
+    _local_hosts = ("localhost", "127.0.0.1", "[::1]")
+    is_local = any(host == h or host.startswith(h + ":") for h in _local_hosts)
+
+    if is_local:
+        print("[proxy] Skipping top models fetch (local endpoint)")
+        return
+
+    try:
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection("openrouter.ai", context=ctx, timeout=30)
+        conn.request("GET", "/api/v1/models?sort=intelligence-high-to-low")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        conn.close()
+
+        top_models = [m["id"] for m in data.get("data", [])[:limit]]
+        with _top_models_lock:
+            _top_intelligent_models = top_models
+
+        # Merge with user models: user models first, then top models (no duplicates)
+        user_models = list(get_config("models"))
+        merged = list(user_models)  # Start with user models
+        for m in top_models:
+            if m not in merged:
+                merged.append(m)
+
+        MODELS = merged
+        print(f"[proxy] Fetched {len(top_models)} top intelligent models, merged total: {len(MODELS)}")
+    except Exception as e:
+        print(f"[proxy] Could not fetch top intelligent models: {e}")
+
+
 def fetch_local_backend_metadata():
     """Fetch model metadata from local backends (LM Studio, llama-server).
 
@@ -174,7 +214,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.screen import Screen
 from textual.widgets import (
-    Header, Footer, Input, Select, Static, Button, Label, Log,
+    Header, Footer, Input, Select, Static, Button, Label, Log, Checkbox,
 )
 
 # ── Available upstream endpoints ──────────────────────────────────────────
@@ -189,8 +229,13 @@ DEFAULTS = {
     "model_index": 0,
     "models": [
         "xiaomi/mimo-v2.5-pro",
+        "xiaomi/mimo-v2.5",
         "deepseek/deepseek-v4-flash-0731",
-        "qwen/qwen3.7-max",
+        "openai/gpt-5.6-luna",
+        "z-ai/glm-5.2",
+        "qwen/qwen3.8-max",
+        "qwen/qwen3.7-plus",
+        "qwen/qwen3.7-flash",
         "google/gemini-3.5-flash",
         "moonshotai/kimi-k3",
     ],
@@ -198,10 +243,15 @@ DEFAULTS = {
     "port": 8090,
     "addr": "0.0.0.0",
     "host": "openrouter.ai",
+    "fetch_top_models": False,
 }
 
 # ── Runtime models list (loaded from config) ─────────────────────────────
 MODELS = list(DEFAULTS["models"])
+
+# ── Top intelligent models fetched from OpenRouter ────────────────────────
+_top_intelligent_models = []
+_top_models_lock = threading.Lock()
 
 # ── Thread-safe shared config ──────────────────────────────────────────────
 _config_lock = threading.Lock()
@@ -747,6 +797,12 @@ class SettingsScreen(Screen):
                 password=True,
                 id="api-key-input",
             )
+            yield Static("Model Settings", classes="section-title")
+            yield Checkbox(
+                "Fetch top intelligent models from OpenRouter (merges with your models)",
+                value=get_config("fetch_top_models"),
+                id="fetch-top-models-checkbox",
+            )
             yield Static("Server Settings", classes="section-title")
             yield Horizontal(
                 Vertical(
@@ -804,6 +860,7 @@ class SettingsScreen(Screen):
             self.app.exit()
 
     def _apply_settings(self):
+        global MODELS
         log = ProxyHandler.tui_log
         # Model
         model_select = self.query_one("#model-select", Select)
@@ -822,6 +879,17 @@ class SettingsScreen(Screen):
         if host:
             set_config("host", host)
             log.write_line(f"Target host → {host}")
+        # Fetch top models checkbox
+        fetch_checkbox = self.query_one("#fetch-top-models-checkbox", Checkbox)
+        fetch_enabled = fetch_checkbox.value
+        set_config("fetch_top_models", fetch_enabled)
+        if fetch_enabled:
+            log.write_line("Fetching top intelligent models...")
+            threading.Thread(target=fetch_top_intelligent_models, daemon=True).start()
+        else:
+            # Reset MODELS to user models only
+            MODELS = list(get_config("models"))
+            log.write_line("Top models fetch disabled, using user models only.")
         # Port / addr are applied on restart
         port = self.query_one("#port-input", Input).value.strip()
         addr = self.query_one("#addr-input", Input).value.strip()
@@ -1034,6 +1102,11 @@ if __name__ == "__main__":
 
     # Fetch model metadata from OpenRouter in background (non-blocking)
     threading.Thread(target=fetch_model_metadata, daemon=True).start()
+
+    # Fetch top intelligent models if enabled in config
+    if get_config("fetch_top_models"):
+        print("[proxy] Fetching top intelligent models from OpenRouter...")
+        threading.Thread(target=fetch_top_intelligent_models, daemon=True).start()
 
     _start_server()
     try:
