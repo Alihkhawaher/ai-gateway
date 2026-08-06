@@ -17,6 +17,7 @@ A multi-endpoint proxy that connects to several AI backends simultaneously — O
 │  proxy.py ─┬─► OpenRouter API ──► Cloud AI Models           │
 │            ├─► llama.cpp :8080 ──► Local GGUF Models        │
 │            ├─► LM Studio :1234 ──► Local Models             │
+│            ├─► Ollama :11434 ──► Local Models               │
 │            └─► Custom Endpoint ──► Any OpenAI-compatible     │
 │      │                                                       │
 │      ├── Terminal TUI (endpoint mgmt, model switch)         │
@@ -65,6 +66,7 @@ openrouter/openai/gpt-5.6-luna        → OpenRouter → openai/gpt-5.6-luna
 openrouter/deepseek/deepseek-v4-flash  → OpenRouter → deepseek/deepseek-v4-flash
 llama.cpp/qwen3-8b                     → llama.cpp server → qwen3-8b
 lmstudio/mistral-7b                    → LM Studio → mistral-7b
+ollama/llama3                          → Ollama → llama3
 ```
 
 The `source` prefix is the endpoint name. The rest is the original model ID as known by the upstream endpoint.
@@ -72,14 +74,14 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 ## Features
 
 ### Proxy Server
-- Multi-endpoint support (OpenRouter, LM Studio, llama.cpp, custom)
+- Multi-endpoint support (OpenRouter, LM Studio, llama.cpp, Ollama, custom)
 - Health checking every 30 seconds with status display
 - Automatic model aggregation from all online endpoints
 - Smart routing: model ID prefix → correct endpoint
 - SSE streaming for all endpoints
 - Automatic model injection when client doesn't specify one
 - CORS headers for cross-origin access
-- Auto-discovery of local endpoints (llama-server on :8080, LM Studio on :1234)
+- Auto-discovery of local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
 
 ### Terminal Dashboard (TUI)
 - Live proxy log showing all requests
@@ -97,6 +99,24 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - File attachments (images, PDFs, audio, text)
 - Markdown with syntax highlighting and math formulas
 - Dark/light theme
+
+#### Displaying Full Raw Model Identifiers
+
+By default, the model selector shows parsed, human-friendly model names with badges (e.g. `GLM-4.7-Flash` with a `Q8_0` quantization badge). To see the **full raw model identifier** — including the source prefix and the complete upstream model ID — enable the **"Show raw model names"** option:
+
+1. Open the **Settings** screen (gear icon in the sidebar)
+2. Go to the **Display** section
+3. Toggle **"Show raw model names"** on
+
+When enabled, model names are shown in their complete form, e.g.:
+
+```
+openrouter/ggml-org/GLM-4.7-Flash-GGUF:Q8_0
+llama.cpp/mistral-7b-instruct-v0.3
+lmstudio/llama-3.2-8b-instruct
+```
+
+This is especially useful with the AI Gateway's multi-endpoint setup, since the `source/vendor/model` prefix makes it clear which endpoint serves each model. The setting is saved in the browser's localStorage and applies immediately.
 
 ## Configuration
 
@@ -116,6 +136,13 @@ Edit `config.json`:
       "name": "llama.cpp",
       "type": "llama-server",
       "host": "localhost:8080",
+      "enabled": true,
+      "api_key": ""
+    },
+    {
+      "name": "ollama",
+      "type": "ollama",
+      "host": "localhost:11434",
       "enabled": true,
       "api_key": ""
     }
@@ -148,6 +175,7 @@ Edit `config.json`:
 | `openrouter` | OpenRouter cloud API | `GET /api/v1/models` |
 | `lmstudio` | LM Studio local server | `GET /v1/models` |
 | `llama-server` | llama.cpp server | `GET /health` |
+| `ollama` | Ollama local server | `GET /api/tags` |
 | `custom` | Any OpenAI-compatible endpoint | `GET /v1/models` |
 
 ## Connecting Clients
@@ -201,7 +229,7 @@ build-webui.cmd
 ## How Model Aggregation Works
 
 On startup, the proxy:
-1. Auto-discovers local endpoints (llama-server on :8080, LM Studio on :1234)
+1. Auto-discovers local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
 2. Checks health of all configured endpoints
 3. For OpenRouter: includes only your curated `models` list (not the full 340+ catalog)
 4. For local endpoints: includes all discovered models (typically 1-5 loaded models)
@@ -215,7 +243,7 @@ On startup, the proxy:
 | OpenRouter | ✅ Tested | Full support — streaming, model switching, metadata |
 | LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint |
 | llama.cpp server | ✅ Tested | Health check via `/health`, model info via `/props` |
-| Ollama | ⏳ Pending | Expected to work (OpenAI-compatible API) |
+| Ollama | ✅ Tested | Health check via `/api/tags`, model discovery, OpenAI-compatible chat API |
 | vLLM | ⏳ Pending | Expected to work (OpenAI-compatible API) |
 
 ## LM Studio Compatible
