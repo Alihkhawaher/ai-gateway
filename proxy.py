@@ -36,6 +36,7 @@ ENDPOINT_TYPE_DEFAULTS = {
     "openrouter": {"name": "openrouter", "host": "openrouter.ai"},
     "lmstudio":   {"name": "lmstudio",   "host": "localhost:1234"},
     "llama-server": {"name": "llama.cpp", "host": "localhost:8080"},
+    "ollama":     {"name": "ollama",      "host": "localhost:11434"},
     "custom":     {"name": "custom",      "host": ""},
 }
 
@@ -318,6 +319,14 @@ def check_endpoint_health(ep: dict) -> str:
             conn.close()
             return "online" if resp.status == 200 else "offline"
 
+        elif ep_type == "ollama":
+            conn = http.client.HTTPConnection(host, timeout=10)
+            conn.request("GET", "/api/tags")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            return "online" if resp.status == 200 else "offline"
+
         elif ep_type == "custom":
             conn = _connect_host(host, timeout=10)
             headers = {}
@@ -429,6 +438,40 @@ def fetch_llama_server_models(host: str) -> list:
         return []
 
 
+def fetch_ollama_models(host: str) -> list:
+    """Fetch installed models from Ollama via /api/tags."""
+    try:
+        conn = http.client.HTTPConnection(host, timeout=10)
+        conn.request("GET", "/api/tags")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        conn.close()
+
+        models = []
+        for m in data.get("models", []):
+            model_name = m.get("name", "")
+            if not model_name:
+                continue
+            # Strip :latest suffix for cleaner display
+            if model_name.endswith(":latest"):
+                model_name = model_name[:-7]
+            # Ollama doesn't provide context_length in /api/tags,
+            # use a reasonable default
+            models.append({
+                "id": model_name,
+                "name": model_name,
+                "context_length": 128000,
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                },
+            })
+        return models
+    except Exception as e:
+        print(f"[proxy] Error fetching Ollama models: {e}")
+        return []
+
+
 def fetch_custom_models(host: str, api_key: str) -> list:
     """Fetch models from a custom OpenAI-compatible endpoint."""
     try:
@@ -493,12 +536,14 @@ def aggregate_models():
                 meta["id"] = aggregated_id
                 new_meta[aggregated_id] = meta
 
-        elif ep_type in ("llama-server", "lmstudio", "custom"):
+        elif ep_type in ("llama-server", "lmstudio", "ollama", "custom"):
             # Local endpoints: include all discovered models
             if ep_type == "llama-server":
                 raw_models = fetch_llama_server_models(host)
             elif ep_type == "lmstudio":
                 raw_models = fetch_lmstudio_models(host)
+            elif ep_type == "ollama":
+                raw_models = fetch_ollama_models(host)
             else:
                 raw_models = fetch_custom_models(host, api_key)
 
@@ -545,6 +590,7 @@ def auto_discover_local_endpoints():
     local_probes = [
         {"name": "llama.cpp", "type": "llama-server", "host": "localhost:8080", "probe": "/health"},
         {"name": "lmstudio",  "type": "lmstudio",    "host": "localhost:1234", "probe": "/v1/models"},
+        {"name": "ollama",    "type": "ollama",       "host": "localhost:11434", "probe": "/api/tags"},
     ]
     existing_names = set()
     with _config_lock:
@@ -1019,6 +1065,7 @@ class EndpointEditScreen(ModalScreen):
         ("OpenRouter", "openrouter"),
         ("LM Studio", "lmstudio"),
         ("llama.cpp Server", "llama-server"),
+        ("Ollama", "ollama"),
         ("Custom", "custom"),
     ]
 

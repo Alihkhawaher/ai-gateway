@@ -15,6 +15,7 @@
 - **Endpoint type defaults** — Auto-fills name and host when selecting endpoint type
 - **Custom endpoint type** — Support for any OpenAI-compatible API endpoint
 - **Architecture design document** (`ver2.md`) — Detailed design spec for the multi-endpoint architecture
+- **Web UI: Show raw model names setting** — Settings > Display toggle to display full raw model identifiers (e.g. `openrouter/ggml-org/GLM-4.7-Flash-GGUF:Q8_0`) instead of parsed names with badges
 
 ### Changed
 - **Config format** — Now uses `endpoints` array instead of single `host`/`api_key` top-level fields
