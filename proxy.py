@@ -34,6 +34,7 @@ WEBUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 # ── Endpoint type defaults ───────────────────────────────────────────────
 ENDPOINT_TYPE_DEFAULTS = {
     "openrouter": {"name": "openrouter", "host": "openrouter.ai"},
+    "orcarouter": {"name": "orcarouter", "host": "api.orcarouter.ai"},
     "lmstudio":   {"name": "lmstudio",   "host": "localhost:1234"},
     "llama-server": {"name": "llama.cpp", "host": "localhost:8080"},
     "ollama":     {"name": "ollama",      "host": "localhost:11434"},
@@ -302,6 +303,17 @@ def check_endpoint_health(ep: dict) -> str:
             conn.close()
             return "online" if resp.status == 200 else "offline"
 
+        elif ep_type == "orcarouter":
+            conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=10)
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            conn.request("GET", "/v1/models", headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            return "online" if resp.status == 200 else "offline"
+
         elif ep_type == "llama-server":
             conn = http.client.HTTPConnection(host, timeout=10)
             conn.request("GET", "/health")
@@ -470,6 +482,23 @@ def fetch_ollama_models(host: str) -> list:
         return []
 
 
+def fetch_orcarouter_models(host: str, api_key: str) -> list:
+    """Fetch all models from OrcaRouter."""
+    try:
+        conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=30)
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        conn.request("GET", "/v1/models", headers=headers)
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        conn.close()
+        return data.get("data", [])
+    except Exception as e:
+        print(f"[proxy] Error fetching OrcaRouter models: {e}")
+        return []
+
+
 def fetch_custom_models(host: str, api_key: str) -> list:
     """Fetch models from a custom OpenAI-compatible endpoint."""
     try:
@@ -512,8 +541,8 @@ def aggregate_models():
         host = ep.get("host", "")
         api_key = ep.get("api_key", "")
 
-        if ep_type == "openrouter":
-            # OpenRouter: Fetch metadata for user's curated models AND
+        if ep_type in ("openrouter", "orcarouter"):
+            # OpenRouter / OrcaRouter: Fetch metadata for user's curated models AND
             # top intelligent models.
             or_original_ids = set()
             for um in user_models:
@@ -527,7 +556,10 @@ def aggregate_models():
             if not or_original_ids:
                 continue
             # Fetch full catalog to get metadata
-            all_or = fetch_openrouter_models(host, api_key)
+            if ep_type == "orcarouter":
+                all_or = fetch_orcarouter_models(host, api_key)
+            else:
+                all_or = fetch_openrouter_models(host, api_key)
             or_meta = {m.get("id", ""): m for m in all_or}
             for original_id in or_original_ids:
                 meta = or_meta.get(original_id, {"id": original_id, "name": original_id})
@@ -1022,7 +1054,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         ep_name = target_endpoint.get("name", "unknown")
         ep_type = target_endpoint.get("type", "")
 
-        # 4. Rewrite path (OpenRouter needs /api prefix, local endpoints don't)
+        # 4. Rewrite path (OpenRouter needs /api prefix, OrcaRouter and local endpoints use /v1)
         if ep_type == "openrouter":
             path = rewrite_path(self.path)
         else:
@@ -1115,6 +1147,7 @@ class EndpointEditScreen(ModalScreen):
 
     ENDPOINT_TYPES = [
         ("OpenRouter", "openrouter"),
+        ("OrcaRouter", "orcarouter"),
         ("LM Studio", "lmstudio"),
         ("llama.cpp Server", "llama-server"),
         ("Ollama", "ollama"),

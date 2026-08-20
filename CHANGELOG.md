@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.2.0] — 2026-08-21
+
+See [changelogs/v2.2.0.md](changelogs/v2.2.0.md) for full details.
+
+### Added
+- **OrcaRouter provider** — New cloud endpoint type for OrcaRouter (`api.orcarouter.ai`), an OpenAI-compatible multi-provider gateway supporting OpenAI, Anthropic, Google Gemini, DeepSeek, xAI Grok, Qwen, Kimi, and more
+- OrcaRouter health checking, model fetching (`/v1/models`), and path rewriting
+- OrcaRouter option in TUI endpoint type dropdown
+- New models: DeepSeek V4 Pro, GLM 5.3, Claude Sonnet 5, Qwen 3.8 27B, Kimi K3
+- Uncensored model: `obsidian/Qwen3.6-35B-A3B` via OrcaRouter
+
+### Removed
+- Outdated models: `qwen/qwen3.7-plus`, `qwen/qwen3.7-flash`, `z-ai/glm-5.2`, `deepseek/deepseek-chat`
+
 ## [2.1.0] — 2026-08-21
 
 See [changelogs/v2.1.0.md](changelogs/v2.1.0.md) for full details.
