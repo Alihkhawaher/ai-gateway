@@ -8,6 +8,22 @@ set SRC_DIR=%~dp0webui-src\tools\ui
 set DIST_DIR=%~dp0webui-src\tools\ui\dist
 set DST_DIR=%~dp0webui
 
+:: Guard: webui-src must be a git clone of llama.cpp
+if not exist "%~dp0webui-src\.git" (
+    echo ERROR: webui-src directory is missing or is not a git clone of llama.cpp.
+    echo.
+    echo To build the web UI, first clone the llama.cpp source into webui-src:
+    echo   git clone https://github.com/ggml-org/llama.cpp.git webui-src
+    echo.
+    exit /b 1
+)
+if not exist "%SRC_DIR%" (
+    echo ERROR: Could not find llama.cpp web UI source at "%SRC_DIR%".
+    echo Make sure webui-src is the llama.cpp repository and the tools/ui folder exists.
+    echo.
+    exit /b 1
+)
+
 :: Step 1: Pull latest changes
 echo [1/5] Pulling latest changes from llama.cpp...
 cd /d "%~dp0webui-src"

@@ -56,7 +56,8 @@ Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interfac
 
 ```bash
 # 1. Clone or download this project
-# 2. Edit config.json — add your endpoints and API key
+# 2. Copy config.example.json to config.json and add your endpoints + API keys
+#    (config.json is gitignored — never commit your real API keys)
 # 3. Run:
 python proxy.py
 
@@ -219,10 +220,13 @@ Open `http://YOUR_PC_IP:8090/`
 
 ## Building the Web UI
 
-The web UI only needs to be built once. After building, Python serves the static files directly — no Node.js runtime needed.
+The web UI only needs to be built once. After building, Python serves the static files directly — no Node.js runtime needed. The bundled `webui/` already contains a pre-built copy, so this step is only required when you want to update it.
 
 ```bash
-# Option A: Build from cloned llama.cpp source
+# First-time setup: clone the llama.cpp source (the build script expects it here)
+git clone https://github.com/ggml-org/llama.cpp.git webui-src
+
+# Option A: Build from the cloned llama.cpp source
 build-webui.cmd
 
 # Option B: Use pre-built files from a local llama.cpp build
@@ -234,11 +238,12 @@ build-webui.cmd
 ```
 .
 ├── proxy.py              # Main application (proxy + TUI + static server)
-├── config.json           # Settings (endpoints, models, port)
+├── config.example.json   # Committed template — copy to config.json
+├── config.json           # Your settings (endpoints, models, port) — gitignored
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files
-├── webui-src/            # llama.cpp source (gitignored)
+├── webui-src/            # llama.cpp source (gitignored, see "Building the Web UI")
 ├── ver2.md               # Architecture design document
 ├── .gitignore
 └── README.md

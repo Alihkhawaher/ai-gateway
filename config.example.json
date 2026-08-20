@@ -1,0 +1,48 @@
+{
+  "endpoints": [
+    {
+      "name": "openrouter",
+      "type": "openrouter",
+      "host": "openrouter.ai",
+      "enabled": true,
+      "api_key": "sk-or-v1-YOUR_KEY_HERE"
+    },
+    {
+      "name": "orcarouter",
+      "type": "orcarouter",
+      "host": "api.orcarouter.ai",
+      "enabled": false,
+      "api_key": "sk-orca-YOUR_KEY_HERE"
+    },
+    {
+      "name": "llama.cpp",
+      "type": "llama-server",
+      "host": "localhost:8080",
+      "enabled": true,
+      "api_key": ""
+    },
+    {
+      "name": "lmstudio",
+      "type": "lmstudio",
+      "host": "localhost:1234",
+      "enabled": true,
+      "api_key": ""
+    },
+    {
+      "name": "ollama",
+      "type": "ollama",
+      "host": "localhost:11434",
+      "enabled": true,
+      "api_key": ""
+    }
+  ],
+  "models": [
+    "openrouter/openai/gpt-5.6-luna",
+    "openrouter/deepseek/deepseek-v4-flash-0731",
+    "openrouter/google/gemini-3.5-flash"
+  ],
+  "model_index": 0,
+  "port": 8090,
+  "addr": "0.0.0.0",
+  "fetch_top_models": false
+}
