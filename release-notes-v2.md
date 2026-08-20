@@ -1,8 +1,38 @@
-# AI Gateway v2.0.0
+# AI Gateway Release Notes
 
-## What's New
+## v2.2.0 — 2026-08-21
 
-### Multi-Endpoint Proxy Architecture
+### Added
+- **OrcaRouter provider** — New cloud endpoint type for OrcaRouter (`api.orcarouter.ai`), an OpenAI-compatible multi-provider gateway that routes requests across OpenAI, Anthropic, Google Gemini, DeepSeek, xAI Grok, Alibaba Qwen, Moonshot Kimi, MiniMax, and more at provider cost price
+- OrcaRouter health checking, model fetching, and path rewriting (same protocol as OpenRouter)
+- OrcaRouter option in TUI endpoint type dropdown with auto-filled defaults
+
+**Full Changelog**: https://github.com/Alihkhawaher/ai-gateway/commits/v2.2.0
+
+## v2.1.0 — 2026-08-21
+
+### Added
+- **LM Studio-compatible API endpoint** — `/api/v0/models` and `/api/v1/models` for Cline auto-discovery
+- **TUI footer key bindings** — Settings, Quit, Save, Restart, Back
+- **Server info display** — Main screen shows Listening URL, Web UI URL, and Default model
+
+### Changed
+- TUI layout uses consistent ScrollableContainer styling
+- Settings screen simplified (read-only endpoint table)
+- Top intelligent models persist across health check cycles
+- SSL context reuse for better performance
+
+### Fixed
+- Top models disappearing after health check cycle
+- Unused CSS and variables cleanup
+
+**Full Changelog**: https://github.com/Alihkhawaher/ai-gateway/commits/v2.1.0
+
+## v2.0.0 — 2026-08-06
+
+### What's New
+
+#### Multi-Endpoint Proxy Architecture
 AI Gateway v2 transforms from a single-endpoint proxy into a **multi-endpoint AI routing gateway**. Connect to OpenRouter, LM Studio, llama.cpp, **Ollama**, and any custom OpenAI-compatible endpoint simultaneously through a single unified API.
 
 ### Highlights

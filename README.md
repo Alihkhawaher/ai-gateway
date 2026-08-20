@@ -1,6 +1,6 @@
 # AI Gateway — Multi-Endpoint OpenAI-Compatible Proxy with Web Chat UI
 
-A multi-endpoint proxy that connects to several AI backends simultaneously — OpenRouter, LM Studio, llama.cpp server, and any custom OpenAI-compatible endpoint. It checks their health, aggregates their models into a unified catalog, and routes requests based on model ID prefixes. Works as a single API server for your entire local network.
+A multi-endpoint proxy that connects to several AI backends simultaneously — OpenRouter, OrcaRouter, LM Studio, llama.cpp server, and any custom OpenAI-compatible endpoint. It checks their health, aggregates their models into a unified catalog, and routes requests based on model ID prefixes. Works as a single API server for your entire local network.
 
 **Use cases:**
 - **Homes** — Share a single paid OpenRouter account with all family devices, while also running local models
@@ -15,6 +15,7 @@ A multi-endpoint proxy that connects to several AI backends simultaneously — O
 │  AI Gateway (192.168.1.100:8090)                             │
 │                                                              │
 │  proxy.py ─┬─► OpenRouter API ──► Cloud AI Models           │
+│            ├─► OrcaRouter API ──► Cloud AI Models           │
 │            ├─► llama.cpp :8080 ──► Local GGUF Models        │
 │            ├─► LM Studio :1234 ──► Local Models             │
 │            ├─► Ollama :11434 ──► Local Models               │
@@ -70,6 +71,8 @@ Model IDs use a `source/vendor/model` prefix to route requests to the correct en
 ```
 openrouter/openai/gpt-5.6-luna        → OpenRouter → openai/gpt-5.6-luna
 openrouter/deepseek/deepseek-v4-flash  → OpenRouter → deepseek/deepseek-v4-flash
+orcarouter/openai/gpt-4o-mini          → OrcaRouter → openai/gpt-4o-mini
+orcarouter/anthropic/claude-sonnet-4.6 → OrcaRouter → anthropic/claude-sonnet-4.6
 llama.cpp/qwen3-8b                     → llama.cpp server → qwen3-8b
 lmstudio/mistral-7b                    → LM Studio → mistral-7b
 ollama/llama3                          → Ollama → llama3
@@ -80,7 +83,7 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 ## Features
 
 ### Proxy Server
-- Multi-endpoint support (OpenRouter, LM Studio, llama.cpp, Ollama, custom)
+- Multi-endpoint support (OpenRouter, OrcaRouter, LM Studio, llama.cpp, Ollama, custom)
 - Health checking every 30 seconds with status display
 - Automatic model aggregation from all online endpoints
 - Smart routing: model ID prefix → correct endpoint
@@ -139,6 +142,13 @@ Edit `config.json`:
       "api_key": "sk-or-v1-YOUR_KEY_HERE"
     },
     {
+      "name": "orcarouter",
+      "type": "orcarouter",
+      "host": "api.orcarouter.ai",
+      "enabled": true,
+      "api_key": "sk-orca-YOUR_KEY_HERE"
+    },
+    {
       "name": "llama.cpp",
       "type": "llama-server",
       "host": "localhost:8080",
@@ -179,6 +189,7 @@ Edit `config.json`:
 | Type | Description | Health Check |
 |------|-------------|-------------|
 | `openrouter` | OpenRouter cloud API | `GET /api/v1/models` |
+| `orcarouter` | OrcaRouter cloud API | `GET /api/v1/models` |
 | `lmstudio` | LM Studio local server | `GET /v1/models` |
 | `llama-server` | llama.cpp server | `GET /health` |
 | `ollama` | Ollama local server | `GET /api/tags` |
@@ -253,6 +264,7 @@ On startup, the proxy:
 | Backend | Status | Notes |
 |---------|--------|-------|
 | OpenRouter | ✅ Tested | Full support — streaming, model switching, metadata |
+| OrcaRouter | ✅ Tested | OpenAI-compatible gateway — streaming, tools, vision, multi-provider routing |
 | LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint |
 | llama.cpp server | ✅ Tested | Health check via `/health`, model info via `/props` |
 | Ollama | ✅ Tested | Health check via `/api/tags`, model discovery, OpenAI-compatible chat API |
