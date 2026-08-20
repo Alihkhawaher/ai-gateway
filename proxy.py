@@ -292,8 +292,7 @@ def check_endpoint_health(ep: dict) -> str:
 
     try:
         if ep_type == "openrouter":
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(host, context=ctx, timeout=10)
+            conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=10)
             headers = {}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
@@ -375,8 +374,7 @@ def _modalities_to_input(modalities: dict) -> list:
 def fetch_openrouter_models(host: str, api_key: str) -> list:
     """Fetch all models from OpenRouter."""
     try:
-        ctx = ssl.create_default_context()
-        conn = http.client.HTTPSConnection(host, context=ctx, timeout=30)
+        conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=30)
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -503,7 +501,6 @@ def aggregate_models():
     new_routes = {}
     new_meta = {}
     user_models = list(get_config("models"))
-    user_model_set = set(user_models)
 
     endpoints = get_config("endpoints")
     for ep in endpoints:
@@ -516,15 +513,20 @@ def aggregate_models():
         api_key = ep.get("api_key", "")
 
         if ep_type == "openrouter":
-            # OpenRouter: Only fetch metadata for user's curated models.
-            # Build list of original IDs that belong to this endpoint.
-            or_original_ids = []
+            # OpenRouter: Fetch metadata for user's curated models AND
+            # top intelligent models.
+            or_original_ids = set()
             for um in user_models:
                 if um.startswith(f"{name}/"):
-                    or_original_ids.append(um[len(name) + 1:])
+                    or_original_ids.add(um[len(name) + 1:])
+            # Also include top intelligent models for this endpoint
+            with _top_models_lock:
+                for tm in _top_intelligent_models:
+                    if tm.startswith(f"{name}/"):
+                        or_original_ids.add(tm[len(name) + 1:])
             if not or_original_ids:
                 continue
-            # Fetch full catalog to get metadata, but only keep user's models
+            # Fetch full catalog to get metadata
             all_or = fetch_openrouter_models(host, api_key)
             or_meta = {m.get("id", ""): m for m in all_or}
             for original_id in or_original_ids:
@@ -558,11 +560,17 @@ def aggregate_models():
                 model["id"] = aggregated_id
                 new_meta[aggregated_id] = model
 
-    # Build MODELS list: user models first, then discovered local models
+    # Build MODELS list: user models first, then top intelligent models,
+    # then discovered local models
     merged = []
     for m in user_models:
         if m in new_routes and m not in merged:
             merged.append(m)
+    # Include top intelligent models (fetched from OpenRouter)
+    with _top_models_lock:
+        for m in _top_intelligent_models:
+            if m in new_routes and m not in merged:
+                merged.append(m)
     for m in new_routes:
         if m not in merged:
             merged.append(m)
@@ -671,6 +679,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # API endpoints handled locally
         if path == "/v1/models" or path == "/models":
             self._handle_models()
+            return
+        if path == "/api/v0/models" or path == "/api/v1/models":
+            self._handle_lmstudio_models()
             return
         if path == "/props":
             query_params = {k: v[0] for k, v in parse_qs(parsed.query).items()} if parsed.query else {}
@@ -802,6 +813,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     },
                 },
             }
+            entries.append(entry)
+        self._send_json({"object": "list", "data": entries})
+
+    # ── API: /api/v0/models (LM Studio compatible) ────────────────────────
+    def _handle_lmstudio_models(self):
+        """Return aggregated model list in LM Studio /api/v0/models format.
+
+        Cline's LM Studio provider calls GET {baseUrl}/api/v0/models and
+        expects each model object to include LM Studio-specific fields
+        (type, publisher, arch, quantization, state, max_context_length,
+        loaded_context_length).  We map the gateway's existing metadata
+        into that shape so Cline's dropdown populates automatically.
+        """
+        entries = []
+        for m in MODELS:
+            meta = get_model_meta(m)
+            context_length = meta.get("context_length", 128000)
+
+            input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
+            has_tools = any(mod in input_mods for mod in ("tools", "tool_use"))
+
+            source, original_id = parse_model_id(m)
+
+            capabilities = []
+            if has_tools:
+                capabilities.append("tool_use")
+
+            entry = {
+                "id": m,
+                "object": "model",
+                "type": "llm",
+                "publisher": meta.get("owned_by", source),
+                "arch": meta.get("architecture", {}).get("modality", "unknown"),
+                "compatibility_type": "openai",
+                "quantization": "",
+                "state": "loaded",
+                "max_context_length": context_length,
+                "loaded_context_length": context_length,
+            }
+            if capabilities:
+                entry["capabilities"] = capabilities
             entries.append(entry)
         self._send_json({"object": "list", "data": entries})
 
@@ -1158,20 +1210,20 @@ class EndpointEditScreen(ModalScreen):
 class SettingsScreen(Screen):
     """Settings screen with endpoint management."""
 
-    BINDINGS = [("escape", "app.pop_screen", "Back")]
+    BINDINGS = [
+        ("escape", "app.pop_screen", "Back"),
+        ("ctrl+s", "save_settings", "Save"),
+        ("ctrl+r", "restart_server", "Restart"),
+    ]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with ScrollableContainer(id="settings-screen"):
             yield Static("Settings", classes="screen-title")
 
-            # ── Endpoint Management ────────────────────────────────────
+            # ── Endpoint Status (read-only) ────────────────────────────
             yield Static("Endpoints", classes="section-title")
             yield DataTable(id="endpoint-table")
-            with Horizontal(id="ep-buttons"):
-                Button("+ Add", id="ep-add-btn", variant="success", compact=True)
-                Button("✎ Edit", id="ep-edit-btn", variant="primary", compact=True)
-                Button("✕ Remove", id="ep-remove-btn", variant="error", compact=True)
 
             # ── Model Settings ─────────────────────────────────────────
             yield Static("Model Settings", classes="section-title")
@@ -1204,12 +1256,7 @@ class SettingsScreen(Screen):
                         placeholder="Bind address (e.g. 0.0.0.0)",
                         id="addr-input",
                     )
-
-            with Horizontal(id="settings-buttons"):
-                Button("💾 Save", id="apply-btn", variant="success", compact=True)
-                Button("✕ Cancel", id="back-btn", variant="default", compact=True)
-                Button("↻ Restart Server", id="restart-btn", variant="warning", compact=True)
-        yield Footer()
+        yield Footer(show_command_palette=False)
 
     def on_mount(self) -> None:
         self._populate_endpoint_table()
@@ -1232,63 +1279,11 @@ class SettingsScreen(Screen):
                 key=name,
             )
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "back-btn":
-            self.app.pop_screen()
-        elif event.button.id == "ep-add-btn":
-            self._add_endpoint()
-        elif event.button.id == "ep-edit-btn":
-            self._edit_endpoint()
-        elif event.button.id == "ep-remove-btn":
-            self._remove_endpoint()
-        elif event.button.id == "apply-btn":
-            self._apply_settings()
-        elif event.button.id == "restart-btn":
-            self._restart_server()
+    def action_save_settings(self):
+        self._apply_settings()
 
-    def _add_endpoint(self):
-        def on_result(result):
-            if result:
-                endpoints = list(get_config("endpoints"))
-                endpoints.append(result)
-                set_config("endpoints", endpoints)
-                self._populate_endpoint_table()
-                self._update_model_select()
-        self.app.push_screen(EndpointEditScreen(), on_result)
-
-    def _edit_endpoint(self):
-        table = self.query_one("#endpoint-table", DataTable)
-        if table.cursor_row is None:
-            return
-        row_key = table.get_row_at(table.cursor_row)
-        ep_name = str(row_key[0]) if row_key else ""
-        endpoints = list(get_config("endpoints"))
-        ep = next((e for e in endpoints if e.get("name") == ep_name), None)
-        if not ep:
-            return
-
-        def on_result(result):
-            if result:
-                for i, e in enumerate(endpoints):
-                    if e.get("name") == ep_name:
-                        endpoints[i] = result
-                        break
-                set_config("endpoints", endpoints)
-                self._populate_endpoint_table()
-                self._update_model_select()
-        self.app.push_screen(EndpointEditScreen(endpoint=ep), on_result)
-
-    def _remove_endpoint(self):
-        table = self.query_one("#endpoint-table", DataTable)
-        if table.cursor_row is None:
-            return
-        row_key = table.get_row_at(table.cursor_row)
-        ep_name = str(row_key[0]) if row_key else ""
-        endpoints = list(get_config("endpoints"))
-        endpoints = [e for e in endpoints if e.get("name") != ep_name]
-        set_config("endpoints", endpoints)
-        self._populate_endpoint_table()
-        self._update_model_select()
+    def action_restart_server(self):
+        self._restart_server()
 
     def _update_model_select(self):
         """Refresh the model selector dropdown."""
@@ -1392,37 +1387,46 @@ def fetch_top_intelligent_models(limit: int = 20):
 class MainScreen(Screen):
     """Main screen: toolbar + endpoint status + live log."""
 
-    BINDINGS = [("q", "quit", "Quit")]
+    BINDINGS = [
+        ("s", "open_settings", "Settings"),
+        ("q", "quit", "Quit"),
+    ]
 
     def on_mount(self) -> None:
         log = self.query_one("#log", Log)
         ProxyHandler.tui_log = log
-        log.write_line("TUI ready — proxy is running.")
-        log.write_line(f"Listening : http://{get_config('addr')}:{get_config('port')}")
-        log.write_line(f"Web UI    : http://{get_config('addr')}:{get_config('port')}/")
-        log.write_line(f"Default   : {get_current_model()}")
         self._update_endpoint_status()
+        self._show_server_info()
         # Periodic status refresh
         self.set_interval(5.0, self._update_endpoint_status)
 
+    def _show_server_info(self):
+        """Display server info after endpoints."""
+        info = self.query_one("#server-info", Static)
+        addr = get_config("addr")
+        port = get_config("port")
+        # Use localhost for display when binding to all interfaces
+        display_host = "localhost" if addr in ("0.0.0.0", "::") else addr
+        url = f"http://{display_host}:{port}"
+        model = get_current_model()
+        info.update(
+            f"Listening : {url}\n"
+            f"Web UI    : {url}/\n"
+            f"Default   : {model}"
+        )
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        yield Horizontal(
-            Button("⚙ Settings", id="menu-settings", variant="primary", compact=True),
-            Button("✕ Quit", id="menu-quit", variant="error", compact=True),
-            id="main-toolbar",
-        )
-        yield Vertical(
-            Static("Endpoints", classes="screen-title"),
-            Static("Loading...", id="endpoint-status"),
-            id="endpoint-panel",
-        )
-        yield Vertical(
-            Static("Proxy Log", classes="screen-title"),
-            Log(id="log", highlight=True),
-            id="log-panel",
-        )
+        with ScrollableContainer(id="main-screen"):
+            yield Static("Endpoints", classes="section-title")
+            yield Static("Loading...", id="endpoint-status")
+            yield Static("", id="server-info")
+            yield Static("Proxy Log", classes="section-title")
+            yield Log(id="log", highlight=True)
         yield Footer()
+
+    def action_open_settings(self):
+        self.app.push_screen(SettingsScreen())
 
     def _update_endpoint_status(self):
         """Refresh the endpoint status display."""
@@ -1446,12 +1450,6 @@ class MainScreen(Screen):
             lines.append(f"  {icon} {name:<12} → {host:<24} [{status}]  {model_count} models")
         status_widget.update("\n".join(lines) if lines else "  No endpoints configured")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "menu-settings":
-            self.app.push_screen(SettingsScreen())
-        elif event.button.id == "menu-quit":
-            self.app.exit()
-
     def action_quit(self):
         self.app.exit()
 
@@ -1472,31 +1470,22 @@ class ProxyTUI(App):
     }
 
     CSS = """
-    #main-toolbar {
-        dock: top;
-        width: 100%;
-        height: auto;
-        padding: 0 1;
-    }
-    #main-toolbar Button {
-        min-width: 10;
-        margin-right: 1;
-    }
-    #endpoint-panel {
-        height: auto;
-        width: 100%;
-        padding: 0 1;
+    #main-screen {
+        padding: 0 2;
+        height: 1fr;
     }
     #endpoint-status {
         height: auto;
         width: 100%;
+        margin-bottom: 1;
     }
-    #log-panel {
-        height: 1fr;
+    #server-info {
+        height: auto;
         width: 100%;
+        margin-bottom: 1;
     }
     #log {
-        height: 1fr;
+        height: 20;
         width: 100%;
     }
     #settings-screen {
@@ -1543,19 +1532,6 @@ class ProxyTUI(App):
     #settings-screen Button {
         width: auto;
         min-width: 10;
-        margin-right: 1;
-    }
-    #settings-buttons {
-        height: auto;
-        margin-top: 1;
-    }
-    #ep-buttons {
-        height: auto;
-        margin-top: 0;
-    }
-    #ep-buttons Button {
-        width: auto;
-        min-width: 8;
         margin-right: 1;
     }
     #endpoint-table {

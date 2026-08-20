@@ -40,7 +40,13 @@ A multi-endpoint proxy that connects to several AI backends simultaneously — O
 | ![Terminal TUI](ss01.png) | ![Console GUI](ss02.png) | ![Web UI](ss03.png) |
 
 ### For AI Agent Users (Cline, etc.)
-Just change the API base URL to `http://YOUR_PC_IP:8090/v1` — the proxy handles the API key, model selection, and routing. Switch models from the TUI and all connected agents instantly use the new model.
+The gateway exposes both OpenAI-compatible and LM Studio-compatible endpoints. For the best experience with Cline:
+
+1. Select **"LM Studio"** as the API provider in Cline
+2. Set the base URL to `http://YOUR_PC_IP:8090` (no `/v1` needed)
+3. The model dropdown populates automatically
+
+The proxy handles the API key, model selection, and routing. Switch models from the TUI and all connected agents instantly use the new model.
 
 ### For Chat Users
 Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interface with conversation management, file attachments, markdown rendering, and model switching — no account needed.
@@ -86,9 +92,9 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 ### Terminal Dashboard (TUI)
 - Live proxy log showing all requests
 - Endpoint status panel (online/offline with model counts)
-- Endpoint management (add, edit, remove) with DataTable UI
-- Model selection with source-prefixed IDs
-- Settings: port, bind address, fetch top models toggle
+- Settings with model selection, port, bind address, fetch top models toggle
+- Footer key bindings: `s` Settings, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
+- Consistent scrollable layout across all screens
 - Save/load settings from `config.json`
 
 ### Web Chat UI
@@ -180,12 +186,18 @@ Edit `config.json`:
 
 ## Connecting Clients
 
-### Cline / AI Agents
-Set the API base URL to:
-```
-http://YOUR_PC_IP:8090/v1
-```
-No API key needed in the client — the proxy handles it.
+### Cline (Recommended)
+Use the **LM Studio** provider in Cline for automatic model discovery:
+1. **API Provider**: Select "LM Studio"
+2. **Base URL**: `http://YOUR_PC_IP:8090`
+3. **API Key**: Leave empty — the proxy handles it
+
+The model dropdown will populate automatically with all models from the gateway.
+
+### Cline (Alternative)
+Use the **OpenAI Compatible** provider:
+- **Base URL**: `http://YOUR_PC_IP:8090/v1`
+- **API Key**: Any non-empty string (e.g., `sk-placeholder`)
 
 ### Any OpenAI-compatible client
 - **Base URL**: `http://YOUR_PC_IP:8090/v1`
@@ -248,7 +260,20 @@ On startup, the proxy:
 
 ## LM Studio Compatible
 
-This proxy also works as an LM Studio-compatible API server with a web UI. Any client that expects an OpenAI-compatible endpoint can point to this proxy and get access to cloud models through OpenRouter — with the same web chat UI that llama.cpp provides.
+This proxy exposes LM Studio-compatible endpoints (`/api/v0/models`, `/api/v1/models`) alongside the standard OpenAI-compatible endpoints (`/v1/models`). This means:
+
+- **Cline's LM Studio provider** can auto-discover models from the gateway
+- **Any LM Studio-compatible client** can connect and get access to cloud models through OpenRouter
+- **The web chat UI** works with all models from all endpoints
+
+### API Endpoints
+
+| Endpoint | Format | Purpose |
+|----------|--------|---------|
+| `GET /v1/models` | OpenAI standard | Standard clients, OpenAI Compatible provider |
+| `GET /api/v0/models` | LM Studio | Cline LM Studio provider, LM Studio clients |
+| `GET /api/v1/models` | LM Studio | Alias for `/api/v0/models` |
+| `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
 
 ## License
 
