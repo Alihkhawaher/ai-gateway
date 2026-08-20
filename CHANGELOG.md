@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.1.0] — 2026-08-21
+
+See [changelogs/v2.1.0.md](changelogs/v2.1.0.md) for full details.
+
+### Added
+- LM Studio-compatible API endpoint (`/api/v0/models`, `/api/v1/models`) for Cline auto-discovery
+- TUI footer key bindings (Settings, Quit, Save, Restart, Back)
+- Server info display on main screen
+
+### Changed
+- TUI layout uses consistent ScrollableContainer styling
+- Settings screen simplified (read-only endpoint table)
+- Top intelligent models persist across health check cycles
+- SSL context reuse for better performance
+
+### Fixed
+- Top models disappearing after health check cycle
+- Unused CSS and variables cleanup
+
 ## [2.0.0] — 2026-08-06
 
 ### Added
