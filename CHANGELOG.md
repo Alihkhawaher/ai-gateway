@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.3.0] — 2026-08-21
+
+See [changelogs/v2.3.0.md](changelogs/v2.3.0.md) for full details.
+
+### Added
+- `config.example.json` — committed config template with placeholder keys
+- Functional endpoint management TUI (Add / Edit / Remove)
+- `/cors-proxy` endpoint (llama.cpp/llama-ui compatible)
+- `/models/load` now sets the model as the new default
+
+### Changed
+- Model catalog caching (5-minute TTL) to avoid re-downloading on every health check
+- Smarter routing — clear 404/503 instead of silent fallback to another endpoint
+- Thread-safe `MODELS` list via `get_models()`/`set_models()`
+- Restart path no longer kills the process on bind failure
+- `build-webui.cmd` guard for missing `webui-src/`
+- README updates (config.example.json + web UI build prerequisite)
+
+### Fixed
+- Removed silent endpoint fallback that could misroute requests with the wrong API key
+- Eliminated redundant full-catalog downloads every health-check cycle
+
 ## [2.2.0] — 2026-08-21
 
 See [changelogs/v2.2.0.md](changelogs/v2.2.0.md) for full details.

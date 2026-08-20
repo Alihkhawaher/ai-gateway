@@ -85,10 +85,19 @@ _top_models_lock = threading.Lock()
 _config_lock = threading.Lock()
 _config = {}  # loaded from config.json
 
+# ── Thread-safe MODELS list ────────────────────────────────────────────────
+_models_lock = threading.Lock()
+
+# ── Upstream catalog cache (avoids re-downloading large catalogs) ──────────
+_catalog_cache_lock = threading.Lock()
+_catalog_cache = {}       # endpoint_name → list of raw model dicts
+_catalog_cache_time = {}  # endpoint_name → timestamp
+CATALOG_CACHE_TTL = 300   # seconds
+
 
 def load_config():
     """Load config from config.json, merging with defaults. Handles v1→v2 migration."""
-    global _config, MODELS
+    global _config
     with _config_lock:
         if os.path.exists(CONFIG_FILE):
             try:
@@ -116,7 +125,7 @@ def load_config():
         else:
             print(f"[proxy] No config file found, using defaults")
         _config = {**DEFAULTS, **_config}
-        MODELS = list(_config.get("models", DEFAULTS["models"]))
+        set_models(list(_config.get("models", DEFAULTS["models"])))
 
 
 def _migrate_v1_config(saved: dict) -> dict:
@@ -172,10 +181,24 @@ def set_config(key: str, value):
         _config[key] = value
 
 
+def get_models() -> list:
+    """Return a snapshot copy of the aggregated model list."""
+    with _models_lock:
+        return list(MODELS)
+
+
+def set_models(models: list):
+    """Atomically replace the aggregated model list."""
+    global MODELS
+    with _models_lock:
+        MODELS = list(models)
+
+
 def get_current_model() -> str:
+    models = get_models()
     with _config_lock:
-        idx = max(0, min(_config.get("model_index", 0), len(MODELS) - 1))
-        return MODELS[idx] if MODELS else ""
+        idx = max(0, min(_config.get("model_index", 0), len(models) - 1))
+        return models[idx] if models else ""
 
 
 # ── Model ID parsing ─────────────────────────────────────────────────────
@@ -197,10 +220,19 @@ def parse_model_id(model_id: str) -> tuple:
 
 
 def get_endpoint_by_name(name: str) -> dict:
-    """Find an endpoint config by its name."""
+    """Find an enabled endpoint config by its name."""
     with _config_lock:
         for ep in _config.get("endpoints", []):
             if ep.get("name") == name and ep.get("enabled", False):
+                return ep
+    return {}
+
+
+def find_endpoint_by_name(name: str) -> dict:
+    """Find an endpoint config by name regardless of enabled state."""
+    with _config_lock:
+        for ep in _config.get("endpoints", []):
+            if ep.get("name") == name:
                 return ep
     return {}
 
@@ -241,7 +273,7 @@ def rewrite_path(path: str) -> str:
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, HTTP-Referer, X-Title",
+    "Access-Control-Allow-Headers": "*",
     "Access-Control-Max-Age": "86400",
 }
 
@@ -516,6 +548,33 @@ def fetch_custom_models(host: str, api_key: str) -> list:
         return []
 
 
+def _get_cached_catalog(endpoint_name: str, fetch_fn, *args) -> list:
+    """Return a catalog for an endpoint, caching large upstream responses.
+
+    OpenRouter/OrcaRouter return hundreds of models; re-downloading that on
+    every 30-second health-check cycle is wasteful. This caches the raw
+    catalog per endpoint and only refreshes after CATALOG_CACHE_TTL.
+    """
+    now = time.time()
+    with _catalog_cache_lock:
+        cached = _catalog_cache.get(endpoint_name)
+        cached_at = _catalog_cache_time.get(endpoint_name, 0)
+        if cached is not None and (now - cached_at) < CATALOG_CACHE_TTL:
+            return list(cached)
+    models = fetch_fn(*args) or []
+    with _catalog_cache_lock:
+        _catalog_cache[endpoint_name] = list(models)
+        _catalog_cache_time[endpoint_name] = time.time()
+    return models
+
+
+def clear_catalog_cache():
+    """Drop cached upstream catalogs (e.g., after endpoint changes)."""
+    with _catalog_cache_lock:
+        _catalog_cache.clear()
+        _catalog_cache_time.clear()
+
+
 def aggregate_models():
     """Fetch models from all online endpoints and build unified list.
 
@@ -525,7 +584,7 @@ def aggregate_models():
     For local endpoints (llama-server, LM Studio, custom): Include all
     discovered models since they typically have 1-5 loaded models.
     """
-    global MODELS, _model_routes
+    global _model_routes
 
     new_routes = {}
     new_meta = {}
@@ -555,11 +614,11 @@ def aggregate_models():
                         or_original_ids.add(tm[len(name) + 1:])
             if not or_original_ids:
                 continue
-            # Fetch full catalog to get metadata
+            # Fetch catalog (cached) to get metadata
             if ep_type == "orcarouter":
-                all_or = fetch_orcarouter_models(host, api_key)
+                all_or = _get_cached_catalog(name, fetch_orcarouter_models, host, api_key)
             else:
-                all_or = fetch_openrouter_models(host, api_key)
+                all_or = _get_cached_catalog(name, fetch_openrouter_models, host, api_key)
             or_meta = {m.get("id", ""): m for m in all_or}
             for original_id in or_original_ids:
                 meta = or_meta.get(original_id, {"id": original_id, "name": original_id})
@@ -612,8 +671,8 @@ def aggregate_models():
         _model_meta.clear()
         _model_meta.update(new_meta)
 
-    MODELS = merged
-    total = len(MODELS)
+    set_models(merged)
+    total = len(merged)
     online_count = sum(1 for ep in endpoints if get_endpoint_status(ep.get("name", "")) == "online")
     print(f"[proxy] Aggregated {total} models from {online_count} online endpoint(s)")
 
@@ -728,6 +787,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path == "/tools":
             self._handle_tools()
             return
+        if path == "/cors-proxy":
+            self._handle_cors_proxy()
+            return
 
         # Try to serve as static web UI file
         if self._serve_file(path.lstrip("/")):
@@ -746,6 +808,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if path in ("/models/load", "/models/unload"):
             self._handle_model_load()
+            return
+        if path == "/cors-proxy":
+            self._handle_cors_proxy()
             return
 
         self._proxy()
@@ -795,7 +860,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_models(self):
         """Return aggregated model list from all online endpoints."""
         entries = []
-        for m in MODELS:
+        for m in get_models():
             meta = get_model_meta(m)
             context_length = meta.get("context_length", 128000)
 
@@ -859,7 +924,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         into that shape so Cline's dropdown populates automatically.
         """
         entries = []
-        for m in MODELS:
+        for m in get_models():
             meta = get_model_meta(m)
             context_length = meta.get("context_length", 128000)
 
@@ -970,20 +1035,123 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json({})
 
     def _handle_model_load(self):
+        """Handle /models/load and /models/unload from the web UI.
+
+        /models/load sets the requested model as the new default (model_index)
+        so subsequent requests without an explicit model use it. /models/unload
+        is a no-op for cloud-aggregated models (they cannot actually be
+        unloaded), but we still validate the model is known.
+        """
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length > _MAX_BODY_SIZE:
             self.send_error(413, "Request body too large")
             return
         body = self.rfile.read(content_length) if content_length > 0 else b""
+
+        model = ""
         if body:
             try:
                 data = json.loads(body)
                 model = data.get("model", "")
-                if model:
-                    self._log(f"Web UI selected model: {model}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
+
+        if not model:
+            self._send_json({"success": False, "error": "No model specified"}, 400)
+            return
+
+        models = get_models()
+        if model not in models:
+            self._send_json({"success": False, "error": f"Model not found: {model}"}, 404)
+            return
+
+        is_unload = self.path == "/models/unload"
+        if not is_unload:
+            set_config("model_index", models.index(model))
+            save_config()
+            self._log(f"Web UI selected model: {model}")
+
         self._send_json({"success": True})
+
+    # ── API: /cors-proxy (llama.cpp llama-ui compatible) ──────────────────
+    def _handle_cors_proxy(self):
+        """Forward cross-origin requests from the bundled web UI.
+
+        The llama.cpp UI avoids browser CORS restrictions by routing external
+        fetches through this endpoint: GET /cors-proxy?url=<target>. Custom
+        request headers are passed with an `x-llama-server-proxy-header-`
+        prefix (verified in webui/sw.js / bundle.js) and are stripped before
+        forwarding upstream.
+        """
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        raw_url = query.get("url", [""])[0]
+        if not raw_url:
+            self._send_json({"error": "Missing 'url' query parameter"}, 400)
+            return
+
+        target = urlparse(raw_url)
+        if target.scheme not in ("http", "https"):
+            self._send_json({"error": "Only http and https URLs are allowed"}, 400)
+            return
+        if not target.netloc:
+            self._send_json({"error": "Invalid URL"}, 400)
+            return
+
+        # Rebuild upstream headers from the proxy-prefixed request headers.
+        prefix = "x-llama-server-proxy-header-"
+        upstream_headers = {}
+        for header, value in self.headers.items():
+            h = header.lower()
+            if h.startswith(prefix):
+                name = header[len(prefix):]
+                if name and value:
+                    upstream_headers[name] = value
+
+        # Read body for non-idempotent methods (e.g., MCP tool POSTs).
+        request_body = b""
+        if self.command not in ("GET", "HEAD"):
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > _MAX_BODY_SIZE:
+                self.send_error(413, "Request body too large")
+                return
+            request_body = self.rfile.read(content_length) if content_length > 0 else b""
+            if request_body:
+                upstream_headers["Content-Length"] = str(len(request_body))
+
+        upstream_path = target.path or "/"
+        if target.query:
+            upstream_path += "?" + target.query
+
+        use_ssl = target.scheme == "https"
+        if use_ssl:
+            conn = http.client.HTTPSConnection(target.netloc, context=_upstream_ssl_ctx, timeout=60)
+        else:
+            conn = http.client.HTTPConnection(target.netloc, timeout=60)
+
+        try:
+            conn.request(self.command, upstream_path, body=request_body, headers=upstream_headers)
+            response = conn.getresponse()
+
+            self.send_response(response.status)
+            for k, v in CORS_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Access-Control-Expose-Headers", "*")
+            content_type = response.getheader("Content-Type")
+            if content_type:
+                self.send_header("Content-Type", content_type)
+            data = response.read()
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self._log(f"cors-proxy error: {e}")
+            try:
+                self.send_error(502, f"cors-proxy error: {e}")
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
     # ── JSON response helper ───────────────────────────────────────────────
     def _send_json(self, data, status=200):
@@ -1008,6 +1176,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 2. Parse model and determine route
         target_endpoint = None
         original_id = None
+        requested_source = None  # source prefix explicitly present in model ID
 
         if body:
             try:
@@ -1025,6 +1194,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 source, original_id = parse_model_id(model_id)
 
                 if source:
+                    requested_source = source
                     target_endpoint = get_endpoint_by_name(source)
 
                 if not target_endpoint:
@@ -1043,6 +1213,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # 3. Determine upstream connection
         if not target_endpoint:
+            # If an explicit source was requested but can't be routed, return a
+            # clear error instead of silently forwarding to another endpoint.
+            if requested_source:
+                ep = find_endpoint_by_name(requested_source)
+                if ep and not ep.get("enabled", False):
+                    self._send_json({"error": {"message": f"Endpoint '{requested_source}' is disabled"}}, 404)
+                    return
+                status = get_endpoint_status(requested_source)
+                self._send_json({"error": {"message": f"Endpoint '{requested_source}' is {status}"}}, 503)
+                return
             target_endpoint = get_first_enabled_endpoint()
 
         if not target_endpoint:
@@ -1254,9 +1434,13 @@ class SettingsScreen(Screen):
         with ScrollableContainer(id="settings-screen"):
             yield Static("Settings", classes="screen-title")
 
-            # ── Endpoint Status (read-only) ────────────────────────────
+            # ── Endpoint Management ────────────────────────────────────
             yield Static("Endpoints", classes="section-title")
             yield DataTable(id="endpoint-table")
+            with Horizontal(id="endpoint-buttons"):
+                Button("+ Add", id="ep-add-btn", variant="primary", compact=True)
+                Button("✎ Edit", id="ep-edit-btn", variant="default", compact=True)
+                Button("✕ Remove", id="ep-remove-btn", variant="error", compact=True)
 
             # ── Model Settings ─────────────────────────────────────────
             yield Static("Model Settings", classes="section-title")
@@ -1293,6 +1477,77 @@ class SettingsScreen(Screen):
 
     def on_mount(self) -> None:
         self._populate_endpoint_table()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ep-add-btn":
+            self._add_endpoint()
+        elif event.button.id == "ep-edit-btn":
+            self._edit_endpoint()
+        elif event.button.id == "ep-remove-btn":
+            self._remove_endpoint()
+
+    def _selected_endpoint(self) -> dict:
+        """Return the endpoint dict for the currently selected table row."""
+        table = self.query_one("#endpoint-table", DataTable)
+        row_key = getattr(table, "cursor_row_key", None)
+        if row_key is None:
+            return {}
+        with _config_lock:
+            for ep in _config.get("endpoints", []):
+                if ep.get("name", "") == row_key:
+                    return ep
+        return {}
+
+    def _add_endpoint(self):
+        self.app.push_screen(EndpointEditScreen(), self._on_endpoint_saved)
+
+    def _edit_endpoint(self):
+        ep = self._selected_endpoint()
+        if not ep:
+            return
+        self.app.push_screen(EndpointEditScreen(dict(ep)), self._on_endpoint_saved)
+
+    def _remove_endpoint(self):
+        ep = self._selected_endpoint()
+        if not ep:
+            return
+        name = ep.get("name", "")
+        with _config_lock:
+            endpoints = list(_config.get("endpoints", []))
+            endpoints = [e for e in endpoints if e.get("name", "") != name]
+            _config["endpoints"] = endpoints
+        clear_catalog_cache()
+        save_config()
+        set_endpoint_status(name, "disabled")
+        self._populate_endpoint_table()
+        log = ProxyHandler.tui_log
+        if log is not None:
+            log.write_line(f"Removed endpoint → {name}")
+
+    def _on_endpoint_saved(self, result) -> None:
+        """Callback after the add/edit modal is dismissed with a value."""
+        if not result:
+            return
+        name = result.get("name", "")
+        if not name:
+            return
+        with _config_lock:
+            endpoints = list(_config.get("endpoints", []))
+            # Check for duplicate source prefix (name collision).
+            for i, ep in enumerate(endpoints):
+                if ep.get("name", "") == name:
+                    endpoints[i] = result
+                    break
+            else:
+                endpoints.append(result)
+            _config["endpoints"] = endpoints
+        clear_catalog_cache()
+        save_config()
+        set_endpoint_status(name, "checking")
+        self._populate_endpoint_table()
+        log = ProxyHandler.tui_log
+        if log is not None:
+            log.write_line(f"Saved endpoint → {name}")
 
     def _populate_endpoint_table(self):
         table = self.query_one("#endpoint-table", DataTable)
@@ -1367,13 +1622,17 @@ class SettingsScreen(Screen):
             _server.shutdown()
             _server.server_close()
             _server = None
-        _start_server()
+        try:
+            _start_server()
+        except OSError as e:
+            log.write_line(f"Restart failed: {e}")
+            return
         log.write_line(f"Server restarted on http://{get_config('addr')}:{get_config('port')}")
 
 
 def fetch_top_intelligent_models(limit: int = 20):
     """Fetch top intelligent models from OpenRouter by intelligence index."""
-    global _top_intelligent_models, MODELS
+    global _top_intelligent_models
     endpoints = get_config("endpoints")
     or_ep = next((ep for ep in endpoints if ep.get("type") == "openrouter" and ep.get("enabled")), None)
     if not or_ep:
@@ -1406,9 +1665,8 @@ def fetch_top_intelligent_models(limit: int = 20):
             if m not in merged:
                 merged.append(m)
 
-        with _config_lock:
-            MODELS = merged
-        print(f"[proxy] Fetched {len(top_models)} top intelligent models, merged total: {len(MODELS)}")
+        set_models(merged)
+        print(f"[proxy] Fetched {len(top_models)} top intelligent models, merged total: {len(merged)}")
     except Exception as e:
         print(f"[proxy] Could not fetch top intelligent models: {e}")
 
@@ -1633,6 +1891,11 @@ _server_thread = None
 
 
 def _start_server():
+    """Bind and start the HTTP server.
+
+    Raises OSError if the address/port cannot be bound, so callers can decide
+    whether to abort (startup) or recover gracefully (TUI restart).
+    """
     global _server, _server_thread
     port = get_config("port")
     addr = get_config("addr")
@@ -1641,7 +1904,7 @@ def _start_server():
     except OSError as e:
         print(f"[proxy] ERROR: Cannot bind to {addr}:{port} — {e}")
         print(f"[proxy] Is another instance already running?")
-        sys.exit(1)
+        raise
     _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _server_thread.start()
     print(f"[proxy] Listening on http://{addr}:{port}")
@@ -1691,7 +1954,12 @@ if __name__ == "__main__":
         print("[proxy] Fetching top intelligent models from OpenRouter...")
         threading.Thread(target=fetch_top_intelligent_models, daemon=True).start()
 
-    _start_server()
+    try:
+        _start_server()
+    except OSError as e:
+        print(f"[proxy] Fatal: could not start server — {e}")
+        sys.exit(1)
+
     try:
         ProxyTUI().run()
     finally:

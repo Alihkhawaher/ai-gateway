@@ -1,5 +1,27 @@
 # AI Gateway Release Notes
 
+## v2.3.0 — 2026-08-21
+
+### Added
+- **`config.example.json`** — Committed config template with placeholder API keys.
+- **Functional endpoint management TUI** — Working `+ Add`, `✎ Edit`, and `✕ Remove` buttons wired to the endpoint edit dialog.
+- **`/cors-proxy` endpoint** — llama.cpp/llama-ui compatible CORS proxy for the web UI's external fetches.
+- **`/models/load`** — Now validates and sets the requested model as the new default instead of a silent no-op.
+
+### Changed
+- Model catalogs are cached for 5 minutes instead of re-downloaded every health-check cycle.
+- Smarter routing returns clear 404/503 errors instead of silently falling back to another endpoint.
+- Thread-safe `MODELS` list via `get_models()`/`set_models()`.
+- Server restart no longer terminates the process on bind failure.
+- `build-webui.cmd` guards against a missing `webui-src/` clone.
+- README documents `config.example.json` and the web UI build prerequisite.
+
+### Fixed
+- Removed silent endpoint fallback that could misroute requests with the wrong API key.
+- Eliminated redundant full-catalog downloads every 30 seconds.
+
+**Full Changelog**: https://github.com/Alihkhawaher/ai-gateway/commits/v2.3.0
+
 ## v2.2.0 — 2026-08-21
 
 ### Added
