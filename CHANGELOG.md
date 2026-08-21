@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.3.1] — 2026-08-21
+
+See [changelogs/v2.3.1.md](changelogs/v2.3.1.md) for full details.
+
+### Fixed
+- Endpoint `✎ Edit` / `✕ Remove` buttons (wrong `DataTable` cursor attribute)
+- Model dropdown refresh (`Select.set_options`)
+- Model-index bounds check preventing `IndexError` on Settings open
+- Settings screen crash from invalid `get_config` call
+- Thread-safe TUI logging via a log queue
+
+### Changed
+- Port/address validation with toast feedback and restart prompt
+- Endpoint removal now requires confirmation
+- Duplicate endpoint names rejected instead of silently overwritten
+- Endpoint type auto-fill only fills empty fields
+- Top-model fetch now reports results in the TUI log
+
 ## [2.3.0] — 2026-08-21
 
 See [changelogs/v2.3.0.md](changelogs/v2.3.0.md) for full details.

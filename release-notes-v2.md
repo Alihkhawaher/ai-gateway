@@ -1,5 +1,23 @@
 # AI Gateway Release Notes
 
+## v2.3.1 — 2026-08-21
+
+### Fixed
+- **Endpoint Edit/Remove buttons** — `✎ Edit` / `✕ Remove` now resolve the selected row correctly (`DataTable.get_row_at(cursor_row)`).
+- **Model dropdown refresh** — Uses `Select.set_options` and refreshes on mount and after endpoint changes.
+- **Model-index bounds check** — Opening Settings no longer crashes on a stale `model_index`.
+- **Settings screen crash** — Fixed invalid `get_config` argument.
+- **Thread-safe TUI logging** — Request log lines are queued and drained on the UI thread instead of writing to the `Log` widget from worker threads.
+
+### Changed
+- **Port/address validation** — Invalid ports are rejected with a toast; changing port/address prompts for restart.
+- **Endpoint removal confirmation** — Removing an endpoint requires confirmation.
+- **Duplicate endpoint names** — Rejected with an error toast instead of overwriting.
+- **Endpoint type auto-fill** — Only fills name/host when empty.
+- **Top-model fetch feedback** — Reported in the TUI log.
+
+**Full Changelog**: https://github.com/Alihkhawaher/ai-gateway/commits/v2.3.1
+
 ## v2.3.0 — 2026-08-21
 
 ### Added

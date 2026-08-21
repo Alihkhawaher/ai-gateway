@@ -17,6 +17,7 @@ import json
 import http.client
 import mimetypes
 import os
+import queue
 import ssl
 import sys
 import threading
@@ -93,6 +94,17 @@ _catalog_cache_lock = threading.Lock()
 _catalog_cache = {}       # endpoint_name → list of raw model dicts
 _catalog_cache_time = {}  # endpoint_name → timestamp
 CATALOG_CACHE_TTL = 300   # seconds
+
+# ── TUI log queue (thread-safe bridge from worker threads) ───────────────
+_log_queue = queue.Queue()
+
+
+def _queue_log_line(line: str):
+    """Thread-safely enqueue a line for the TUI log widget."""
+    try:
+        _log_queue.put(line)
+    except Exception:
+        pass
 
 
 def load_config():
@@ -1304,16 +1316,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _log(self, msg: str):
-        if ProxyHandler.tui_log is not None:
-            try:
-                ProxyHandler.tui_log.write_line(f"[{self.address_string()}] {msg}")
-            except Exception:
-                pass
-        else:
-            print(f"[proxy] {msg}")
+        """Queue a request log line for the TUI (thread-safe)."""
+        _queue_log_line(f"[{self.address_string()}] {msg}")
 
     def log_message(self, fmt, *args):
         pass  # Suppress default stderr logging
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TUI — CONFIRM DIALOG (ModalScreen)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ConfirmScreen(ModalScreen):
+    """Simple yes/no confirmation dialog."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str, **kwargs):
+        super().__init__(**kwargs)
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(self.message, id="confirm-message")
+            with Horizontal(id="confirm-buttons"):
+                Button("Yes", id="confirm-yes-btn", variant="error", compact=True)
+                Button("No", id="confirm-no-btn", variant="default", compact=True)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-yes-btn":
+            self.dismiss(True)
+        elif event.button.id == "confirm-no-btn":
+            self.dismiss(False)
+
+    def action_cancel(self):
+        self.dismiss(False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1337,6 +1374,7 @@ class EndpointEditScreen(ModalScreen):
     def __init__(self, endpoint: dict = None, **kwargs):
         super().__init__(**kwargs)
         self.endpoint = endpoint  # None = add new, dict = edit existing
+        self.original_name = (endpoint or {}).get("_original_name") or (endpoint or {}).get("name") or None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ep-edit-dialog"):
@@ -1373,15 +1411,17 @@ class EndpointEditScreen(ModalScreen):
                 Button("✕ Cancel", id="ep-cancel-btn", variant="default", compact=True)
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        """Auto-fill name and host when type is selected."""
+        """Auto-fill name/host when a type is chosen in add mode, only if empty."""
         if event.select.id == "ep-type-select":
             ep_type = str(event.select.value)
             defaults = ENDPOINT_TYPE_DEFAULTS.get(ep_type, {})
             name_input = self.query_one("#ep-name-input", Input)
             host_input = self.query_one("#ep-host-input", Input)
             if not self.endpoint:
-                name_input.value = defaults.get("name", "")
-                host_input.value = defaults.get("host", "")
+                if not name_input.value.strip():
+                    name_input.value = defaults.get("name", "")
+                if not host_input.value.strip():
+                    host_input.value = defaults.get("host", "")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "ep-save-btn":
@@ -1413,6 +1453,8 @@ class EndpointEditScreen(ModalScreen):
             "api_key": api_key,
             "enabled": enabled,
         }
+        if self.original_name:
+            result["_original_name"] = self.original_name
         self.dismiss(result)
 
 
@@ -1445,9 +1487,12 @@ class SettingsScreen(Screen):
             # ── Model Settings ─────────────────────────────────────────
             yield Static("Model Settings", classes="section-title")
             yield Label("Default Model")
+            current_models = get_models()
+            default_idx = max(0, min(get_config("model_index"), len(current_models) - 1))
+            model_options = [(m, m) for m in current_models] if current_models else [("No models available", "")]
             yield Select(
-                [(m, m) for m in MODELS],
-                value=MODELS[get_config("model_index")] if MODELS else "",
+                model_options,
+                value=current_models[default_idx] if current_models else "",
                 id="model-select",
             )
             yield Checkbox(
@@ -1477,6 +1522,7 @@ class SettingsScreen(Screen):
 
     def on_mount(self) -> None:
         self._populate_endpoint_table()
+        self._update_model_select()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "ep-add-btn":
@@ -1489,7 +1535,13 @@ class SettingsScreen(Screen):
     def _selected_endpoint(self) -> dict:
         """Return the endpoint dict for the currently selected table row."""
         table = self.query_one("#endpoint-table", DataTable)
-        row_key = getattr(table, "cursor_row_key", None)
+        if table.row_count == 0:
+            return {}
+        try:
+            row = table.get_row_at(table.cursor_row)
+            row_key = row[0]  # "Name" is the first column
+        except Exception:
+            return {}
         if row_key is None:
             return {}
         with _config_lock:
@@ -1504,14 +1556,26 @@ class SettingsScreen(Screen):
     def _edit_endpoint(self):
         ep = self._selected_endpoint()
         if not ep:
+            self.notify("No endpoint selected", severity="warning")
             return
-        self.app.push_screen(EndpointEditScreen(dict(ep)), self._on_endpoint_saved)
+        original = dict(ep)
+        original["_original_name"] = ep.get("name", "")
+        self.app.push_screen(EndpointEditScreen(original), self._on_endpoint_saved)
 
     def _remove_endpoint(self):
         ep = self._selected_endpoint()
         if not ep:
+            self.notify("No endpoint selected", severity="warning")
             return
         name = ep.get("name", "")
+        self.app.push_screen(
+            ConfirmScreen(f"Remove endpoint '{name}'?"),
+            lambda confirmed: self._do_remove_endpoint(name, confirmed),
+        )
+
+    def _do_remove_endpoint(self, name: str, confirmed):
+        if not confirmed:
+            return
         with _config_lock:
             endpoints = list(_config.get("endpoints", []))
             endpoints = [e for e in endpoints if e.get("name", "") != name]
@@ -1520,9 +1584,8 @@ class SettingsScreen(Screen):
         save_config()
         set_endpoint_status(name, "disabled")
         self._populate_endpoint_table()
-        log = ProxyHandler.tui_log
-        if log is not None:
-            log.write_line(f"Removed endpoint → {name}")
+        self._update_model_select()
+        _queue_log_line(f"Removed endpoint → {name}")
 
     def _on_endpoint_saved(self, result) -> None:
         """Callback after the add/edit modal is dismissed with a value."""
@@ -1531,23 +1594,30 @@ class SettingsScreen(Screen):
         name = result.get("name", "")
         if not name:
             return
+        original_name = result.pop("_original_name", None)
         with _config_lock:
             endpoints = list(_config.get("endpoints", []))
-            # Check for duplicate source prefix (name collision).
-            for i, ep in enumerate(endpoints):
-                if ep.get("name", "") == name:
-                    endpoints[i] = result
-                    break
+            if original_name:
+                # Editing: replace the endpoint identified by its original name.
+                for i, ep in enumerate(endpoints):
+                    if ep.get("name", "") == original_name:
+                        endpoints[i] = result
+                        break
+                else:
+                    endpoints.append(result)
             else:
+                # Adding: reject duplicate source prefix (name collision).
+                if any(ep.get("name", "") == name for ep in endpoints):
+                    self.notify(f"Endpoint '{name}' already exists", severity="error")
+                    return
                 endpoints.append(result)
             _config["endpoints"] = endpoints
         clear_catalog_cache()
         save_config()
         set_endpoint_status(name, "checking")
         self._populate_endpoint_table()
-        log = ProxyHandler.tui_log
-        if log is not None:
-            log.write_line(f"Saved endpoint → {name}")
+        self._update_model_select()
+        _queue_log_line(f"Saved endpoint → {name}")
 
     def _populate_endpoint_table(self):
         table = self.query_one("#endpoint-table", DataTable)
@@ -1576,47 +1646,60 @@ class SettingsScreen(Screen):
     def _update_model_select(self):
         """Refresh the model selector dropdown."""
         model_select = self.query_one("#model-select", Select)
-        new_options = [(m, m) for m in MODELS]
-        model_select.clear()
-        for label, value in new_options:
-            model_select.add_option((label, value))
-        if MODELS:
-            idx = min(get_config("model_index"), len(MODELS) - 1)
-            model_select.value = MODELS[idx]
+        models = get_models()
+        if models:
+            idx = max(0, min(get_config("model_index"), len(models) - 1))
+            model_select.set_options([(m, m) for m in models])
+            model_select.value = models[idx]
+        else:
+            model_select.set_options([("No models available", "")])
 
     def _apply_settings(self):
         log = ProxyHandler.tui_log
+        models = get_models()
 
         # Model
         model_select = self.query_one("#model-select", Select)
         if model_select.value is not None:
             model_name = str(model_select.value)
-            if model_name in MODELS:
-                set_config("model_index", MODELS.index(model_name))
-                log.write_line(f"Model set → {model_name}")
+            if model_name in models:
+                set_config("model_index", models.index(model_name))
+                _queue_log_line(f"Model set → {model_name}")
 
         # Fetch top models checkbox
         fetch_checkbox = self.query_one("#fetch-top-models-checkbox", Checkbox)
         fetch_enabled = fetch_checkbox.value
         set_config("fetch_top_models", fetch_enabled)
         if fetch_enabled:
-            log.write_line("Fetching top intelligent models...")
+            _queue_log_line("Fetching top intelligent models...")
             threading.Thread(target=fetch_top_intelligent_models, daemon=True).start()
 
         # Port / addr
         port = self.query_one("#port-input", Input).value.strip()
         addr = self.query_one("#addr-input", Input).value.strip()
+        changed = False
         if port.isdigit():
-            set_config("port", int(port))
-        if addr:
+            p = int(port)
+            if 1 <= p <= 65535:
+                if p != get_config("port"):
+                    set_config("port", p)
+                    changed = True
+            else:
+                self.notify(f"Port {p} out of range (1-65535), ignored", severity="error")
+        elif port:
+            self.notify(f"Invalid port '{port}', ignored — must be a number", severity="error")
+        if addr and addr != get_config("addr"):
             set_config("addr", addr)
+            changed = True
 
         save_config()
-        log.write_line("Config saved to config.json")
+        if log is not None:
+            log.write_line("Config saved to config.json")
+        if changed:
+            self.notify("Port/address changed — press Ctrl+R (Restart) to apply", severity="warning")
 
     def _restart_server(self):
-        log = ProxyHandler.tui_log
-        log.write_line("Restarting server...")
+        _queue_log_line("Restarting server...")
         global _server
         if _server is not None:
             _server.shutdown()
@@ -1625,9 +1708,9 @@ class SettingsScreen(Screen):
         try:
             _start_server()
         except OSError as e:
-            log.write_line(f"Restart failed: {e}")
+            _queue_log_line(f"Restart failed: {e}")
             return
-        log.write_line(f"Server restarted on http://{get_config('addr')}:{get_config('port')}")
+        _queue_log_line(f"Server restarted on http://{get_config('addr')}:{get_config('port')}")
 
 
 def fetch_top_intelligent_models(limit: int = 20):
@@ -1636,7 +1719,9 @@ def fetch_top_intelligent_models(limit: int = 20):
     endpoints = get_config("endpoints")
     or_ep = next((ep for ep in endpoints if ep.get("type") == "openrouter" and ep.get("enabled")), None)
     if not or_ep:
-        print("[proxy] No OpenRouter endpoint enabled, skipping top models fetch")
+        msg = "Fetch top models skipped: no enabled OpenRouter endpoint"
+        print(f"[proxy] {msg}")
+        _queue_log_line(msg)
         return
 
     ep_name = or_ep.get("name", "openrouter")
@@ -1666,9 +1751,13 @@ def fetch_top_intelligent_models(limit: int = 20):
                 merged.append(m)
 
         set_models(merged)
-        print(f"[proxy] Fetched {len(top_models)} top intelligent models, merged total: {len(merged)}")
+        msg = f"Fetched {len(top_models)} top intelligent models (total {len(merged)})"
+        print(f"[proxy] {msg}")
+        _queue_log_line(msg)
     except Exception as e:
-        print(f"[proxy] Could not fetch top intelligent models: {e}")
+        msg = f"Could not fetch top intelligent models: {e}"
+        print(f"[proxy] {msg}")
+        _queue_log_line(msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1690,6 +1779,18 @@ class MainScreen(Screen):
         self._show_server_info()
         # Periodic status refresh
         self.set_interval(5.0, self._update_endpoint_status)
+        # Drain worker-thread log lines into the Log widget
+        self.set_interval(0.25, self._drain_log_queue)
+
+    def _drain_log_queue(self):
+        """Move queued log lines (from worker threads) into the Log widget."""
+        log = self.query_one("#log", Log)
+        try:
+            while True:
+                line = _log_queue.get_nowait()
+                log.write_line(line)
+        except queue.Empty:
+            pass
 
     def _show_server_info(self):
         """Display server info after endpoints."""
@@ -1737,7 +1838,7 @@ class MainScreen(Screen):
             else:
                 icon = "○"
                 style = "red"
-            model_count = sum(1 for m in MODELS if m.startswith(f"{name}/"))
+            model_count = sum(1 for m in get_models() if m.startswith(f"{name}/"))
             lines.append(f"  {icon} {name:<12} → {host:<24} [{status}]  {model_count} models")
         status_widget.update("\n".join(lines) if lines else "  No endpoints configured")
 
@@ -1861,6 +1962,27 @@ class ProxyTUI(App):
         margin-top: 1;
     }
     #ep-edit-buttons Button {
+        width: auto;
+        min-width: 10;
+        margin-right: 1;
+    }
+    #confirm-dialog {
+        padding: 1 2;
+        width: 50;
+        height: auto;
+        border: solid $error;
+        background: $surface;
+    }
+    #confirm-message {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+    }
+    #confirm-buttons {
+        height: auto;
+        margin-top: 0;
+    }
+    #confirm-buttons Button {
         width: auto;
         min-width: 10;
         margin-right: 1;
