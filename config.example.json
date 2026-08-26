@@ -34,11 +34,20 @@
       "host": "localhost:11434",
       "enabled": true,
       "api_key": ""
+    },
+    {
+      "name": "llamastash",
+      "type": "custom",
+      "host": "localhost:11435",
+      "enabled": false,
+      "api_key": ""
     }
   ],
   "models": [
     "openrouter/openai/gpt-5.6-luna",
     "openrouter/deepseek/deepseek-v4-flash-0731",
+    "openrouter/deepseek/deepseek-v4-flash-vision-exp",
+    "openrouter/z-ai/glm-5.3-flash",
     "openrouter/google/gemini-3.5-flash"
   ],
   "model_index": 0,
