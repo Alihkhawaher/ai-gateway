@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.3.2] — 2026-08-26
+
+### Fixed
+- **Model capabilities not forwarded to web UI / endpoints** — three related bugs:
+  - Catalog cache returned shallow copies; `aggregate_models()` mutated the cached dicts, corrupting the cache so models lost their `architecture` metadata (and thus capabilities) on the next 30-second aggregation cycle. Now uses `copy.deepcopy`.
+  - `function_calling` was always `False` because tool support was only checked in `input_modalities`, but OpenRouter/OrcaRouter report it in `supported_parameters` (`"tools"`/`"tool_choice"`).
+  - `/v1/models` was missing the top-level `modalities` field that the bundled llama.cpp web UI reads to enable image/audio/video uploads (caused "requires a vision-capable model" errors).
+
+### Added
+- **llamastash endpoint** — OpenAI-compatible local endpoint at `localhost:11435` (via the `custom` endpoint type).
+- New default models: `openrouter/deepseek/deepseek-v4-flash-vision-exp`, `openrouter/z-ai/glm-5.3-flash`.
+
 ## [2.3.1] — 2026-08-21
 
 See [changelogs/v2.3.1.md](changelogs/v2.3.1.md) for full details.

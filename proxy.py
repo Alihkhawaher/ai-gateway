@@ -13,6 +13,7 @@ Usage:
   python proxy.py 9090 127.0.0.1   # custom bind address
 """
 
+import copy
 import json
 import http.client
 import mimetypes
@@ -312,6 +313,32 @@ _upstream_ssl_ctx = ssl.create_default_context()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  MODEL CAPABILITY FORWARDING — DO NOT REGRESS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Model capabilities (vision / audio / video / function_calling) are forwarded
+# to clients through THREE mechanisms. All three are REQUIRED and must not be
+# removed or simplified — each serves a different client:
+#
+#   1. `_get_cached_catalog()` MUST return deep copies (copy.deepcopy).
+#      `aggregate_models()` mutates the returned dicts (adds _source/_source_host
+#      and overwrites `id`). A shallow copy corrupts the cache, so on the next
+#      30-second aggregation cycle the original model ID can no longer be found
+#      and the model loses its `architecture` metadata (capabilities). This was
+#      the v2.3.0 regression.
+#
+#   2. `has_tools` (function_calling) MUST check `supported_parameters` for
+#      "tools"/"tool_choice", NOT only `input_modalities`. OpenRouter/OrcaRouter
+#      report tool support in `supported_parameters`, so checking only
+#      `input_modalities` makes function_calling always False.
+#
+#   3. `/v1/models` MUST include a top-level `modalities` field
+#      ({vision, audio, video}) on each model entry. The bundled llama.cpp web
+#      UI reads this exact field (getModelModalities) to enable image/audio/
+#      video uploads. Without it the UI reports "requires a vision-capable
+#      model" even for multimodal models.
+#
+# ═══════════════════════════════════════════════════════════════════════════
 #  HEALTH CHECKING & MODEL AGGREGATION
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -566,18 +593,24 @@ def _get_cached_catalog(endpoint_name: str, fetch_fn, *args) -> list:
     OpenRouter/OrcaRouter return hundreds of models; re-downloading that on
     every 30-second health-check cycle is wasteful. This caches the raw
     catalog per endpoint and only refreshes after CATALOG_CACHE_TTL.
+
+    IMPORTANT: We store and return DEEP COPIES so callers can mutate the
+    returned dicts (e.g. adding _source / _source_host / overwriting id)
+    without corrupting the cache for subsequent aggregations. Before v2.3.0
+    this was a shallow copy and the mutate-on-read corrupted the cache,
+    causing model capabilities metadata to be lost on the next cycle.
     """
     now = time.time()
     with _catalog_cache_lock:
         cached = _catalog_cache.get(endpoint_name)
         cached_at = _catalog_cache_time.get(endpoint_name, 0)
         if cached is not None and (now - cached_at) < CATALOG_CACHE_TTL:
-            return list(cached)
+            return copy.deepcopy(cached)
     models = fetch_fn(*args) or []
     with _catalog_cache_lock:
-        _catalog_cache[endpoint_name] = list(models)
+        _catalog_cache[endpoint_name] = copy.deepcopy(models)
         _catalog_cache_time[endpoint_name] = time.time()
-    return models
+    return copy.deepcopy(models)
 
 
 def clear_catalog_cache():
@@ -881,7 +914,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             has_vision = any(mod in input_mods for mod in ("image", "vision"))
             has_audio = "audio" in input_mods
             has_video = "video" in input_mods
-            has_tools = any(mod in input_mods for mod in ("tools", "tool_use"))
+            # Tool calling is reported by OpenRouter/OrcaRouter in
+            # supported_parameters (e.g. "tools"), not in input_modalities.
+            supported_params = meta.get("supported_parameters", [])
+            has_tools = (
+                any(mod in input_mods for mod in ("tools", "tool_use"))
+                or "tools" in supported_params
+                or "tool_choice" in supported_params
+            )
 
             tags = []
             if has_vision:
@@ -909,6 +949,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "max_model_len": context_length,
                 "status": {"value": "loaded"},
                 "tags": tags,
+                # llama.cpp web UI reads this field directly to detect
+                # vision/audio/video support (see getModelModalities in the
+                # bundled llama-ui). Without it, the UI reports "requires a
+                # vision-capable model" even for multimodal models.
+                "modalities": {
+                    "vision": has_vision,
+                    "audio": has_audio,
+                    "video": has_video,
+                },
                 "architecture": {
                     "input_modalities": input_mods,
                     "output_modalities": output_mods,
@@ -941,7 +990,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             context_length = meta.get("context_length", 128000)
 
             input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
-            has_tools = any(mod in input_mods for mod in ("tools", "tool_use"))
+            # Tool calling is reported by OpenRouter/OrcaRouter in
+            # supported_parameters (e.g. "tools"), not in input_modalities.
+            supported_params = meta.get("supported_parameters", [])
+            has_tools = (
+                any(mod in input_mods for mod in ("tools", "tool_use"))
+                or "tools" in supported_params
+                or "tool_choice" in supported_params
+            )
 
             source, original_id = parse_model_id(m)
 

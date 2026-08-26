@@ -162,11 +162,20 @@ Edit `config.json`:
       "host": "localhost:11434",
       "enabled": true,
       "api_key": ""
+    },
+    {
+      "name": "llamastash",
+      "type": "custom",
+      "host": "localhost:11435",
+      "enabled": true,
+      "api_key": ""
     }
   ],
   "models": [
     "openrouter/openai/gpt-5.6-luna",
     "openrouter/deepseek/deepseek-v4-flash-0731",
+    "openrouter/deepseek/deepseek-v4-flash-vision-exp",
+    "openrouter/z-ai/glm-5.3-flash",
     "openrouter/google/gemini-3.5-flash"
   ],
   "model_index": 0,
@@ -194,7 +203,7 @@ Edit `config.json`:
 | `lmstudio` | LM Studio local server | `GET /v1/models` |
 | `llama-server` | llama.cpp server | `GET /health` |
 | `ollama` | Ollama local server | `GET /api/tags` |
-| `custom` | Any OpenAI-compatible endpoint | `GET /v1/models` |
+| `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` |
 
 ## Connecting Clients
 
