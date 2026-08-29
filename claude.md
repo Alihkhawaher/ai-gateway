@@ -20,6 +20,7 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 ├── webui/                # Built web UI static files (llama.cpp llama-ui)
 ├── webui-src/            # llama.cpp source (gitignored, for rebuilding the UI)
 ├── changelogs/           # Per-version release notes (vX.Y.Z.md)
+├── testing/              # Automated test suite (python testing/test_proxy.py)
 ├── claude.md             # This file — project spec & workflow
 ├── .gitignore
 └── README.md
@@ -62,6 +63,30 @@ These are documented inline in `proxy.py` under the header **"MODEL CAPABILITY F
 3. **`/v1/models` must include a top-level `modalities` field (`{vision, audio, video}`) on each model entry.**
    The bundled llama.cpp web UI reads this exact field (`getModelModalities`) to enable image/audio/video uploads. Without it the UI reports "requires a vision-capable model" even for multimodal models.
 
+## Using MCP Servers (tools/resources) in the Web UI
+
+The bundled llama-ui can attach MCP servers to the chat. MCP servers that
+speak HTTP/S (Streamable HTTP or SSE) are added directly by URL; the
+**"Use llama-server proxy"** toggle routes their traffic through this
+gateway's `/cors-proxy` endpoint to bypass browser CORS/mixed-content.
+
+For this to work, the gateway must:
+
+1. Advertise `cors_proxy_enabled: true` in `GET /props` (enables the toggle in
+   the web UI — same signal llama-server emits via `--ui-mcp-proxy`).
+2. On `/cors-proxy`, forward the MCP session handshake correctly:
+   - Forward normal request headers **and** the `x-llama-server-proxy-header-*`
+     prefixed headers (with the prefixed ones taking precedence, so the
+     correct `Content-Type: application/json` wins over a browser auto-added
+     `text/plain`).
+   - Forward upstream response headers (notably `Mcp-Session-Id`) back to the
+     browser, so stateful MCP bridges can complete their session handshake.
+
+Caveat: the proxy only forwards to HTTP(S) URLs. It does **not** spawn
+command/stdio MCP servers (e.g. `@modelcontextprotocol/server-filesystem`).
+To use a stdio server, bridge it to HTTP first (e.g. `supergateway`) and add
+the resulting localhost URL with the proxy toggle on.
+
 ## API Endpoints
 
 | Endpoint | Format | Purpose |
@@ -73,6 +98,20 @@ These are documented inline in `proxy.py` under the header **"MODEL CAPABILITY F
 | `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
 | `GET /health` | — | Endpoint statuses |
 | `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the web UI's external fetches |
+
+## Testing Convention
+
+- **Every new feature or bug fix must include a test procedure.**
+- Automated tests live in `testing/` and use Python's `unittest` (no third-party test runner).
+- Run them with:
+  ```powershell
+  python testing/test_proxy.py
+  ```
+- Tests must be self-contained: spin up an in-process mock upstream and an
+  ephemeral gateway, make real HTTP requests, and assert on behavior. They
+  must not require a running gateway, an online model, or any API key.
+- Before merging, confirm all tests pass (`Ran N tests ... OK`) and run
+  `python -m py_compile proxy.py testing/test_proxy.py`.
 
 ## Release Notes Convention
 

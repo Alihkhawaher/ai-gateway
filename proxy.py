@@ -1080,6 +1080,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             },
             "chat_template": "", "bos_token": "", "eos_token": "",
             "build_info": "ai-gateway v2.0",
+            # Advertise the /cors-proxy endpoint so the bundled llama-ui
+            # enables the "Use llama-server proxy" option for MCP servers
+            # (same mechanism as llama-server's --ui-mcp-proxy flag).
+            "cors_proxy_enabled": True,
         }
         self._send_json(data)
 
@@ -1166,15 +1170,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Invalid URL"}, 400)
             return
 
-        # Rebuild upstream headers from the proxy-prefixed request headers.
+        # Forward request headers upstream. The MCP streamable-HTTP transport
+        # carries its session token and Content-Type in prefixed headers
+        # (`x-llama-server-proxy-header-*`) when proxying, but the browser may
+        # ALSO auto-add plain headers (e.g. `content-type: text/plain` for a
+        # JSON string body). We forward normal headers too, but the prefixed
+        # (user-intended) headers MUST take precedence so the correct
+        # `content-type: application/json` wins over the auto-added text/plain.
+        # Hop-by-hop and proxy-internal headers are excluded so we don't
+        # corrupt the upstream request or trigger gzip/keep-alive side effects.
         prefix = "x-llama-server-proxy-header-"
+        hop_by_hop = {
+            "host", "content-length", "connection", "keep-alive",
+            "proxy-authenticate", "proxy-authorization", "te",
+            "trailer", "transfer-encoding", "upgrade", "accept-encoding",
+        }
+
         upstream_headers = {}
+        lower_seen = set()
+        # First pass: prefixed (user-supplied) headers. These win.
         for header, value in self.headers.items():
             h = header.lower()
+            if h in hop_by_hop or not value:
+                continue
             if h.startswith(prefix):
                 name = header[len(prefix):]
-                if name and value:
+                if name:
                     upstream_headers[name] = value
+                    lower_seen.add(name.lower())
+        # Second pass: plain headers (session token, auth, etc.), but never
+        # override a header the prefixed headers already provided.
+        for header, value in self.headers.items():
+            h = header.lower()
+            if h in hop_by_hop or not value:
+                continue
+            if h.startswith(prefix):
+                continue
+            if h in lower_seen:
+                continue
+            upstream_headers[header] = value
+            lower_seen.add(h)
 
         # Read body for non-idempotent methods (e.g., MCP tool POSTs).
         request_body = b""
@@ -1208,6 +1243,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             content_type = response.getheader("Content-Type")
             if content_type:
                 self.send_header("Content-Type", content_type)
+            # Forward upstream response headers the MCP streamable-HTTP
+            # session relies on (e.g. Mcp-Session-Id) back to the browser so
+            # it can echo them on subsequent requests. Without this, stateful
+            # MCP bridges such as supergateway fail with "No valid session ID
+            # provided" on the follow-up POST.
+            hop_by_hop = {
+                "transfer-encoding", "connection", "keep-alive",
+                "proxy-authenticate", "proxy-authorization", "te",
+                "trailer", "upgrade",
+            }
+            for name, value in response.getheaders():
+                key = name.lower()
+                if key in hop_by_hop or key == "content-type":
+                    continue
+                self.send_header(name, value)
             data = response.read()
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
