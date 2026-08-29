@@ -3,4 +3,4 @@ webui-src/
 node_modules/
 __pycache__/
 *.pyc
-testing/
+testing/__pycache__/

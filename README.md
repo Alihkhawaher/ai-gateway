@@ -109,6 +109,7 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - File attachments (images, PDFs, audio, text)
 - Markdown with syntax highlighting and math formulas
 - Dark/light theme
+- MCP server support (attach tools/resources; "Use llama-server proxy" toggle)
 
 #### Displaying Full Raw Model Identifiers
 
@@ -127,6 +128,21 @@ lmstudio/llama-3.2-8b-instruct
 ```
 
 This is especially useful with the AI Gateway's multi-endpoint setup, since the `source/vendor/model` prefix makes it clear which endpoint serves each model. The setting is saved in the browser's localStorage and applies immediately.
+
+## MCP Servers (Tools & Resources)
+
+The web UI can attach **MCP servers** to the chat so the model can call external tools and read resources. HTTP/S MCP servers (Streamable HTTP or SSE) are added by URL in the MCP Servers screen.
+
+- **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers.
+- **Session support** — the proxy forwards the MCP session handshake (`Mcp-Session-Id`) so stateful MCP servers work.
+
+> **Command/stdio servers** (e.g. `@modelcontextprotocol/server-filesystem`) are not spawned by the gateway. To use one, bridge it to HTTP first — for example with [supergateway](https://github.com/supercorp-ai/supergateway):
+>
+> ```
+> npx -y supergateway --stdio "npx -y @modelcontextprotocol/server-filesystem C:\path\to\folder" --port 8099 --outputTransport streamableHttp --stateful
+> ```
+>
+> Then add `http://localhost:8099/mcp` as the MCP URL with the proxy toggle on.
 
 ## Configuration
 
@@ -253,10 +269,20 @@ build-webui.cmd
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files
 ├── webui-src/            # llama.cpp source (gitignored, see "Building the Web UI")
-├── ver2.md               # Architecture design document
+├── testing/              # Automated test suite (python testing/test_proxy.py)
 ├── .gitignore
 └── README.md
 ```
+
+## Testing
+
+The project ships an automated test suite for the proxy's MCP support, using Python's built-in `unittest` (no third-party test runner required):
+
+```bash
+python testing/test_proxy.py
+```
+
+The tests spin up an in-process mock MCP server and an ephemeral gateway, then assert on `/props`, `/cors-proxy` forwarding, header precedence, the MCP session handshake, and error handling — no running gateway, online model, or API key needed.
 
 ## Prerequisites
 
