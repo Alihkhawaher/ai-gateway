@@ -3,7 +3,7 @@ AI Gateway — Multi-endpoint OpenAI-compatible proxy with Textual TUI.
 
 Connects to multiple AI backends (OpenRouter, LM Studio, llama.cpp, etc.)
 simultaneously, checks their availability, and presents a unified model
-catalog to all clients. Model IDs follow the source/vendor/modelname format.
+catalog to all clients. Model IDs follow the source:vendor/modelname format.
 
 Includes an integrated web chat UI (llama.cpp's llama-ui) served at /.
 
@@ -26,6 +26,7 @@ import subprocess
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote, parse_qs
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Config file path ──────────────────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -55,9 +56,10 @@ DEFAULTS = {
         },
     ],
     "models": [
-        "openrouter/openai/gpt-5.6-luna",
-        "openrouter/qwen/qwen3.8-max",
-        "openrouter/deepseek/deepseek-v4-flash-0731",
+        "openrouter:openai/gpt-5.6-luna",
+        "openrouter:qwen/qwen3.8-max",
+        "openrouter:deepseek/deepseek-v4-flash-0731",
+        "openrouter:deepseek/deepseek-v4.1-flash",
     ],
     "model_index": 0,
     "port": 8090,
@@ -165,7 +167,7 @@ def _migrate_v1_config(saved: dict) -> dict:
 
     # Prefix existing model IDs with source name
     old_models = saved.get("models", [])
-    saved["models"] = [f"{name}/{m}" for m in old_models]
+    saved["models"] = [f"{name}:{m}" for m in old_models]
 
     # Remove old top-level fields
     saved.pop("host", None)
@@ -216,13 +218,14 @@ def get_current_model() -> str:
 
 # ── Model ID parsing ─────────────────────────────────────────────────────
 def parse_model_id(model_id: str) -> tuple:
-    """Parse 'source/vendor/model' into (source_name, original_model_id).
+    """Parse 'source:vendor/model' into (source_name, original_model_id).
 
-    First segment = endpoint name (source)
-    Remaining = original model ID as known by the upstream endpoint.
+    First segment (up to the first ':') = endpoint name (source)
+    Remaining = original model ID as known by the upstream endpoint
+    (which may itself contain '/', e.g. deepseek/deepseek-v4.1-flash).
     Returns ("", model_id) if no source prefix found.
     """
-    parts = model_id.split("/", 1)
+    parts = model_id.split(":", 1)
     if len(parts) == 2:
         # Check if the first segment matches a configured endpoint name
         with _config_lock:
@@ -338,6 +341,20 @@ _upstream_ssl_ctx = ssl.create_default_context()
 #      video uploads. Without it the UI reports "requires a vision-capable
 #      model" even for multimodal models.
 #
+#   4. Reasoning / thinking capability MUST be normalized across gateways by
+#      `_extract_reasoning()` and surfaced per model. Each upstream advertises
+#      it differently:
+#        • OpenRouter : meta["reasoning"] = {mandatory, default_enabled,
+#                       supported_efforts, default_effort}  (richest form)
+#        • llama.cpp  : default_generation_settings.params.reasoning_format
+#                       (and chat_template_caps.supports_reasoning)
+#        • Ollama     : model "capabilities" contains "thinking"
+#        • LM Studio  : model "capabilities" contains "reasoning"
+#        • OrcaRouter : (advertises nothing)
+#      The normalized descriptor is exposed as `reasoning` on every /v1/models
+#      entry (top-level + meta.capabilities.reasoning), as a "reasoning"
+#      capability on /api/v0/models, and drives `reasoning_format` in /props.
+#
 # ═══════════════════════════════════════════════════════════════════════════
 #  HEALTH CHECKING & MODEL AGGREGATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -427,16 +444,30 @@ def check_endpoint_health(ep: dict) -> str:
 
 
 def health_check_loop():
-    """Continuously check endpoint health every 30 seconds."""
+    """Continuously check endpoint health every 30 seconds.
+
+    Endpoints are checked in PARALLEL so one slow or unreachable gateway
+    (waiting out its network timeout) doesn't delay all the others. This
+    keeps the startup sweep and each refresh cycle fast regardless of how
+    many offline endpoints are configured.
+    """
     while True:
         endpoints = get_config("endpoints")
+
+        # Separate enabled vs disabled, marking disabled immediately.
+        enabled_eps = []
         for ep in endpoints:
-            name = ep.get("name", "")
             if not ep.get("enabled", False):
-                set_endpoint_status(name, "disabled")
-                continue
-            status = check_endpoint_health(ep)
-            set_endpoint_status(name, status)
+                set_endpoint_status(ep.get("name", ""), "disabled")
+            else:
+                enabled_eps.append(ep)
+
+        if enabled_eps:
+            with ThreadPoolExecutor(max_workers=len(enabled_eps)) as pool:
+                statuses = list(pool.map(check_endpoint_health, enabled_eps))
+            for ep, status in zip(enabled_eps, statuses):
+                set_endpoint_status(ep.get("name", ""), status)
+
         # Re-aggregate models after health check
         aggregate_models()
         time.sleep(30)
@@ -452,6 +483,85 @@ def _modalities_to_input(modalities: dict) -> list:
     if modalities.get("video"):
         mods.append("video")
     return mods
+
+
+# Canonical effort vocabulary, ordered weakest→strongest. Used to normalize
+# the differing per-provider effort names into one consistent scale.
+_EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def _extract_reasoning(meta: dict) -> dict:
+    """Normalize thinking/reasoning capability across all gateway types.
+
+    Different upstreams advertise reasoning in different shapes:
+      • OpenRouter : meta["reasoning"] = {"mandatory", "default_enabled",
+                     "supported_efforts", "default_effort"} — the richest form.
+      • llama.cpp  : default_generation_settings.params.reasoning_format
+                     (anything other than "none" means reasoning is emitted),
+                     and chat_template_caps.supports_reasoning.
+      • Ollama     : model "capabilities" contains "thinking".
+      • LM Studio  : model "capabilities" contains "reasoning".
+      • OrcaRouter : advertises nothing → reasoning unsupported.
+
+    Returns a normalized descriptor ({} when reasoning is unsupported):
+        {
+          "supported": bool,
+          "default_enabled": bool,
+          "mandatory": bool,
+          "supported_efforts": [str, ...],   # canonical scale
+          "default_effort": str | None,
+          "source": "<how we learned it>",
+        }
+    """
+    caps = [c.lower() for c in (meta.get("capabilities") or [])]
+
+    # ── 1. Rich per-model descriptor (OpenRouter-style) ────────────────────
+    r = meta.get("reasoning")
+    if isinstance(r, dict):
+        efforts = r.get("supported_efforts") or []
+        # Normalize any non-canonical effort names (lowercase, reorder).
+        norm_efforts = sorted(
+            {str(e).lower() for e in efforts if e},
+            key=lambda e: _EFFORT_ORDER.index(e) if e in _EFFORT_ORDER else 99,
+        )
+        if not norm_efforts:
+            # No explicit effort list but the model still reasons.
+            norm_efforts = ["low", "medium", "high"]
+        return {
+            "supported": True,
+            "default_enabled": bool(r.get("default_enabled", True)),
+            "mandatory": bool(r.get("mandatory", False)),
+            "supported_efforts": norm_efforts,
+            "default_effort": (r.get("default_effort") or None),
+            "source": "model_metadata",
+        }
+
+    # ── 2. Capability list (Ollama "thinking" / LM Studio "reasoning") ─────
+    if "thinking" in caps or "reasoning" in caps:
+        return {
+            "supported": True,
+            "default_enabled": True,
+            "mandatory": False,
+            "supported_efforts": [],
+            "default_effort": None,
+            "source": "capabilities",
+        }
+
+    # ── 3. llama.cpp reasoning_format + chat template caps ─────────────────
+    gen = meta.get("default_generation_settings") or {}
+    params = gen.get("params") or {}
+    reasoning_format = params.get("reasoning_format")
+    if reasoning_format and str(reasoning_format).lower() != "none":
+        return {
+            "supported": True,
+            "default_enabled": True,
+            "mandatory": False,
+            "supported_efforts": [],
+            "default_effort": None,
+            "source": "llama_reasoning_format",
+        }
+
+    return {}
 
 
 def fetch_openrouter_models(host: str, api_key: str) -> list:
@@ -472,17 +582,55 @@ def fetch_openrouter_models(host: str, api_key: str) -> list:
 
 
 def fetch_lmstudio_models(host: str) -> list:
-    """Fetch loaded models from LM Studio."""
+    """Fetch loaded models from LM Studio via /api/v0/models.
+
+    The OpenAI-style /v1/models endpoint returns only id/object/owned_by,
+    so we query /api/v0/models instead, which reports the real context
+    sizes (max_context_length, loaded_context_length) plus arch,
+    quantization, publisher and capabilities.
+
+    Context fields carried through to the gateway:
+      - context_length          → max_context_length (model's max window)
+      - loaded_context_length   → the context currently loaded in LM Studio
+    """
     try:
         conn = http.client.HTTPConnection(host, timeout=10)
-        conn.request("GET", "/v1/models")
+        conn.request("GET", "/api/v0/models")
         resp = conn.getresponse()
         data = json.loads(resp.read())
         conn.close()
-        return data.get("data", [])
     except Exception as e:
         print(f"[proxy] Error fetching LM Studio models: {e}")
         return []
+
+    models = []
+    for m in data.get("data", []):
+        model_id = m.get("id", "")
+        if not model_id:
+            continue
+        max_ctx = m.get("max_context_length") or m.get("context_length")
+        if max_ctx is None:
+            max_ctx = 128000
+        loaded_ctx = m.get("loaded_context_length") or max_ctx
+        caps = m.get("capabilities", []) or []
+        input_mods = ["text"]
+        if "tool_use" in caps:
+            input_mods.append("tool_use")
+        models.append({
+            "id": model_id,
+            "name": m.get("name", model_id),
+            "context_length": max_ctx,
+            "loaded_context_length": loaded_ctx,
+            "owned_by": m.get("publisher", ""),
+            "arch": m.get("arch", ""),
+            "quantization": m.get("quantization", ""),
+            "capabilities": caps,
+            "architecture": {
+                "input_modalities": input_mods,
+                "output_modalities": ["text"],
+            },
+        })
+    return models
 
 
 def fetch_llama_server_models(host: str) -> list:
@@ -504,16 +652,26 @@ def fetch_llama_server_models(host: str) -> list:
         if model_name.lower().endswith(".gguf"):
             model_name = model_name[:-5]
         modalities = props.get("modalities", {})
+        gen_settings = props.get("default_generation_settings", {}) or {}
+        chat_caps = props.get("chat_template_caps", {}) or {}
 
-        return [{
+        entry = {
             "id": model_name,
             "name": model_name,
-            "context_length": props.get("default_generation_settings", {}).get("n_ctx", 128000),
+            "context_length": gen_settings.get("n_ctx", 128000),
             "architecture": {
                 "input_modalities": _modalities_to_input(modalities),
                 "output_modalities": ["text"],
             },
-        }]
+            # Keep the raw generation settings so _extract_reasoning() can read
+            # reasoning_format from params for this model.
+            "default_generation_settings": gen_settings,
+        }
+        # If llama.cpp reports reasoning support via the chat template, mark it
+        # as a "thinking" capability (same key Ollama uses).
+        if chat_caps.get("supports_reasoning"):
+            entry["capabilities"] = ["thinking"]
+        return [entry]
     except Exception as e:
         print(f"[proxy] Error fetching llama-server models: {e}")
         return []
@@ -537,11 +695,14 @@ def fetch_ollama_models(host: str) -> list:
             if model_name.endswith(":latest"):
                 model_name = model_name[:-7]
             # Ollama doesn't provide context_length in /api/tags,
-            # use a reasonable default
+            # use a reasonable default. Newer Ollama versions advertise
+            # capabilities (e.g. "thinking", "tools", "vision") per model.
+            caps = m.get("capabilities", []) or []
             models.append({
                 "id": model_name,
                 "name": model_name,
                 "context_length": 128000,
+                "capabilities": caps,
                 "architecture": {
                     "input_modalities": ["text"],
                     "output_modalities": ["text"],
@@ -650,12 +811,12 @@ def aggregate_models():
             # top intelligent models.
             or_original_ids = set()
             for um in user_models:
-                if um.startswith(f"{name}/"):
+                if um.startswith(f"{name}:"):
                     or_original_ids.add(um[len(name) + 1:])
             # Also include top intelligent models for this endpoint
             with _top_models_lock:
                 for tm in _top_intelligent_models:
-                    if tm.startswith(f"{name}/"):
+                    if tm.startswith(f"{name}:"):
                         or_original_ids.add(tm[len(name) + 1:])
             if not or_original_ids:
                 continue
@@ -667,7 +828,7 @@ def aggregate_models():
             or_meta = {m.get("id", ""): m for m in all_or}
             for original_id in or_original_ids:
                 meta = or_meta.get(original_id, {"id": original_id, "name": original_id})
-                aggregated_id = f"{name}/{original_id}"
+                aggregated_id = f"{name}:{original_id}"
                 new_routes[aggregated_id] = (name, original_id, ep)
                 meta["_source"] = name
                 meta["_source_host"] = host
@@ -689,7 +850,7 @@ def aggregate_models():
                 original_id = model.get("id", "")
                 if not original_id:
                     continue
-                aggregated_id = f"{name}/{original_id}"
+                aggregated_id = f"{name}:{original_id}"
                 new_routes[aggregated_id] = (name, original_id, ep)
                 model["_source"] = name
                 model["_source_host"] = host
@@ -931,6 +1092,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if has_video:
                 tags.append("video")
 
+            # Normalized reasoning/thinking descriptor ({} when unsupported).
+            reasoning = _extract_reasoning(meta)
+            if reasoning.get("supported"):
+                tags.append("reasoning")
+
             # Parse source from model ID
             source, original_id = parse_model_id(m)
 
@@ -962,12 +1128,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "input_modalities": input_mods,
                     "output_modalities": output_mods,
                 },
+                # Normalized reasoning/thinking capability. Exposed top-level
+                # (mirrors OpenRouter's own `reasoning` field) so clients can
+                # discover supported thinking levels per model.
+                "reasoning": reasoning,
                 "meta": {
                     "capabilities": {
                         "vision": has_vision,
                         "audio": has_audio,
                         "video": has_video,
                         "function_calling": has_tools,
+                        "reasoning": bool(reasoning.get("supported")),
                     },
                 },
             }
@@ -988,6 +1159,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for m in get_models():
             meta = get_model_meta(m)
             context_length = meta.get("context_length", 128000)
+            loaded_context = meta.get("loaded_context_length", context_length)
 
             input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
             # Tool calling is reported by OpenRouter/OrcaRouter in
@@ -1004,18 +1176,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             capabilities = []
             if has_tools:
                 capabilities.append("tool_use")
+            # LM Studio advertises reasoning support as a "reasoning" capability.
+            reasoning = _extract_reasoning(meta)
+            if reasoning.get("supported"):
+                capabilities.append("reasoning")
 
             entry = {
                 "id": m,
                 "object": "model",
                 "type": "llm",
                 "publisher": meta.get("owned_by", source),
-                "arch": meta.get("architecture", {}).get("modality", "unknown"),
-                "compatibility_type": "openai",
-                "quantization": "",
+                "arch": meta.get("arch") or meta.get("architecture", {}).get("modality", "unknown"),
+                "compatibility_type": "gguf" if meta.get("quantization") else "openai",
+                "quantization": meta.get("quantization", ""),
                 "state": "loaded",
                 "max_context_length": context_length,
-                "loaded_context_length": context_length,
+                "loaded_context_length": loaded_context,
             }
             if capabilities:
                 entry["capabilities"] = capabilities
@@ -1035,6 +1211,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         has_vision = any(m in input_mods for m in ("image", "vision"))
         has_audio = "audio" in input_mods
         has_video = "video" in input_mods
+
+        # Drive llama.cpp's reasoning params from the model's real capability
+        # instead of the old hardcoded "none" / False.
+        reasoning = _extract_reasoning(meta)
+        reasoning_format = "auto" if reasoning.get("supported") else "none"
 
         data = {
             "default_generation_settings": {
@@ -1058,7 +1239,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "logit_bias": [], "n_probs": 0, "min_keep": 0,
                     "grammar": "", "grammar_lazy": False,
                     "grammar_triggers": [], "preserved_tokens": [],
-                    "chat_format": "chatml", "reasoning_format": "none",
+                    "chat_format": "chatml", "reasoning_format": reasoning_format,
                     "reasoning_in_content": False, "generation_prompt": "",
                     "samplers": ["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"],
                     "backend_sampling": False,
@@ -1078,6 +1259,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "modalities": {
                 "vision": has_vision, "audio": has_audio, "video": has_video,
             },
+            # Normalized reasoning descriptor (llama.cpp UI + other clients).
+            "reasoning": reasoning,
             "chat_template": "", "bos_token": "", "eos_token": "",
             "build_info": "ai-gateway v2.0",
             # Advertise the /cors-proxy endpoint so the bundled llama-ui
@@ -1845,7 +2028,7 @@ def fetch_top_intelligent_models(limit: int = 20):
         data = json.loads(resp.read())
         conn.close()
 
-        top_models = [f"{ep_name}/{m['id']}" for m in data.get("data", [])[:limit]]
+        top_models = [f"{ep_name}:{m['id']}" for m in data.get("data", [])[:limit]]
         with _top_models_lock:
             _top_intelligent_models = top_models
 
@@ -1944,7 +2127,7 @@ class MainScreen(Screen):
             else:
                 icon = "○"
                 style = "red"
-            model_count = sum(1 for m in get_models() if m.startswith(f"{name}/"))
+            model_count = sum(1 for m in get_models() if m.startswith(f"{name}:"))
             lines.append(f"  {icon} {name:<12} → {host:<24} [{status}]  {model_count} models")
         status_widget.update("\n".join(lines) if lines else "  No endpoints configured")
 

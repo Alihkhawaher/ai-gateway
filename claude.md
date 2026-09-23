@@ -6,13 +6,14 @@
 
 AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI and a bundled web chat UI (llama.cpp's llama-ui). It connects to several AI backends simultaneously, health-checks them, aggregates their models into a unified catalog, and routes requests based on model ID prefixes.
 
-**Single-file architecture:** the entire application lives in `proxy.py` (proxy server + TUI + static file server). There is no framework, no database, and no external runtime dependency beyond Python 3.8+ and the `textual` library (auto-installed on first run).
+**Single-file architecture:** the entire application lives in `proxy.py` (proxy server + TUI + static file server). There is no framework, no database, and no external runtime dependency beyond Python 3.8+ and the `textual` library (auto-installed on first run). The optional launcher `gateway_tui.py` (split-view TUI: proxy GUI + Supergateway) subclasses `proxy.py`'s TUI classes — it does not modify or duplicate them.
 
 ## Repository Layout
 
 ```
 .
 ├── proxy.py              # Main application (proxy + TUI + static server)
+├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + Supergateway)
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — GITIGNORED
 ├── build-webui.cmd       # One-click web UI build script
@@ -85,7 +86,10 @@ For this to work, the gateway must:
 Caveat: the proxy only forwards to HTTP(S) URLs. It does **not** spawn
 command/stdio MCP servers (e.g. `@modelcontextprotocol/server-filesystem`).
 To use a stdio server, bridge it to HTTP first (e.g. `supergateway`) and add
-the resulting localhost URL with the proxy toggle on.
+the resulting localhost URL with the proxy toggle on. The split-view TUI
+(`gateway_tui.py`) does this automatically: it launches `supergateway`
+bridging `@modelcontextprotocol/server-filesystem` (root `./supergateway`,
+relative to the project directory) to streamable HTTP on `:8099`.
 
 ## API Endpoints
 

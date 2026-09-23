@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCP Servers — Filesystem & Command Prompt Access Comparison</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #161a24;
+    --panel-2: #1d2230;
+    --border: #2a3040;
+    --text: #e6e9f0;
+    --muted: #98a0b3;
+    --accent: #6ea8fe;
+    --good: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --code-bg: #0a0c12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem 1rem;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; }
+  h1 { margin: 0 0 .25rem; font-size: 1.9rem; }
+  h2 { margin: 2.5rem 0 1rem; font-size: 1.4rem; border-bottom: 1px solid var(--border); padding-bottom: .4rem; }
+  h3 { margin: 1.5rem 0 .6rem; font-size: 1.1rem; color: var(--accent); }
+  p, li { color: var(--text); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem 1.4rem; margin: 1rem 0; }
+  code, pre { font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace; }
+  code { background: var(--code-bg); padding: .1rem .35rem; border-radius: 5px; font-size: .9em; }
+  pre { background: var(--code-bg); padding: 1rem; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); }
+  pre code { background: none; padding: 0; }
+  .rust { color: #e07b53; font-weight: 600; }
+  .table-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .86rem; }
+  th, td { border: 1px solid var(--border); padding: .55rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--panel-2); color: #fff; white-space: nowrap; }
+  tr:nth-child(even) td { background: var(--panel); }
+  .y { color: var(--good); font-weight: 600; }
+  .n { color: var(--bad); font-weight: 600; }
+  .p { color: var(--warn); font-weight: 600; }
+  .tag { display: inline-block; font-size: .7rem; padding: .1rem .45rem; border-radius: 99px; border: 1px solid var(--border); color: var(--muted); margin-right: .3rem; white-space: nowrap; }
+  .tag.shell { background: rgba(248,113,113,.12); color: var(--bad); border-color: rgba(248,113,113,.4); }
+  .tag.fs { background: rgba(110,168,254,.12); color: var(--accent); border-color: rgba(110,168,254,.4); }
+  .tag.http { background: rgba(74,222,128,.12); color: var(--good); border-color: rgba(74,222,128,.4); }
+  .tag.rust { background: rgba(224,123,83,.12); color: #e07b53; border-color: rgba(224,123,83,.4); }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin: 1rem 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.2rem; }
+  .card h4 { margin: 0 0 .5rem; }
+  .best { border-left: 4px solid var(--good); }
+  .cautious { border-left: 4px solid var(--warn); }
+  .rusty { border-left: 4px solid #e07b53; }
+  .why { color: var(--muted); font-size: .9rem; }
+  ul { margin: .5rem 0 .5rem 1.2rem; }
+  .note { background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.3); border-radius: 8px; padding: .8rem 1rem; margin: 1rem 0; }
+  .note strong { color: var(--warn); }
+  .small { font-size: .8rem; color: var(--muted); }
+  .gh { opacity: .85; font-size: .82em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>MCP Servers for Filesystem & Command Prompt Access</h1>
+  <p class="subtitle">A comparison of Model Context Protocol (MCP) servers that let an AI agent read/write local files and/or execute shell commands — with explicit reasoning for each recommendation and links to every project.</p>
+
+  <div class="note">
+    <strong>Context for AI Gateway:</strong> The bundled web UI can only attach MCP servers over <strong>HTTP/S</strong> (Streamable HTTP or SSE) — the gateway does <em>not</em> spawn command/stdio servers. So any stdio-based server below must be bridged to HTTP first (see <a href="#bridging">§5 Bridging</a>), then added as <code>http://localhost:<port>/mcp</code> with the <strong>"Use llama-server proxy"</strong> toggle enabled to bypass browser CORS.
+  </div>
+
+  <h2>1. Quick orientation — what "access" means</h2>
+  <div class="panel">
+    <p>There are two distinct capabilities, often confused:</p>
+    <ul>
+      <li><span class="tag fs">FILESYSTEM</span> <strong>Filesystem access</strong> — read, write, list, search, move, delete files within (optionally) scoped directories. No ability to run programs.</li>
+      <li><span class="tag shell">SHELL</span> <strong>Command prompt / terminal access</strong> — execute arbitrary shell commands, run long-lived processes, inspect running processes, interact with REPLs. This <em>includes</em> implicit file access (a shell can read/write anything the OS user can).</li>
+    </ul>
+    <p>Some servers offer only filesystem access (safer); others combine both. Most "filesystem-only" servers are safer because they enforce a path allow-list and cannot execute code.</p>
+  </div>
+
+  <h2>2. All-in-one servers (filesystem + shell)</h2>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Server</th>
+        <th>Language</th>
+        <th>Shell commands</th>
+        <th>Filesystem</th>
+        <th>Process mgmt</th>
+        <th>Security model</th>
+        <th>Transport</th>
+        <th>Windows-friendly</th>
+        <th>Stars (approx)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong><a href="https://github.com/wonderwhy-er/DesktopCommanderMCP" target="_blank">Desktop Commander</a></strong><br><code>@wonderwhy-er/desktop-commander</code></td>
+        <td>TypeScript</td>
+        <td class="y">Yes — <code>execute_command</code> (any shell), interactive sessions</td>
+        <td class="y">Yes — plus Excel/PDF/DOCX, diff <code>edit_block</code></td>
+        <td class="y">Yes — <code>start_process</code>, list/kill</td>
+        <td>Command blocklist, symlink-traversal prevention, optional Docker, audit log. <strong>allowedDirectories only restricts file tools, NOT the terminal.</strong></td>
+        <td>stdio (+ remote MCP)</td>
+        <td class="y">Yes</td>
+        <td>~6,000</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/ellmos-ai/ellmos-filecommander-mcp" target="_blank">FileCommander</a></strong><br><code>ellmos-filecommander-mcp</code></td>
+        <td>TypeScript</td>
+        <td class="y">Yes — <code>fc_execute_command</code></td>
+        <td class="y">Yes — 14+ tools, safe delete to Recycle Bin, ZIP, JSON repair, OCR (opt)</td>
+        <td class="y">Yes — start/list/kill</td>
+        <td>No sandboxing; runs with full user permissions. Safe-delete (Recycle Bin/Trash) is the standout safety feature on Windows.</td>
+        <td>stdio only</td>
+        <td class="y">Yes (safe delete → Recycle Bin)</td>
+        <td>smaller/newer</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/gaspardpetit/mcp-shell" target="_blank">mcp-shell</a></strong></td>
+        <td>Docker image</td>
+        <td class="y">Yes — <code>shell.exec</code>, plus <code>python.run</code>, <code>node.run</code></td>
+        <td class="y">Yes — <code>fs.*</code>, <code>git.*</code>, doc/media tools</td>
+        <td class="y">Yes — <code>proc.*</code></td>
+        <td><strong>Container isolation (non-root)</strong>, read-only/read-write mounts, egress control, allow/deny command patterns, rate limits. Strongest isolation.</td>
+        <td class="y">HTTP <code>/mcp</code> + SSE by default (native for gateway)</td>
+        <td class="y">Via Docker</td>
+        <td>moderate</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Why "best" depends on what you value — explained</h3>
+  <div class="card-grid">
+    <div class="card best">
+      <h4>🥇 Desktop Commander — best all-round for local use</h4>
+      <p class="why"><strong>Why:</strong> The most mature, actively maintained single server combining terminal + filesystem + search + diff editing. Its <code>execute_command</code> gives true command-prompt access, while <code>start_process</code>/<code>interact_with_process</code> let the agent run long-lived dev servers and read streaming output — something most filesystem servers cannot do. It reads Excel/PDF/DOCX directly, and <code>edit_block</code> applies surgical diffs instead of blind overwrites. Windows support is solid.</p>
+      <p class="why"><strong>Trade-off:</strong> The terminal bypasses the directory allow-list, so it is effectively "give the AI your OS user's shell" — use only on a machine you trust, never in production/shared environments.</p>
+    </div>
+    <div class="card cautious">
+      <h4>🔒 mcp-shell — best if you want isolation</h4>
+      <p class="why"><strong>Why:</strong> The only one that sandboxes in a non-root container by default. You control exactly which host folders are mounted (and whether read-only), whether it can reach the network, and which commands are allowed. This is the responsible choice when you don't fully trust the agent.</p>
+      <p class="why"><strong>Trade-off:</strong> Requires Docker, and "filesystem access" only reaches what you explicitly mount into <code>/workspace</code>. It's also HTTP-native, which removes the need for a separate bridge to the AI Gateway.</p>
+    </div>
+    <div class="card">
+      <h4>🗑️ FileCommander — standout for Windows safety</h4>
+      <p class="why"><strong>Why:</strong> Its safe-delete routes deletions to the Recycle Bin/Trash (recoverable), and it uniquely handles cloud-lock files (OneDrive/Dropbox), async background search, and interactive REPLs. 47 tools in one server.</p>
+      <p class="why"><strong>Trade-off:</strong> Newer and smaller community; stdio-only (needs a bridge for the gateway); no path allow-list sandboxing.</p>
+    </div>
+  </div>
+
+  <h2>3. Filesystem-only servers (no shell — safer, official baseline)</h2>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Server</th>
+        <th>Language</th>
+        <th>Tools</th>
+        <th>Shell access</th>
+        <th>Path sandboxing</th>
+        <th>HTTP transport</th>
+        <th>Notable features</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong><a href="https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem" target="_blank">Official Filesystem</a></strong><br><code>@modelcontextprotocol/server-filesystem</code></td>
+        <td>TypeScript (Anthropic)</td>
+        <td>14 — read/write/list/search/move/get_info/create_directory</td>
+        <td class="n">None</td>
+        <td class="y">Yes — strict allow-list of passed directories</td>
+        <td class="n">stdio only</td>
+        <td>Reference implementation, battle-tested, safest default</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/j0hanz/filesystem-mcp" target="_blank">filesystem-mcp</a></strong></td>
+        <td>TypeScript</td>
+        <td>18 — incl diff, patch, hash, grep, bulk search/replace</td>
+        <td class="n">None</td>
+        <td class="y">Yes — symlink-escape prevention, sensitive-file denylist</td>
+        <td class="y">Yes — <code>--port</code> (stateful Streamable HTTP)</td>
+        <td>Security-first, optional API key, host-header validation</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://pypi.org/project/fs-mcp/" target="_blank">fs-mcp</a></strong></td>
+        <td>Python (fastmcp)</td>
+        <td>read/grep/tree/edit + <code>run_command</code> (shell, destructive blocked)</td>
+        <td class="p">Limited — shell with destructive-command blocking</td>
+        <td class="p">Partial — path validation + command blocking</td>
+        <td class="y">Yes — HTTP <code>:8124/mcp</code> + Web UI <code>:8123</code></td>
+        <td>Human-in-the-loop review (VS Code diff), RTK output compression</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Why choose filesystem-only?</h3>
+  <div class="panel">
+    <ul>
+      <li><strong>Official Filesystem</strong> is the <em>safest</em> option: it cannot run commands and is hard-restricted to the directories you list. Choose it when you only need structured read/write and want to avoid giving the model a shell.</li>
+      <li><strong>filesystem-mcp</strong> is the best <em>security-hardened</em> upgrade: it adds diffing/patching and — crucially — a <strong>native HTTP mode</strong>, so it can plug into the AI Gateway directly without a separate bridge.</li>
+      <li><strong>fs-mcp</strong> is notable for its <strong>human-in-the-loop editing</strong> (propose a change, review a diff in VS Code, then apply) and an HTTP server + web UI out of the box. Its <code>run_command</code> is a middle-ground that blocks destructive commands (<code>rm</code>, <code>kill</code>).</li>
+    </ul>
+  </div>
+
+  <h2>4. Rust-native tools <span class="rust">(Rust)</span></h2>
+  <p>Rust MCP servers/bridges are typically single static binaries, very low on memory/CPU, and embed strong safety guarantees. There are two use cases here: <strong>(a) bridges</strong> (stdio → HTTP) and <strong>(b) filesystem/shell servers</strong>.</p>
+
+  <h3>4a. Rust filesystem / shell servers</h3>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Server</th>
+        <th>Shell commands</th>
+        <th>Filesystem</th>
+        <th>Path sandboxing</th>
+        <th>HTTP transport</th>
+        <th>Notes / why it stands out</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong><a href="https://github.com/nihmadev/fs-mcp-rs" target="_blank">fs-mcp-rs</a></strong> <span class="rust">Rust</span></td>
+        <td class="y">Yes — <code>run_command</code>, persistent terminal sessions (<code>terminal_start/read/write/kill</code>)</td>
+        <td class="y">Yes — bounded reads/writes/search/tree, atomic replacement, BLAKE3 hashes, <code>patch</code> (unified diff)</td>
+        <td class="y">Yes — explicit allow-list of roots, read-only mode, symlink traversal off by default</td>
+        <td class="y">Yes — <code>/mcp</code> + <code>/health</code> (Streamable HTTP)</td>
+        <td>The best <em>Rust all-in-one</em>: combines filesystem <strong>and</strong> terminal with strong bounding and a path policy. Arbitrary commands run as your OS account — roots/read-only do NOT sandbox the terminal (clearly documented).</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://docs.rs/mcp-filesystem/latest" target="_blank">mcp-filesystem</a></strong> <span class="rust">Rust</span></td>
+        <td class="n">None</td>
+        <td class="y">Yes — read/write/edit/search/hash/compress/encrypt/CSV (41 tools)</td>
+        <td class="y">Yes — strict <code>PathTrie</code> allow-list + symlink escape protection; <code>readonly</code> mode</td>
+        <td class="y">Yes — HTTP <code>POST /rpc</code> + TLS option</td>
+        <td>Purely filesystem (no shell), privacy/performance focused: Tokio async I/O, mimalloc, zero-copy reads, per-category tool opt-in. Good for a hardened, restricted file server.</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://crates.io/crates/filesystem-mcp-rs" target="_blank">filesystem-mcp-rs</a></strong> <span class="rust">Rust</span></td>
+        <td class="p">Yes — <code>run_command</code> (sync/managed/detached) + process tools</td>
+        <td class="y">Yes — very rich: hashing, diff/compare, archives, tail/watch, grep, Excel/DOCX, S3, screenshots</td>
+        <td class="y">Yes — allowlist/roots + escape protection</td>
+        <td class="y">Yes — HTTP with SSE streaming (<code>/mcp</code>, <code>/health</code>)</td>
+        <td>Rust port of the official filesystem server, extended with shell, process management, and many extras. Feature-flagged (network/S3/screenshot). Windows notes for Claude Code included.</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/yuunnn-w/Rust-MCP-Server" target="_blank">Rust-MCP-Server</a></strong> <span class="rust">Rust</span></td>
+        <td class="y">Yes — <code>Bash</code> (disabled by default), <code>ExecutePython</code>, <code>Git</code></td>
+        <td class="y">Yes — file ops + office docs (.docx/.pptx/.xlsx/.pdf/.ipynb)</td>
+        <td class="p">Working-directory restricted writes; read-only tools can access any path</td>
+        <td class="y">Yes — HTTP (default) + SSE, plus a WebUI control panel</td>
+        <td>21 built-in tools with a modern <strong>WebUI</strong> and tool presets. Writes restricted to working dir; sysinfo/process inspection available.</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/rust-mcp-stack/rust-mcp-filesystem" target="_blank">Rust MCP Filesystem</a></strong> <span class="rust">Rust</span></td>
+        <td class="n">None</td>
+        <td class="y">Yes — modern high-performance async filesystem ops</td>
+        <td class="y">Yes</td>
+        <td class="y">Yes — built on the Rust MCP SDK (Axum)</td>
+        <td>From the <a href="https://github.com/rust-mcp-stack/rust-mcp-sdk" target="_blank">rust-mcp-sdk</a> project (100% MCP conformance). A clean, spec-compliant filesystem server using a conformance-tested SDK.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="card-grid">
+    <div class="card rusty">
+      <h4>⚙️ fs-mcp-rs — pick this if you want a Rust "Desktop Commander"</h4>
+      <p class="why"><strong>Why:</strong> It merges a bounded terminal (with persistent sessions and process-tree kill) into a path-policy-enforced filesystem server — the closest Rust equivalent to Desktop Commander, with stricter resource bounding and an explicit separation between filesystem roots (sandboxed) and terminal commands (not sandboxed, clearly warned).</p>
+    </div>
+    <div class="card">
+      <h4>🛡️ mcp-filesystem — pick this for a hardened files-only Rust server</h4>
+      <p class="why"><strong>Why:</strong> No shell at all, strict <code>PathTrie</code> allow-list, read-only mode, per-tool-category opt-in, and TLS support. It's the most defensible choice if you want Rust performance with maximum safety and zero command-execution surface.</p>
+    </div>
+  </div>
+
+  <h2 id="bridging">5. Bridging stdio → HTTP for the AI Gateway</h2>
+  <p>Because the gateway web UI only accepts HTTP/S MCP endpoints, stdio servers must be exposed over HTTP. These bridges all do the same job; the key differentiator is <strong>stateful Streamable HTTP + <code>Mcp-Session-Id</code> support</strong> (which matches your v2.4.0 <code>/cors-proxy</code> session forwarding). Links are provided for verification.</p>
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th>Bridge</th>
+        <th>Language</th>
+        <th>Stateful Streamable HTTP</th>
+        <th>SSE</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong><a href="https://github.com/supercorp-ai/supergateway" target="_blank">supergateway</a></strong></td>
+        <td>JS/TS</td>
+        <td class="y">Yes (<code>--stateful</code>)</td>
+        <td class="y">Yes</td>
+        <td>Simplest one-liner; already documented in this project</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/punkpeye/mcp-proxy" target="_blank">mcp-proxy</a></strong></td>
+        <td>TypeScript</td>
+        <td class="y">Yes</td>
+        <td class="y">Yes</td>
+        <td>Same lib FastMCP uses; actively maintained; per-request + session modes</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/jpetrucciani/ferry" target="_blank">ferry</a></strong> <span class="rust">Rust</span></td>
+        <td>Rust</td>
+        <td class="y">Yes</td>
+        <td class="y">Yes</td>
+        <td>Single static binary; <code>Mcp-Session-Id</code>/protocol handling; SOCKS5/TLS</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/hyper-mcp-rs/hyper-mcp-proxy" target="_blank">hyper-mcp-proxy</a></strong> <span class="rust">Rust</span></td>
+        <td>Rust</td>
+        <td class="y">Yes</td>
+        <td class="n">No</td>
+        <td>One child process per session; full protocol forwarding</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://pypi.org/project/mcp-stdio/" target="_blank">mcp-stdio</a></strong> (<code>serve</code>)</td>
+        <td>Python</td>
+        <td class="y">Yes</td>
+        <td class="y">Yes</td>
+        <td>Stdlib-only, no deps; optional auth/OAuth</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/brrock/mcp-bridge" target="_blank">mcp-bridge</a></strong></td>
+        <td>TS</td>
+        <td class="p">Partial</td>
+        <td class="y">Yes</td>
+        <td>Serverless/Vercel focus</td>
+      </tr>
+      <tr>
+        <td><strong><a href="https://github.com/hackagadget/mcp-stdio-bridge" target="_blank">mcp-stdio-bridge</a></strong></td>
+        <td>TS</td>
+        <td class="p">Partial</td>
+        <td class="y">Yes</td>
+        <td>Jailing + command-wrapper focus</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="small">Rust SDK reference: <a href="https://github.com/rust-mcp-stack/rust-mcp-sdk" target="_blank">rust-mcp-sdk</a> is the underlying conformance-tested Rust toolkit for building Streamable-HTTP/SSE/stdio MCP servers and clients (used by the Rust servers above).</p>
+
+  <h2>6. Concrete examples for the AI Gateway</h2>
+  <h3>Option A — Desktop Commander (filesystem + terminal) via supergateway</h3>
+  <pre><code>npx -y supergateway \
+  --stdio "npx -y @wonderwhy-er/desktop-commander" \
+  --port 8099 \
+  --outputTransport streamableHttp \
+  --stateful</code></pre>
+  <p>Add in the UI: <code>http://localhost:8099/mcp</code> with <strong>Use llama-server proxy = ON</strong>.</p>
+
+  <h3>Option B — Official filesystem server (safe, files only)</h3>
+  <pre><code>npx -y supergateway \
+  --stdio "npx -y @modelcontextprotocol/server-filesystem C:\path\to\allowed\folder" \
+  --port 8099 \
+  --outputTransport streamableHttp \
+  --stateful</code></pre>
+
+  <h3>Option C — Rust bridge (e.g. ferry) around a Rust server</h3>
+  <pre><code># Rust-native: ferry bridges a stdio server to Streamable HTTP in one static binary
+ferry serve --listen 127.0.0.1:8099 stdio -- fs-mcp-rs /allowed/folder</code></pre>
+
+  <h3>Option D — No bridge needed (HTTP-native)</h3>
+  <ul>
+    <li><strong>filesystem-mcp:</strong> <code>npx -y @j0hanz/filesystem-mcp --port 8099 C:\allowed\folder</code> → add <code>http://localhost:8099/mcp</code></li>
+    <li><strong>fs-mcp:</strong> <code>uvx fs-mcp .</code> → HTTP at <code>http://localhost:8124/mcp</code>, Web UI at <code>:8123</code></li>
+    <li><strong>mcp-shell:</strong> run the Docker image → <code>http://localhost:3333/mcp</code> + <code>/healthz</code></li>
+    <li><strong>fs-mcp-rs / filesystem-mcp-rs:</strong> start in HTTP mode → <code>http://localhost:<port>/mcp</code></li>
+  </ul>
+
+  <h2>7. Security guidance</h2>
+  <div class="panel">
+    <ul>
+      <li><span class="tag shell">SHELL</span> servers = giving the model your OS user's privileges. Use locally only, on a machine you can wipe, never in shared/production environments.</li>
+      <li><span class="tag fs">FILESYSTEM-only</span> servers are the safer default; prefer ones with a path allow-list (official Filesystem, filesystem-mcp, mcp-filesystem, fs-mcp-rs).</li>
+      <li><span class="tag rust">RUST</span> servers with <code>run_command</code>/terminal make the same "unsandboxed terminal" trade-off as Desktop Commander — their roots/read-only policy does <em>not</em> confine the shell. Read each project's warnings.</li>
+      <li>For any exposure beyond localhost, prefer <strong>mcp-shell</strong> (container) or add your own auth layer — most community servers ship with <em>no</em> authentication by default.</li>
+      <li>Desktop Commander's own docs warn its directory restrictions and command blocklist can be bypassed via symlinks/command substitution — treat it as unrestricted.</li>
+    </ul>
+  </div>
+
+  <p class="small">Data compiled from each project's GitHub README / crate or registry listing and independent tool-enumeration reviews. Star counts and exact tool numbers change over time — follow the links to verify current state.</p>
+
+</div>
+</body>
+</html>
