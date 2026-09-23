@@ -3,17 +3,18 @@ Gateway Split-View TUI.
 
 Runs the AI Gateway proxy (from proxy.py, started headlessly) with its FULL
 existing GUI (endpoint status, server info, settings) in the top pane, and
-Supergateway (streamable HTTP MCP server) in the bottom pane.
+1MCP (an aggregated streamable-HTTP MCP endpoint) in the bottom pane.
 
 This is achieved by subclassing proxy.py's own TUI classes — proxy.py itself
 is never modified:
   - SplitMainScreen(proxy.MainScreen): overrides only compose() to wrap the
-    existing widgets (same IDs) in a top pane and add a supergateway pane.
+    existing widgets (same IDs) in a top pane and add an MCP bridge pane.
     All inherited logic (status refresh, log draining, settings) keeps working.
   - GatewayApp(proxy.ProxyTUI): inherits all CSS/screens, swaps in the split
     main screen.
 """
 
+import json
 import os
 import queue
 import subprocess
@@ -28,28 +29,58 @@ import proxy  # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Supergateway subprocess (relative filesystem root)
+#  1MCP aggregator subprocess (multiple MCPs -> one /mcp port)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_supergateway_cmd() -> list:
-    """Build the supergateway command list.
+MCP_CONFIG_FILE = os.path.join(SCRIPT_DIR, "mcp.json")
+# The HTTP port the BRIDGE listens on (the stdio MCP itself has no port).
+BRIDGE_PORT = 8099
 
-    The filesystem server root is 'supergateway' — relative to the project
-    directory (SCRIPT_DIR), NOT an absolute hardcoded path. The inner npx
-    command resolves it against the subprocess cwd (set to SCRIPT_DIR).
+
+def load_mcp_servers() -> dict:
+    """Load stdio MCP server definitions from mcp.json.
+
+    Returns the `mcpServers` object (name -> {command, args, ...}), or an
+    empty dict when the file is missing/invalid. mcp.json is gitignored — it
+    is the user's server-side list of stdio MCP servers to bridge.
     """
-    stdio_arg = "npx -y @modelcontextprotocol/server-filesystem supergateway"
+    try:
+        with open(MCP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        servers = data.get("mcpServers", {})
+        return servers if isinstance(servers, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[gateway-tui] Could not read mcp.json: {e}")
+        return {}
+
+
+def build_mcp_bridge_cmd() -> list:
+    """Build the 1MCP aggregator command from mcp.json.
+
+    1MCP (@1mcp/agent) reads mcp.json directly (same `mcpServers` schema) and
+    aggregates EVERY configured MCP server behind ONE streamable-HTTP endpoint
+    on BRIDGE_PORT — so multiple MCPs share a single port instead of needing one
+    port each. llama-ui connects once to /mcp and sees all tools (namespaced
+    server___tool).
+    """
+    servers = load_mcp_servers()
+    names = ", ".join(servers.keys()) if servers else "(none configured)"
+    print(f"[gateway-tui] 1MCP aggregating: {names}")
+    print(f"[gateway-tui]   config: {MCP_CONFIG_FILE}")
+    print(f"[gateway-tui]   endpoint: http://localhost:{BRIDGE_PORT}/mcp")
     return [
-        "npx", "-y", "supergateway",
-        "--stdio", stdio_arg,
-        "--outputTransport", "streamableHttp",
-        "--port", "8099",
+        "npx", "-y", "@1mcp/agent",
+        "--config", MCP_CONFIG_FILE,
+        "--port", str(BRIDGE_PORT),
+        "--transport", "http",
     ]
 
 
-def start_supergateway(q: "queue.Queue") -> subprocess.Popen:
-    """Spawn supergateway and stream its stdout/stderr into the queue."""
-    cmd_list = build_supergateway_cmd()
+def start_mcp_bridge(q: "queue.Queue") -> subprocess.Popen:
+    """Spawn the 1MCP bridge and stream its stdout/stderr into the queue."""
+    cmd_list = build_mcp_bridge_cmd()
 
     creationflags = 0
     if os.name == "nt":
@@ -81,14 +112,14 @@ def start_supergateway(q: "queue.Queue") -> subprocess.Popen:
             line = line.rstrip("\r\n")
             if line.strip():
                 q.put(line)
-        q.put("<< supergateway process exited >>")
+        q.put("<< MCP bridge process exited >>")
 
     threading.Thread(target=_reader, daemon=True).start()
     return proc
 
 
-def stop_supergateway(proc: subprocess.Popen):
-    """Terminate supergateway and its process tree."""
+def stop_mcp_bridge(proc: subprocess.Popen):
+    """Terminate the 1MCP bridge and its process tree."""
     if proc is None or proc.poll() is not None:
         return
     if os.name == "nt":
@@ -113,7 +144,7 @@ from textual.widgets import Footer, Header, Log, Static  # noqa: E402
 
 
 class SplitMainScreen(proxy.MainScreen):
-    """Main screen with the full proxy GUI on top and supergateway below.
+    """Main screen with the full proxy GUI on top and the MCP bridge below.
 
     Only compose() is overridden — the inherited on_mount(),
     _update_endpoint_status(), _show_server_info(), _drain_log_queue() and
@@ -131,9 +162,9 @@ class SplitMainScreen(proxy.MainScreen):
                 yield Static("", id="server-info")
                 yield Static("Proxy Log", classes="section-title")
                 yield Log(id="log", highlight=True)
-            # ── Bottom pane: supergateway ──────────────────────────────────
+            # ── Bottom pane: MCP bridge (1MCP) ────────────────────────────
             with Vertical(id="sg-pane"):
-                yield Static("Supergateway  (streamableHttp :8099, root: ./supergateway)",
+                yield Static(f"1MCP  (streamableHttp :{BRIDGE_PORT}/mcp)",
                              classes="section-title")
                 yield Log(id="supergateway-log", highlight=False)
         yield Footer()
@@ -142,7 +173,7 @@ class SplitMainScreen(proxy.MainScreen):
         # Run the original MainScreen mount logic (tui_log hookup,
         # status refresh interval, proxy log queue draining).
         super().on_mount()
-        # Drain supergateway output into its log pane.
+        # Drain MCP bridge output into its log pane.
         self.set_interval(0.1, self._drain_sg_queue)
 
     def _drain_sg_queue(self):
@@ -155,7 +186,7 @@ class SplitMainScreen(proxy.MainScreen):
             pass
 
     def action_quit(self):
-        stop_supergateway(self.app.sg_proc)
+        stop_mcp_bridge(self.app.sg_proc)
         self.app.exit()
 
 
@@ -167,7 +198,7 @@ class GatewayApp(proxy.ProxyTUI):
     """The proxy's own app, with the split main screen swapped in."""
 
     TITLE = "AI Gateway"
-    SUB_TITLE = "Proxy + Supergateway"
+    SUB_TITLE = "Proxy + 1MCP"
 
     SCREENS = {
         "main": SplitMainScreen,
@@ -233,16 +264,16 @@ def main():
         print(f"[proxy] Fatal: could not start server — {e}")
         sys.exit(1)
 
-    # ── Start supergateway subprocess (relative root: ./supergateway) ──────
-    print("[gateway-tui] Launching supergateway (relative root: ./supergateway)")
+    # ── Start the 1MCP bridge (aggregates mcp.json → one /mcp port) ───────
+    print("[gateway-tui] Launching 1MCP bridge (aggregating mcp.json)")
     sg_lines = queue.Queue()
-    sg_proc = start_supergateway(sg_lines)
+    sg_proc = start_mcp_bridge(sg_lines)
 
-    # ── Run the split-view TUI (full proxy GUI + supergateway pane) ────────
+    # ── Run the split-view TUI (full proxy GUI + MCP bridge pane) ──────────
     try:
         GatewayApp(sg_lines, sg_proc).run()
     finally:
-        stop_supergateway(sg_proc)
+        stop_mcp_bridge(sg_proc)
         try:
             if proxy._server is not None:
                 proxy._server.shutdown()

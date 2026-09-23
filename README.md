@@ -58,10 +58,10 @@ Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interfac
 # 1. Clone or download this project
 # 2. Copy config.example.json to config.json and add your endpoints + API keys
 #    (config.json is gitignored — never commit your real API keys)
-# 3. Run (recommended — split-view TUI: proxy GUI + Supergateway):
+# 3. Run (recommended — split-view TUI: proxy GUI + 1MCP MCP bridge):
 python gateway_tui.py
 #    or just double-click run.cmd
-#    (plain proxy only, no Supergateway: python proxy.py)
+#    (plain proxy only, no MCP bridge: python proxy.py)
 
 # That's it. Open http://localhost:8090/ for the chat UI.
 # Other devices: http://YOUR_IP:8090/
@@ -104,11 +104,11 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - Save/load settings from `config.json`
 
 ### Split-View TUI (`gateway_tui.py`)
-- Runs the proxy **and** [Supergateway](https://github.com/supercorp-ai/supergateway) (stdio→HTTP MCP bridge) in one terminal
+- Runs the proxy **and** [1MCP](https://github.com/1mcp-app/agent) (an MCP aggregator) in one terminal
 - Top pane: the full proxy GUI (endpoint status, server info, live log, Settings via `s`)
-- Bottom pane: live Supergateway output (streamable HTTP on `:8099`, filesystem root `./supergateway` — relative to the project directory)
+- Bottom pane: live 1MCP output — **every** server in `mcp.json` aggregated behind ONE streamable-HTTP endpoint on `:8099/mcp`
 - Reuses `proxy.py`'s TUI via subclassing — `proxy.py` is not modified
-- Clean shutdown on `q` (kills the Supergateway process tree, stops the proxy server)
+- Clean shutdown on `q` (kills the 1MCP process tree, stops the proxy server)
 - Windows-compatible `npx` launch; requires Node.js/npx on PATH
 
 ### Web Chat UI
@@ -146,13 +146,18 @@ The web UI can attach **MCP servers** to the chat so the model can call external
 - **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers.
 - **Session support** — the proxy forwards the MCP session handshake (`Mcp-Session-Id`) so stateful MCP servers work.
 
-> **Command/stdio servers** (e.g. `@modelcontextprotocol/server-filesystem`) are not spawned by the proxy itself — but the split-view TUI (`gateway_tui.py`) launches Supergateway automatically, bridging the filesystem server to streamable HTTP on `:8099` with root `./supergateway`. To bridge a stdio server manually instead, run:
+> **Command/stdio servers** (e.g. ComfyUI's `comfyui_mcp.py`, `@modelcontextprotocol/server-filesystem`) are not spawned by the proxy itself. Instead, list them in **`mcp.json`** (gitignored) and the split-view TUI (`gateway_tui.py`) launches [1MCP](https://github.com/1mcp-app/agent), which aggregates **all** of them behind a single streamable-HTTP endpoint on `:8099/mcp` — one port for any number of MCP servers:
 >
-> ```
-> npx -y supergateway --stdio "npx -y @modelcontextprotocol/server-filesystem C:\path\to\folder" --port 8099 --outputTransport streamableHttp --stateful
+> ```json
+> {
+>   "mcpServers": {
+>     "comfyui":   { "type": "stdio", "command": "python", "args": ["D:/Developments/Tools/comfyui/comfyui_mcp.py"] },
+>     "filesystem": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/path/to/folder"] }
+>   }
+> }
 > ```
 >
-> Then add `http://localhost:8099/mcp` as the MCP URL with the proxy toggle on.
+> Then add `http://localhost:8099/mcp` as **one** MCP URL with the proxy toggle on — you'll get every server's tools (namespaced `server___tool`).
 
 ## Configuration
 
@@ -273,9 +278,10 @@ build-webui.cmd
 ```
 .
 ├── proxy.py              # Main application (proxy + TUI + static server)
-├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + Supergateway)
+├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + 1MCP bridge)
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — gitignored
+├── mcp.json              # MCP servers aggregated by 1MCP — gitignored
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files

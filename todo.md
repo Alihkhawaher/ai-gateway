@@ -5,6 +5,12 @@ research and the available approaches for pre-configuring MCP servers (Exa,
 supergateway, etc.) so they appear automatically when a visitor first opens
 the AI Gateway web UI.
 
+> **Update:** the stdio→HTTP *bridge* now uses [1MCP](https://github.com/1mcp-app/agent)
+> instead of `supergateway`. Every server listed in `mcp.json` (gitignored) is
+> aggregated behind ONE streamable-HTTP endpoint on `:8099/mcp` — one port for
+> many MCPs. This solves the *bridge* half of the problem; the *localStorage
+> pre-seeding* question below (auto-attaching servers in the UI) is still open.
+
 ## Why this isn't trivial
 
 MCP servers configured in the bundled llama-ui are **not** stored next to the

@@ -1,4 +1,5 @@
 config.json
+mcp.json
 webui-src/
 node_modules/
 __pycache__/

@@ -6,16 +6,17 @@
 
 AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI and a bundled web chat UI (llama.cpp's llama-ui). It connects to several AI backends simultaneously, health-checks them, aggregates their models into a unified catalog, and routes requests based on model ID prefixes.
 
-**Single-file architecture:** the entire application lives in `proxy.py` (proxy server + TUI + static file server). There is no framework, no database, and no external runtime dependency beyond Python 3.8+ and the `textual` library (auto-installed on first run). The optional launcher `gateway_tui.py` (split-view TUI: proxy GUI + Supergateway) subclasses `proxy.py`'s TUI classes — it does not modify or duplicate them.
+**Single-file architecture:** the entire application lives in `proxy.py` (proxy server + TUI + static file server). There is no framework, no database, and no external runtime dependency beyond Python 3.8+ and the `textual` library (auto-installed on first run). The optional launcher `gateway_tui.py` (split-view TUI: proxy GUI + 1MCP MCP bridge) subclasses `proxy.py`'s TUI classes — it does not modify or duplicate them.
 
 ## Repository Layout
 
 ```
 .
 ├── proxy.py              # Main application (proxy + TUI + static server)
-├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + Supergateway)
+├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + 1MCP bridge)
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — GITIGNORED
+├── mcp.json              # MCP servers aggregated by 1MCP — GITIGNORED
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files (llama.cpp llama-ui)
@@ -84,12 +85,11 @@ For this to work, the gateway must:
      browser, so stateful MCP bridges can complete their session handshake.
 
 Caveat: the proxy only forwards to HTTP(S) URLs. It does **not** spawn
-command/stdio MCP servers (e.g. `@modelcontextprotocol/server-filesystem`).
-To use a stdio server, bridge it to HTTP first (e.g. `supergateway`) and add
-the resulting localhost URL with the proxy toggle on. The split-view TUI
-(`gateway_tui.py`) does this automatically: it launches `supergateway`
-bridging `@modelcontextprotocol/server-filesystem` (root `./supergateway`,
-relative to the project directory) to streamable HTTP on `:8099`.
+command/stdio MCP servers itself. To use stdio servers, list them in
+`mcp.json` (gitignored) and the split-view TUI (`gateway_tui.py`) launches
+[1MCP](https://github.com/1mcp-app/agent), which aggregates **every** listed
+server behind ONE streamable-HTTP endpoint on `:8099/mcp` — one port for many
+MCPs. Add that single URL in the web UI with the proxy toggle on.
 
 ## API Endpoints
 
