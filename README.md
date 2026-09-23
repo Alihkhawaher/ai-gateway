@@ -58,8 +58,10 @@ Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interfac
 # 1. Clone or download this project
 # 2. Copy config.example.json to config.json and add your endpoints + API keys
 #    (config.json is gitignored — never commit your real API keys)
-# 3. Run:
-python proxy.py
+# 3. Run (recommended — split-view TUI: proxy GUI + Supergateway):
+python gateway_tui.py
+#    or just double-click run.cmd
+#    (plain proxy only, no Supergateway: python proxy.py)
 
 # That's it. Open http://localhost:8090/ for the chat UI.
 # Other devices: http://YOUR_IP:8090/
@@ -101,6 +103,14 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - Consistent scrollable layout across all screens
 - Save/load settings from `config.json`
 
+### Split-View TUI (`gateway_tui.py`)
+- Runs the proxy **and** [Supergateway](https://github.com/supercorp-ai/supergateway) (stdio→HTTP MCP bridge) in one terminal
+- Top pane: the full proxy GUI (endpoint status, server info, live log, Settings via `s`)
+- Bottom pane: live Supergateway output (streamable HTTP on `:8099`, filesystem root `./supergateway` — relative to the project directory)
+- Reuses `proxy.py`'s TUI via subclassing — `proxy.py` is not modified
+- Clean shutdown on `q` (kills the Supergateway process tree, stops the proxy server)
+- Windows-compatible `npx` launch; requires Node.js/npx on PATH
+
 ### Web Chat UI
 - Powered by [llama.cpp's llama-ui](https://github.com/ggml-org/llama.cpp/tree/master/tools/ui)
 - Streaming responses with real-time token display
@@ -136,7 +146,7 @@ The web UI can attach **MCP servers** to the chat so the model can call external
 - **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers.
 - **Session support** — the proxy forwards the MCP session handshake (`Mcp-Session-Id`) so stateful MCP servers work.
 
-> **Command/stdio servers** (e.g. `@modelcontextprotocol/server-filesystem`) are not spawned by the gateway. To use one, bridge it to HTTP first — for example with [supergateway](https://github.com/supercorp-ai/supergateway):
+> **Command/stdio servers** (e.g. `@modelcontextprotocol/server-filesystem`) are not spawned by the proxy itself — but the split-view TUI (`gateway_tui.py`) launches Supergateway automatically, bridging the filesystem server to streamable HTTP on `:8099` with root `./supergateway`. To bridge a stdio server manually instead, run:
 >
 > ```
 > npx -y supergateway --stdio "npx -y @modelcontextprotocol/server-filesystem C:\path\to\folder" --port 8099 --outputTransport streamableHttp --stateful
@@ -263,6 +273,7 @@ build-webui.cmd
 ```
 .
 ├── proxy.py              # Main application (proxy + TUI + static server)
+├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + Supergateway)
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — gitignored
 ├── build-webui.cmd       # One-click web UI build script
