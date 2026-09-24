@@ -81,6 +81,44 @@ _model_meta = {}  # aggregated_id → metadata dict
 _endpoint_status_lock = threading.Lock()
 _endpoint_status = {}  # endpoint_name → "checking" | "online" | "offline" | "disabled"
 
+# ── Endpoint load tracking (in-flight + cumulative proxied requests) ───────
+_endpoint_load_lock = threading.Lock()
+_endpoint_load = {}  # endpoint_name → {"active": int, "total": int}
+
+
+def bump_endpoint_load_start(name: str):
+    """Mark a request as in-flight for the given endpoint."""
+    with _endpoint_load_lock:
+        e = _endpoint_load.setdefault(name, {"active": 0, "total": 0})
+        e["active"] += 1
+
+
+def bump_endpoint_load_end(name: str):
+    """Mark an in-flight request finished and count it toward the total."""
+    with _endpoint_load_lock:
+        e = _endpoint_load.setdefault(name, {"active": 0, "total": 0})
+        e["active"] = max(0, e["active"] - 1)
+        e["total"] += 1
+
+
+def get_endpoint_load(name: str):
+    """Return (active, total) request counts for an endpoint."""
+    with _endpoint_load_lock:
+        e = _endpoint_load.get(name)
+        if not e:
+            return 0, 0
+        return e["active"], e["total"]
+
+
+def format_endpoint_load(name: str) -> str:
+    """Human-readable load string: active in-flight requests and total served."""
+    active, total = get_endpoint_load(name)
+    if active > 0:
+        return f"⚡ {active} active · {total} total"
+    if total > 0:
+        return f"idle · {total} total"
+    return "—"
+
 # ── Top intelligent models fetched from OpenRouter ────────────────────────
 _top_intelligent_models = []
 _top_models_lock = threading.Lock()
@@ -1571,6 +1609,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         else:
             conn = http.client.HTTPConnection(host, timeout=180)
 
+        bump_endpoint_load_start(ep_name)
         try:
             conn.request(self.command, path, body=body, headers=fwd_headers)
             response = conn.getresponse()
@@ -1603,6 +1642,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
         finally:
             conn.close()
+            bump_endpoint_load_end(ep_name)
 
     def _log(self, msg: str):
         """Queue a request log line for the TUI (thread-safe)."""
@@ -1912,7 +1952,7 @@ class SettingsScreen(Screen):
         table = self.query_one("#endpoint-table", DataTable)
         table.clear(columns=True)
         table.cursor_type = "row"
-        table.add_columns("Name", "Type", "Host", "Status")
+        table.add_columns("Name", "Type", "Host", "Status", "Load")
         endpoints = get_config("endpoints")
         for ep in endpoints:
             name = ep.get("name", "")
@@ -1923,6 +1963,7 @@ class SettingsScreen(Screen):
                 ep.get("type", ""),
                 ep.get("host", ""),
                 status_icon,
+                format_endpoint_load(name),
                 key=name,
             )
 
@@ -2110,25 +2151,29 @@ class MainScreen(Screen):
         self.app.push_screen(SettingsScreen())
 
     def _update_endpoint_status(self):
-        """Refresh the endpoint status display."""
+        """Refresh the endpoint status display (with per-endpoint load)."""
         status_widget = self.query_one("#endpoint-status", Static)
         endpoints = get_config("endpoints")
         lines = []
+        # Column header (aligned to the row template below)
+        lines.append(
+            f"    {'ENDPOINT':<12} → {'HOST':<24} [{'STATUS':<8}] {'MODELS':>6}   LOAD"
+        )
         for ep in endpoints:
             name = ep.get("name", "")
             host = ep.get("host", "")
             status = get_endpoint_status(name)
             if status == "online":
                 icon = "●"
-                style = "green"
             elif status == "checking":
                 icon = "◌"
-                style = "yellow"
             else:
                 icon = "○"
-                style = "red"
             model_count = sum(1 for m in get_models() if m.startswith(f"{name}:"))
-            lines.append(f"  {icon} {name:<12} → {host:<24} [{status}]  {model_count} models")
+            load_str = format_endpoint_load(name)
+            lines.append(
+                f"  {icon} {name:<12} → {host:<24} [{status:<8}] {model_count:>6}   {load_str}"
+            )
         status_widget.update("\n".join(lines) if lines else "  No endpoints configured")
 
     def action_quit(self):
