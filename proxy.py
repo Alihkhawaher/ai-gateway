@@ -1669,8 +1669,8 @@ class ConfirmScreen(ModalScreen):
         with Vertical(id="confirm-dialog"):
             yield Static(self.message, id="confirm-message")
             with Horizontal(id="confirm-buttons"):
-                Button("Yes", id="confirm-yes-btn", variant="error", compact=True)
-                Button("No", id="confirm-no-btn", variant="default", compact=True)
+                yield Button("Yes", id="confirm-yes-btn", variant="error", compact=True)
+                yield Button("No", id="confirm-no-btn", variant="default", compact=True)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "confirm-yes-btn":
@@ -1736,8 +1736,8 @@ class EndpointEditScreen(ModalScreen):
             )
 
             with Horizontal(id="ep-edit-buttons"):
-                Button("💾 Save", id="ep-save-btn", variant="success", compact=True)
-                Button("✕ Cancel", id="ep-cancel-btn", variant="default", compact=True)
+                yield Button("💾 Save", id="ep-save-btn", variant="success", compact=True)
+                yield Button("✕ Cancel", id="ep-cancel-btn", variant="default", compact=True)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Auto-fill name/host when a type is chosen in add mode, only if empty."""
@@ -1809,9 +1809,9 @@ class SettingsScreen(Screen):
             yield Static("Endpoints", classes="section-title")
             yield DataTable(id="endpoint-table")
             with Horizontal(id="endpoint-buttons"):
-                Button("+ Add", id="ep-add-btn", variant="primary", compact=True)
-                Button("✎ Edit", id="ep-edit-btn", variant="default", compact=True)
-                Button("✕ Remove", id="ep-remove-btn", variant="error", compact=True)
+                yield Button("+ Add", id="ep-add-btn", variant="primary", compact=True)
+                yield Button("✎ Edit", id="ep-edit-btn", variant="default", compact=True)
+                yield Button("✕ Remove", id="ep-remove-btn", variant="error", compact=True)
 
             # ── Model Settings ─────────────────────────────────────────
             yield Static("Model Settings", classes="section-title")
@@ -2109,6 +2109,11 @@ class MainScreen(Screen):
         self._show_server_info()
         # Periodic status refresh
         self.set_interval(5.0, self._update_endpoint_status)
+        # Periodic server-info refresh: the aggregated model catalog is merged
+        # in asynchronously after mount (OpenRouter top-models fetch), so the
+        # "Default" line must be re-rendered to stay in sync with the current
+        # model instead of showing the mount-time resolution
+        self.set_interval(5.0, self._show_server_info)
         # Drain worker-thread log lines into the Log widget
         self.set_interval(0.25, self._drain_log_queue)
 
