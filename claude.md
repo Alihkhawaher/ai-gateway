@@ -91,6 +91,27 @@ command/stdio MCP servers itself. To use stdio servers, list them in
 server behind ONE streamable-HTTP endpoint on `:8099/mcp` — one port for many
 MCPs. Add that single URL in the web UI with the proxy toggle on.
 
+## Endpoint Load Tracking
+
+The TUI shows a per-endpoint **load** column in both endpoint views — the
+main screen's endpoint list (`#endpoint-status`) and the Settings screen's
+DataTable (`#endpoint-table`). It is driven by a small, thread-safe counter
+in `proxy.py`:
+
+- `_endpoint_load` (guarded by `_endpoint_load_lock`) maps endpoint name →
+  `{"active": int, "total": int}`.
+- `bump_endpoint_load_start(name)` is called in `ProxyHandler._proxy()`
+  immediately before the upstream request; `bump_endpoint_load_end(name)` is
+  called in the `finally` block, so the in-flight count is always released —
+  even on upstream error or timeout.
+- `format_endpoint_load(name)` renders `⚡ N active · M total` (busy),
+  `idle · M total` (seen, none in flight), or `—` (never used).
+
+`active` = requests in flight to that endpoint right now; `total` = cumulative
+proxied requests since start. Only requests routed through `_proxy()` (chat
+completions and other proxied paths) are counted — `/cors-proxy` traffic is
+not, since it isn't tied to a configured upstream gateway.
+
 ## API Endpoints
 
 | Endpoint | Format | Purpose |

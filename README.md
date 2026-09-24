@@ -97,7 +97,7 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 
 ### Terminal Dashboard (TUI)
 - Live proxy log showing all requests
-- Endpoint status panel (online/offline with model counts)
+- Endpoint status panel (online/offline with model counts) and a per-endpoint **load** column — in-flight requests and total requests served (e.g. `⚡ 2 active · 17 total`, `idle · 12 total`, `—` if never used)
 - Settings with model selection, port, bind address, fetch top models toggle
 - Footer key bindings: `s` Settings, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
 - Consistent scrollable layout across all screens
