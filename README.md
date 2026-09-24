@@ -36,9 +36,9 @@ A multi-endpoint proxy that connects to several AI backends simultaneously — O
 
 ### Screenshots
 
-| Terminal TUI | Console GUI | Web UI |
+| Split-View TUI | Settings | Web Chat UI |
 |:---:|:---:|:---:|
-| ![Terminal TUI](ss01.png) | ![Console GUI](ss02.png) | ![Web UI](ss03.png) |
+| ![Split-View TUI](screenshots/ss01.png) | ![Settings](screenshots/ss02.png) | ![Web Chat UI](screenshots/ss03.png) |
 
 ### For AI Agent Users (Cline, etc.)
 The gateway exposes both OpenAI-compatible and LM Studio-compatible endpoints. For the best experience with Cline:
