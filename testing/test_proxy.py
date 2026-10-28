@@ -132,6 +132,7 @@ class MockStream(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
     fail_after_first = False
+    last_body = None
 
     def do_GET(self):
         if self.path == "/api/v0/models":
@@ -140,7 +141,7 @@ class MockStream(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": [{"id": "m", "object": "model"}]})
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        MockStream.last_body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -564,6 +565,61 @@ class GatewayReliabilityTests(unittest.TestCase):
         self.assertNotIn(b"HTTP/1.", rest)
         self.assertNotIn(b"<html", rest.lower())
 
+    def test_unreachable_endpoint_gives_json_error(self):
+        """A stopped upstream (e.g. LM Studio closed while a client still
+        asks for its model) gets an OpenAI-style JSON error naming it."""
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); closed_port = s.getsockname()[1]; s.close()
+        proxy.set_config("endpoints", [{"name": "gone", "type": "lmstudio", "host": f"localhost:{closed_port}",
+                                        "enabled": True, "api_key": ""}])
+        status, headers, body = request(self.gw_port, "POST", "/v1/chat/completions",
+                                        body=json.dumps({"model": "gone:some-model", "messages": []}),
+                                        headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 502)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        message = json.loads(body)["error"]["message"]
+        self.assertIn("'gone'", message)
+        self.assertIn("isn't running", message)
+
+    # ── force default model ───────────────────────────────────────────────
+    def _closed_port(self):
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        return port
+
+    def _post(self, path, model):
+        return request(self.gw_port, "POST", path, body=json.dumps({"model": model, "messages": []}),
+                       headers={"Content-Type": "application/json"})
+
+    def test_forced_default_model_overrides_client_model(self):
+        """A client stuck on a model of a stopped endpoint (Cline asking for
+        lmstudio:... while LM Studio is closed) gets the default instead."""
+        gone = {"name": "gone", "type": "lmstudio", "host": f"127.0.0.1:{self._closed_port()}",
+                "enabled": True, "api_key": ""}
+        self._use_mock_endpoint(extra=[gone])
+        proxy.set_config("default_model", "mock:m")
+        proxy.set_config("force_default_model", True)
+        status, _, _ = self._post("/v1/chat/completions", "gone:qwen")
+        self.assertEqual(status, 200)
+        self.assertEqual(MockStream.last_body["model"], "m")
+
+    def test_without_force_client_model_is_kept(self):
+        gone = {"name": "gone", "type": "lmstudio", "host": f"127.0.0.1:{self._closed_port()}",
+                "enabled": True, "api_key": ""}
+        self._use_mock_endpoint(extra=[gone])
+        proxy.set_config("default_model", "mock:m")
+        proxy.set_config("force_default_model", False)
+        status, _, _ = self._post("/v1/chat/completions", "gone:qwen")
+        self.assertEqual(status, 502)
+
+    def test_force_leaves_non_chat_requests_alone(self):
+        self._use_mock_endpoint()
+        proxy.set_config("default_model", "mock:m")
+        proxy.set_config("force_default_model", True)
+        status, _, _ = self._post("/v1/embeddings", "mock:embed-model")
+        self.assertEqual(status, 200)
+        self.assertEqual(MockStream.last_body["model"], "embed-model")
+
     # ── aggregation / catalog ─────────────────────────────────────────────
     def test_one_bad_endpoint_does_not_drop_the_others(self):
         broken = {"name": "broken", "type": "lmstudio", "host": f"127.0.0.1:{self.up_port}",
@@ -667,6 +723,52 @@ class GatewayReliabilityTests(unittest.TestCase):
                 proxy._GatewayHTTPServer(("127.0.0.1", first.server_address[1]), proxy.ProxyHandler)
         finally:
             first.server_close()
+
+
+class SettingsScreenTests(unittest.TestCase):
+    """The TUI's Settings screen, run headless."""
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy.get_models())
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._config = dict(proxy._config)
+        proxy.set_config("endpoints", [])
+
+    def tearDown(self):
+        proxy.CONFIG_FILE, proxy._config, models = self._saved
+        proxy.set_models(models)
+        self._tmp.cleanup()
+
+    def test_force_checkbox_sits_next_to_default_model_and_saves(self):
+        import asyncio
+        from textual.widgets import Checkbox, Select
+
+        proxy.set_models(["a:1", "b:2"])
+        proxy.set_config("default_model", "b:2")
+        proxy.set_config("force_default_model", False)
+        layout = {}
+
+        async def run():
+            app = proxy.ProxyTUI()
+            async with app.run_test(size=(120, 40)) as pilot:
+                screen = proxy.SettingsScreen()
+                await app.push_screen(screen)
+                await pilot.pause()
+                box = screen.query_one("#force-model-checkbox", Checkbox)
+                select = screen.query_one("#model-select", Select)
+                layout.update(box=box.region, select=select.region)
+                box.value = True
+                screen.action_save_settings()
+                await pilot.pause()
+
+        asyncio.run(run())
+        self.assertEqual(layout["box"].y, layout["select"].y)  # same row
+        self.assertGreater(layout["box"].x, layout["select"].x)  # to its right
+        self.assertGreater(layout["box"].width, 0)
+        self.assertTrue(proxy.get_config("force_default_model"))
+        with open(proxy.CONFIG_FILE, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["force_default_model"], True)
 
 
 if __name__ == "__main__":

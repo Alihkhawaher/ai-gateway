@@ -64,6 +64,7 @@ DEFAULTS = {
         "openrouter:deepseek/deepseek-v4.1-flash",
     ],
     "default_model": "",
+    "force_default_model": False,
     "port": 8090,
     "addr": "0.0.0.0",
     "fetch_top_models": False,
@@ -283,6 +284,18 @@ def get_current_model() -> str:
     if chosen in models:
         return chosen
     return models[0] if models else ""
+
+
+def _forces_default_model(path: str) -> bool:
+    """Whether "force default model" applies to this request path.
+
+    Only generation calls (chat/text completions, responses, messages) are
+    switched to the default model; embeddings and the like are left alone,
+    since a chat model can't serve them.
+    """
+    if not get_config("force_default_model"):
+        return False
+    return urlparse(path).path.rstrip("/").endswith(("/completions", "/responses", "/messages"))
 
 
 # ── Model ID parsing ─────────────────────────────────────────────────────
@@ -1716,6 +1729,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     data["model"] = model_id
                     body = json.dumps(data).encode("utf-8")
                     self._log(f"Injected default model: {model_id}")
+                elif _forces_default_model(self.path):
+                    # "Force" is ticked next to the default model: every
+                    # client gets it, whatever model it asked for.
+                    forced = get_current_model()
+                    if forced and forced != model_id:
+                        self._log(f"Forced default model: {forced} (client asked for {model_id})")
+                        model_id = forced
+                        data["model"] = model_id
+                        body = json.dumps(data).encode("utf-8")
 
                 # Parse source prefix
                 source, original_id = parse_model_id(model_id)
@@ -1835,7 +1857,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log(f"Error → {ep_name}: {e}")
             try:
                 if not headers_sent:
-                    self.send_error(502, f"Bad Gateway ({ep_name}): {e}")
+                    # OpenAI-style JSON, not an HTML error page: API clients
+                    # (Cline, the OpenAI SDK) show error.message to the user.
+                    if isinstance(e, ConnectionRefusedError):
+                        msg = (f"Endpoint '{ep_name}' refused the connection at {host}: "
+                               f"it isn't running or isn't listening there")
+                    else:
+                        msg = f"Bad Gateway ({ep_name}): {e}"
+                    self._send_json({"error": {"message": msg, "type": "upstream_error",
+                                               "code": 502}}, 502)
                 elif streaming:
                     # The status line is already out: end the stream with an
                     # SSE error event, not a second HTTP response in the body.
@@ -2024,11 +2054,19 @@ class SettingsScreen(Screen):
             yield Label("Default Model")
             current_models = get_models()
             model_options = [(m, m) for m in current_models] if current_models else [("No models available", "")]
-            yield Select(
-                model_options,
-                value=get_current_model() if current_models else "",
-                id="model-select",
-            )
+            with Horizontal(id="default-model-row"):
+                yield Select(
+                    model_options,
+                    value=get_current_model() if current_models else "",
+                    id="model-select",
+                )
+                force_box = Checkbox(
+                    "Force",
+                    value=bool(get_config("force_default_model")),
+                    id="force-model-checkbox",
+                )
+                force_box.tooltip = "Use the default model for every chat request, whatever model the client asks for"
+                yield force_box
             yield Checkbox(
                 "Fetch top intelligent models from OpenRouter (merges with your models)",
                 value=get_config("fetch_top_models"),
@@ -2200,6 +2238,13 @@ class SettingsScreen(Screen):
                 set_config("default_model", model_name)
                 _queue_log_line(f"Model set → {model_name}")
 
+        # Force default model checkbox
+        force = self.query_one("#force-model-checkbox", Checkbox).value
+        if force != bool(get_config("force_default_model")):
+            set_config("force_default_model", force)
+            _queue_log_line("Default model is now forced for all chat requests" if force
+                            else "Default model no longer forced")
+
         # Fetch top models checkbox
         fetch_checkbox = self.query_one("#fetch-top-models-checkbox", Checkbox)
         fetch_enabled = fetch_checkbox.value
@@ -2340,10 +2385,11 @@ class MainScreen(Screen):
         display_host = "localhost" if addr in ("0.0.0.0", "::") else addr
         url = f"http://{display_host}:{port}"
         model = get_current_model()
+        forced = "  (forced for all chat requests)" if get_config("force_default_model") else ""
         info.update(
             f"Listening : {url}\n"
             f"Web UI    : {url}/\n"
-            f"Default   : {model}"
+            f"Default   : {model}{forced}"
         )
 
     def compose(self) -> ComposeResult:
@@ -2455,6 +2501,16 @@ class ProxyTUI(App):
     #settings-screen > Horizontal {
         height: auto;
         margin-top: 0;
+    }
+    #settings-screen #default-model-row Select {
+        width: 1fr;
+    }
+    #settings-screen #force-model-checkbox {
+        width: auto;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        margin: 0 0 0 1;
     }
     #settings-screen > Horizontal > Vertical {
         width: 1fr;

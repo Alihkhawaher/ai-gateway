@@ -210,6 +210,7 @@ Edit `config.json`:
     "openrouter/google/gemini-3.5-flash"
   ],
   "default_model": "",
+  "force_default_model": false,
   "port": 8090,
   "addr": "0.0.0.0",
   "fetch_top_models": false
@@ -221,6 +222,7 @@ Edit `config.json`:
 | `endpoints` | List of AI backends (name, type, host, api_key, enabled; optional `timeout` in seconds per upstream read — default 180 for cloud, 600 for local) |
 | `models` | Your curated model list with `source/model` prefix format |
 | `default_model` | Model ID used when a request names none (empty, or not currently available → the first available model) |
+| `force_default_model` | When `true` (the **Force** checkbox next to Default Model in Settings), every chat request (`…/completions`, `/responses`, `/messages`) uses the default model, whatever model the client asks for; other requests such as embeddings are left alone |
 | `port` | HTTP port (default: 8090) |
 | `addr` | Bind address (`0.0.0.0` = all interfaces) |
 | `fetch_top_models` | When `true`, fetches top 20 intelligent models from OpenRouter and merges with your models |
