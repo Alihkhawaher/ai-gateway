@@ -143,7 +143,7 @@ This is especially useful with the AI Gateway's multi-endpoint setup, since the 
 
 The web UI can attach **MCP servers** to the chat so the model can call external tools and read resources. HTTP/S MCP servers (Streamable HTTP or SSE) are added by URL in the MCP Servers screen.
 
-- **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers.
+- **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers. `/cors-proxy` only answers the gateway's own web page (and non-browser clients): a page from another site gets `403`, so it can't use the gateway to reach services that only listen on this PC. Open the web UI by IP, `localhost`, the PC's name (`my-pc`) or a `.local`/`.lan`/`.home` name; a name with a public domain is refused, which blocks DNS-rebinding.
 - **Session support** — the proxy forwards the MCP session handshake (`Mcp-Session-Id`) so stateful MCP servers work.
 
 > **Command/stdio servers** (e.g. ComfyUI's `comfyui_mcp.py`, `@modelcontextprotocol/server-filesystem`) are not spawned by the proxy itself. Instead, list them in **`mcp.json`** (gitignored) and the split-view TUI (`gateway_tui.py`) launches [1MCP](https://github.com/1mcp-app/agent), which aggregates **all** of them behind a single streamable-HTTP endpoint on `:8099/mcp` — one port for any number of MCP servers:
@@ -209,7 +209,7 @@ Edit `config.json`:
     "openrouter/z-ai/glm-5.3-flash",
     "openrouter/google/gemini-3.5-flash"
   ],
-  "model_index": 0,
+  "default_model": "",
   "port": 8090,
   "addr": "0.0.0.0",
   "fetch_top_models": false
@@ -218,9 +218,9 @@ Edit `config.json`:
 
 | Field | Description |
 |-------|-------------|
-| `endpoints` | List of AI backends (name, type, host, api_key, enabled) |
+| `endpoints` | List of AI backends (name, type, host, api_key, enabled; optional `timeout` in seconds per upstream read — default 180 for cloud, 600 for local) |
 | `models` | Your curated model list with `source/model` prefix format |
-| `model_index` | Default model (0-based index into `models`) |
+| `default_model` | Model ID used when a request names none (empty, or not currently available → the first available model) |
 | `port` | HTTP port (default: 8090) |
 | `addr` | Bind address (`0.0.0.0` = all interfaces) |
 | `fetch_top_models` | When `true`, fetches top 20 intelligent models from OpenRouter and merges with your models |
@@ -234,6 +234,7 @@ Edit `config.json`:
 | `lmstudio` | LM Studio local server | `GET /v1/models` |
 | `llama-server` | llama.cpp server | `GET /health` |
 | `ollama` | Ollama local server | `GET /api/tags` |
+| `strata` | Strata gateway (default `127.0.0.1:47831`) — vision and context follow the model loaded in Strata | `GET /v1/models` |
 | `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` |
 
 ## Connecting Clients

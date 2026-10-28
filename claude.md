@@ -41,6 +41,7 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 | `lmstudio` | LM Studio local server | `GET /v1/models` (HTTP) | `/v1/models` |
 | `llama-server` | llama.cpp server | `GET /health` (HTTP) | `/props` |
 | `ollama` | Ollama local server | `GET /api/tags` (HTTP) | `/api/tags` |
+| `strata` | Strata gateway (default `127.0.0.1:47831`) | `GET /v1/models` | `/v1/models` + `/api/native` (per loaded model: vision, context, label) |
 | `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` | `/v1/models` |
 
 ### Model ID Format
@@ -83,6 +84,13 @@ For this to work, the gateway must:
      `text/plain`).
    - Forward upstream response headers (notably `Mcp-Session-Id`) back to the
      browser, so stateful MCP bridges can complete their session handshake.
+3. Serve `/cors-proxy` only to the gateway's own web page
+   (`_cors_proxy_caller_allowed`): browser requests must be `Sec-Fetch-Site:
+   same-origin` (or carry an `Origin` matching `Host`), and `Host` must be an
+   IP, `localhost`, a single-label name or a local suffix (`.local`, `.lan`,
+   …) so DNS rebinding can't pass as same-origin. Requests with neither header
+   (curl, scripts) are allowed. Otherwise any web page could use the gateway
+   to reach loopback-only services (1MCP, Strata) and read the replies.
 
 Caveat: the proxy only forwards to HTTP(S) URLs. It does **not** spawn
 command/stdio MCP servers itself. To use stdio servers, list them in
