@@ -84,7 +84,10 @@ def start_mcp_bridge(q: "queue.Queue") -> subprocess.Popen:
 
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        # Own process group, and its own hidden console: when cmd/npx/node and
+        # the MCP servers they start share the TUI's console, they reset its
+        # input mode, which switches off Textual's mouse input.
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         # On Windows, npx is a .cmd shim that CreateProcess cannot execute
         # directly, so run it through the shell. list2cmdline quotes the
         # --stdio value correctly.
@@ -97,6 +100,7 @@ def start_mcp_bridge(q: "queue.Queue") -> subprocess.Popen:
     proc = subprocess.Popen(
         cmd,
         cwd=SCRIPT_DIR,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -132,6 +136,42 @@ def stop_mcp_bridge(proc: subprocess.Popen):
             proc.terminate()
     else:
         proc.terminate()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Windows console mouse input
+# ═══════════════════════════════════════════════════════════════════════════
+
+def disable_quick_edit():
+    """Turn off the Windows console's QuickEdit mode while the TUI runs.
+
+    With QuickEdit on, the classic console (conhost) treats a click as the
+    start of a text selection — which also pauses the app until Esc — instead
+    of passing it to Textual. Returns a callable that restores the old mode.
+    """
+    if os.name != "nt":
+        return lambda: None
+    import ctypes
+    from ctypes import wintypes
+
+    ENABLE_QUICK_EDIT_MODE = 0x0040
+    ENABLE_EXTENDED_FLAGS = 0x0080
+    STD_INPUT_HANDLE = -10
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetStdHandle.restype = wintypes.HANDLE
+    kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
+    handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+    mode = wintypes.DWORD()
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return lambda: None  # stdin is not a console
+    original = mode.value
+    kernel32.SetConsoleMode(
+        handle, (original | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+    )
+    return lambda: kernel32.SetConsoleMode(handle, original)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -270,9 +310,11 @@ def main():
     sg_proc = start_mcp_bridge(sg_lines)
 
     # ── Run the split-view TUI (full proxy GUI + MCP bridge pane) ──────────
+    restore_quick_edit = disable_quick_edit()
     try:
         GatewayApp(sg_lines, sg_proc).run()
     finally:
+        restore_quick_edit()
         stop_mcp_bridge(sg_proc)
         try:
             if proxy._server is not None:
