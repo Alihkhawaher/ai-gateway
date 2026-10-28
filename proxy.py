@@ -16,6 +16,7 @@ Usage:
 import copy
 import json
 import http.client
+import ipaddress
 import mimetypes
 import os
 import queue
@@ -41,6 +42,7 @@ ENDPOINT_TYPE_DEFAULTS = {
     "lmstudio":   {"name": "lmstudio",   "host": "localhost:1234"},
     "llama-server": {"name": "llama.cpp", "host": "localhost:8080"},
     "ollama":     {"name": "ollama",      "host": "localhost:11434"},
+    "strata":     {"name": "strata",      "host": "127.0.0.1:47831"},
     "custom":     {"name": "custom",      "host": ""},
 }
 
@@ -61,7 +63,7 @@ DEFAULTS = {
         "openrouter:deepseek/deepseek-v4-flash-0731",
         "openrouter:deepseek/deepseek-v4.1-flash",
     ],
-    "model_index": 0,
+    "default_model": "",
     "port": 8090,
     "addr": "0.0.0.0",
     "fetch_top_models": False,
@@ -126,6 +128,8 @@ _top_models_lock = threading.Lock()
 # ── Thread-safe shared config ──────────────────────────────────────────────
 _config_lock = threading.Lock()
 _config = {}  # loaded from config.json
+_config_load_error = ""  # set when config.json exists but can't be read
+_config_save_lock = threading.Lock()
 
 # ── Thread-safe MODELS list ────────────────────────────────────────────────
 _models_lock = threading.Lock()
@@ -150,7 +154,8 @@ def _queue_log_line(line: str):
 
 def load_config():
     """Load config from config.json, merging with defaults. Handles v1→v2 migration."""
-    global _config
+    global _config, _config_load_error
+    _config_load_error = ""
     with _config_lock:
         if os.path.exists(CONFIG_FILE):
             try:
@@ -174,7 +179,14 @@ def load_config():
                     _config["endpoints"] = list(DEFAULTS["endpoints"])
                 print(f"[proxy] Config loaded from {CONFIG_FILE}")
             except Exception as e:
-                print(f"[proxy] Could not load config: {e}")
+                # Run on defaults in memory, but never save over the file
+                # (save_config checks this): one stray comma would otherwise
+                # wipe every endpoint and API key on the next save.
+                _config_load_error = str(e)
+                msg = (f"[proxy] Could not load config: {e} — running on defaults; "
+                       f"config.json will not be saved until it is fixed")
+                print(msg)
+                _queue_log_line(msg)
         else:
             print(f"[proxy] No config file found, using defaults")
         _config = {**DEFAULTS, **_config}
@@ -214,12 +226,25 @@ def _migrate_v1_config(saved: dict) -> dict:
 
 
 def save_config():
-    """Save current config to config.json."""
+    """Save current config to config.json.
+
+    Written to a temp file and swapped in, so a crash or two threads saving
+    at once (web UI and TUI) can't leave a half-written file. Skipped while
+    config.json is unreadable, so the broken file isn't replaced by defaults.
+    """
+    if _config_load_error:
+        msg = f"[proxy] Not saving config: config.json could not be read ({_config_load_error})"
+        print(msg)
+        _queue_log_line(msg)
+        return
     with _config_lock:
-        data = dict(_config)
+        text = json.dumps(_config, indent=2)
+    tmp = CONFIG_FILE + ".tmp"
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        with _config_save_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, CONFIG_FILE)
     except Exception as e:
         print(f"[proxy] Could not save config: {e}")
 
@@ -248,10 +273,16 @@ def set_models(models: list):
 
 
 def get_current_model() -> str:
+    """The default model: the one picked by ID, else the first available.
+
+    Kept by ID, not list position: the list is rebuilt every 30 s from the
+    endpoints that are online, so a position drifts onto other models.
+    """
     models = get_models()
-    with _config_lock:
-        idx = max(0, min(_config.get("model_index", 0), len(models) - 1))
-        return models[idx] if models else ""
+    chosen = get_config("default_model")
+    if chosen in models:
+        return chosen
+    return models[0] if models else ""
 
 
 # ── Model ID parsing ─────────────────────────────────────────────────────
@@ -403,10 +434,66 @@ def _is_local_host(host: str) -> bool:
     return any(host == h or host.startswith(h + ":") for h in _local)
 
 
+def _is_lan_host_name(host: str) -> bool:
+    """True for Host values a DNS-rebinding attacker can't own: IP literals,
+    localhost, single-label names (my-pc) and local-only suffixes."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return True  # IPv6 literal, e.g. [::1]:8090
+    name = host.rsplit(":", 1)[0]
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if "." not in name:
+        return True
+    return name.endswith((".localhost", ".local", ".lan", ".home", ".internal", ".home.arpa"))
+
+
+def _cors_proxy_caller_allowed(headers) -> bool:
+    """Whether a /cors-proxy request comes from the gateway's own web page.
+
+    Browsers label requests with where they come from (Sec-Fetch-Site, and
+    Origin on cross-site or non-GET requests), so a page on another site is
+    refused: it can't use the gateway to reach services that only listen on
+    this PC (1MCP, Strata, router pages) and read their replies. The Host
+    check stops DNS rebinding, where an attacker's domain is re-pointed at
+    this PC so its page counts as same-origin. Requests with neither header
+    are not from a browser page (curl, scripts) and are let through.
+    """
+    site = (headers.get("Sec-Fetch-Site") or "").lower()
+    origin = headers.get("Origin")
+    if not site and origin is None:
+        return True
+    host = (headers.get("Host") or "").strip().lower()
+    if not _is_lan_host_name(host):
+        return False
+    if site and site not in ("same-origin", "none"):
+        return False
+    if origin is not None and urlparse(origin).netloc.lower() != host:
+        return False
+    return True
+
+
+def _dial_host(host: str) -> str:
+    """Address to connect to for `host`: localhost → 127.0.0.1.
+
+    On Windows "localhost" resolves to ::1 first, and local AI servers listen
+    on IPv4 only, so every connection waited ~2 s for the IPv6 attempt to be
+    refused before falling back.
+    """
+    if host == "localhost" or host.startswith("localhost:"):
+        return "127.0.0.1" + host[len("localhost"):]
+    return host
+
+
 def _connect_host(host: str, timeout: int = 10):
     """Create an HTTP or HTTPS connection based on host."""
     if _is_local_host(host):
-        return http.client.HTTPConnection(host, timeout=timeout)
+        return http.client.HTTPConnection(_dial_host(host), timeout=timeout)
     else:
         return http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=timeout)
 
@@ -441,7 +528,7 @@ def check_endpoint_health(ep: dict) -> str:
             return "online" if resp.status == 200 else "offline"
 
         elif ep_type == "llama-server":
-            conn = http.client.HTTPConnection(host, timeout=10)
+            conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
             conn.request("GET", "/health")
             resp = conn.getresponse()
             resp.read()
@@ -449,7 +536,7 @@ def check_endpoint_health(ep: dict) -> str:
             return "online" if resp.status == 200 else "offline"
 
         elif ep_type == "lmstudio":
-            conn = http.client.HTTPConnection(host, timeout=10)
+            conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
             conn.request("GET", "/v1/models")
             resp = conn.getresponse()
             resp.read()
@@ -457,14 +544,14 @@ def check_endpoint_health(ep: dict) -> str:
             return "online" if resp.status == 200 else "offline"
 
         elif ep_type == "ollama":
-            conn = http.client.HTTPConnection(host, timeout=10)
+            conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
             conn.request("GET", "/api/tags")
             resp = conn.getresponse()
             resp.read()
             conn.close()
             return "online" if resp.status == 200 else "offline"
 
-        elif ep_type == "custom":
+        elif ep_type in ("custom", "strata"):
             conn = _connect_host(host, timeout=10)
             headers = {}
             if api_key:
@@ -490,24 +577,29 @@ def health_check_loop():
     many offline endpoints are configured.
     """
     while True:
-        endpoints = get_config("endpoints")
+        # One bad cycle must not end the loop: this is a daemon thread and
+        # Textual swallows stderr, so statuses would silently freeze.
+        try:
+            endpoints = get_config("endpoints")
 
-        # Separate enabled vs disabled, marking disabled immediately.
-        enabled_eps = []
-        for ep in endpoints:
-            if not ep.get("enabled", False):
-                set_endpoint_status(ep.get("name", ""), "disabled")
-            else:
-                enabled_eps.append(ep)
+            # Separate enabled vs disabled, marking disabled immediately.
+            enabled_eps = []
+            for ep in endpoints:
+                if not ep.get("enabled", False):
+                    set_endpoint_status(ep.get("name", ""), "disabled")
+                else:
+                    enabled_eps.append(ep)
 
-        if enabled_eps:
-            with ThreadPoolExecutor(max_workers=len(enabled_eps)) as pool:
-                statuses = list(pool.map(check_endpoint_health, enabled_eps))
-            for ep, status in zip(enabled_eps, statuses):
-                set_endpoint_status(ep.get("name", ""), status)
+            if enabled_eps:
+                with ThreadPoolExecutor(max_workers=len(enabled_eps)) as pool:
+                    statuses = list(pool.map(check_endpoint_health, enabled_eps))
+                for ep, status in zip(enabled_eps, statuses):
+                    set_endpoint_status(ep.get("name", ""), status)
 
-        # Re-aggregate models after health check
-        aggregate_models()
+            # Re-aggregate models after health check
+            aggregate_models()
+        except Exception as e:
+            _queue_log_line(f"[proxy] Health check cycle failed: {e!r}")
         time.sleep(30)
 
 
@@ -632,7 +724,7 @@ def fetch_lmstudio_models(host: str) -> list:
       - loaded_context_length   → the context currently loaded in LM Studio
     """
     try:
-        conn = http.client.HTTPConnection(host, timeout=10)
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
         conn.request("GET", "/api/v0/models")
         resp = conn.getresponse()
         data = json.loads(resp.read())
@@ -674,7 +766,7 @@ def fetch_lmstudio_models(host: str) -> list:
 def fetch_llama_server_models(host: str) -> list:
     """Fetch model info from llama.cpp server."""
     try:
-        conn = http.client.HTTPConnection(host, timeout=10)
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
         conn.request("GET", "/props")
         resp = conn.getresponse()
         props = json.loads(resp.read())
@@ -718,7 +810,7 @@ def fetch_llama_server_models(host: str) -> list:
 def fetch_ollama_models(host: str) -> list:
     """Fetch installed models from Ollama via /api/tags."""
     try:
-        conn = http.client.HTTPConnection(host, timeout=10)
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=10)
         conn.request("GET", "/api/tags")
         resp = conn.getresponse()
         data = json.loads(resp.read())
@@ -780,10 +872,69 @@ def fetch_custom_models(host: str, api_key: str) -> list:
         resp = conn.getresponse()
         data = json.loads(resp.read())
         conn.close()
-        return data.get("data", [])
+        models = data.get("data") if isinstance(data, dict) else None
+        return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else []
     except Exception as e:
         print(f"[proxy] Error fetching custom models from {host}: {e}")
         return []
+
+
+def fetch_strata_models(host: str, api_key: str) -> list:
+    """Fetch the models a Strata gateway is serving right now.
+
+    Strata is itself a gateway: which models it serves, and whether each one
+    reads images, depends on what is loaded in it, so nothing about them is
+    fixed in config. Its /v1/models lists the ready models but only with
+    id/label; the app's /api/native reports each loaded model's vision switch
+    and context size, matched here by apiModelId or alias. When /api/native
+    can't be read (e.g. a Strata on another PC), the models are still listed,
+    as text-only.
+    """
+    models = fetch_custom_models(host, api_key)
+    if not models:
+        return []
+
+    instances = []
+    try:
+        conn = _connect_host(host, timeout=10)
+        conn.request("GET", "/api/native")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        if resp.status == 200:
+            instances = json.loads(body).get("instances", []) or []
+    except Exception as e:
+        print(f"[proxy] Could not read Strata model details from {host}: {e}")
+
+    by_id = {}
+    for inst in instances:
+        if inst.get("status") != "ready":
+            continue
+        for key in [inst.get("apiModelId")] + list(inst.get("aliases") or []):
+            if key:
+                by_id[key] = inst
+
+    entries = []
+    for m in models:
+        model_id = m.get("id", "")
+        if not model_id:
+            continue
+        meta = m.get("meta") or {}
+        inst = by_id.get(model_id, {})
+        input_mods = ["text"]
+        if inst.get("vision"):
+            input_mods.append("image")
+        entries.append({
+            "id": model_id,
+            "name": inst.get("label") or meta.get("label") or model_id,
+            "owned_by": "strata",
+            "context_length": inst.get("context") or meta.get("context") or 128000,
+            "architecture": {
+                "input_modalities": input_mods,
+                "output_modalities": ["text"],
+            },
+        })
+    return entries
 
 
 def _get_cached_catalog(endpoint_name: str, fetch_fn, *args) -> list:
@@ -806,6 +957,11 @@ def _get_cached_catalog(endpoint_name: str, fetch_fn, *args) -> list:
         if cached is not None and (now - cached_at) < CATALOG_CACHE_TTL:
             return copy.deepcopy(cached)
     models = fetch_fn(*args) or []
+    if not models:
+        # Fetchers return [] on any error. Caching that would strip every
+        # cloud model's capabilities until the TTL ran out, so keep serving
+        # the last good catalog and retry on the next cycle.
+        return copy.deepcopy(cached) if cached else []
     with _catalog_cache_lock:
         _catalog_cache[endpoint_name] = copy.deepcopy(models)
         _catalog_cache_time[endpoint_name] = time.time()
@@ -817,6 +973,67 @@ def clear_catalog_cache():
     with _catalog_cache_lock:
         _catalog_cache.clear()
         _catalog_cache_time.clear()
+
+
+def _collect_endpoint_models(ep: dict, user_models: list, new_routes: dict, new_meta: dict):
+    """Add one online endpoint's models to the routes and metadata being built."""
+    name = ep.get("name", "")
+    ep_type = ep.get("type", "")
+    host = ep.get("host", "")
+    api_key = ep.get("api_key", "")
+
+    if ep_type in ("openrouter", "orcarouter"):
+        # OpenRouter / OrcaRouter: Fetch metadata for user's curated models AND
+        # top intelligent models.
+        or_original_ids = set()
+        for um in user_models:
+            if um.startswith(f"{name}:"):
+                or_original_ids.add(um[len(name) + 1:])
+        # Also include top intelligent models for this endpoint
+        with _top_models_lock:
+            for tm in _top_intelligent_models:
+                if tm.startswith(f"{name}:"):
+                    or_original_ids.add(tm[len(name) + 1:])
+        if not or_original_ids:
+            return
+        # Fetch catalog (cached) to get metadata
+        if ep_type == "orcarouter":
+            all_or = _get_cached_catalog(name, fetch_orcarouter_models, host, api_key)
+        else:
+            all_or = _get_cached_catalog(name, fetch_openrouter_models, host, api_key)
+        or_meta = {m.get("id", ""): m for m in all_or}
+        for original_id in or_original_ids:
+            meta = or_meta.get(original_id, {"id": original_id, "name": original_id})
+            aggregated_id = f"{name}:{original_id}"
+            new_routes[aggregated_id] = (name, original_id, ep)
+            meta["_source"] = name
+            meta["_source_host"] = host
+            meta["id"] = aggregated_id
+            new_meta[aggregated_id] = meta
+
+    elif ep_type in ("llama-server", "lmstudio", "ollama", "strata", "custom"):
+        # Local endpoints: include all discovered models
+        if ep_type == "llama-server":
+            raw_models = fetch_llama_server_models(host)
+        elif ep_type == "lmstudio":
+            raw_models = fetch_lmstudio_models(host)
+        elif ep_type == "ollama":
+            raw_models = fetch_ollama_models(host)
+        elif ep_type == "strata":
+            raw_models = fetch_strata_models(host, api_key)
+        else:
+            raw_models = fetch_custom_models(host, api_key)
+
+        for model in raw_models:
+            original_id = model.get("id", "")
+            if not original_id:
+                continue
+            aggregated_id = f"{name}:{original_id}"
+            new_routes[aggregated_id] = (name, original_id, ep)
+            model["_source"] = name
+            model["_source_host"] = host
+            model["id"] = aggregated_id
+            new_meta[aggregated_id] = model
 
 
 def aggregate_models():
@@ -836,64 +1053,14 @@ def aggregate_models():
 
     endpoints = get_config("endpoints")
     for ep in endpoints:
-        name = ep.get("name", "")
-        if get_endpoint_status(name) != "online":
+        if get_endpoint_status(ep.get("name", "")) != "online":
             continue
-
-        ep_type = ep.get("type", "")
-        host = ep.get("host", "")
-        api_key = ep.get("api_key", "")
-
-        if ep_type in ("openrouter", "orcarouter"):
-            # OpenRouter / OrcaRouter: Fetch metadata for user's curated models AND
-            # top intelligent models.
-            or_original_ids = set()
-            for um in user_models:
-                if um.startswith(f"{name}:"):
-                    or_original_ids.add(um[len(name) + 1:])
-            # Also include top intelligent models for this endpoint
-            with _top_models_lock:
-                for tm in _top_intelligent_models:
-                    if tm.startswith(f"{name}:"):
-                        or_original_ids.add(tm[len(name) + 1:])
-            if not or_original_ids:
-                continue
-            # Fetch catalog (cached) to get metadata
-            if ep_type == "orcarouter":
-                all_or = _get_cached_catalog(name, fetch_orcarouter_models, host, api_key)
-            else:
-                all_or = _get_cached_catalog(name, fetch_openrouter_models, host, api_key)
-            or_meta = {m.get("id", ""): m for m in all_or}
-            for original_id in or_original_ids:
-                meta = or_meta.get(original_id, {"id": original_id, "name": original_id})
-                aggregated_id = f"{name}:{original_id}"
-                new_routes[aggregated_id] = (name, original_id, ep)
-                meta["_source"] = name
-                meta["_source_host"] = host
-                meta["id"] = aggregated_id
-                new_meta[aggregated_id] = meta
-
-        elif ep_type in ("llama-server", "lmstudio", "ollama", "custom"):
-            # Local endpoints: include all discovered models
-            if ep_type == "llama-server":
-                raw_models = fetch_llama_server_models(host)
-            elif ep_type == "lmstudio":
-                raw_models = fetch_lmstudio_models(host)
-            elif ep_type == "ollama":
-                raw_models = fetch_ollama_models(host)
-            else:
-                raw_models = fetch_custom_models(host, api_key)
-
-            for model in raw_models:
-                original_id = model.get("id", "")
-                if not original_id:
-                    continue
-                aggregated_id = f"{name}:{original_id}"
-                new_routes[aggregated_id] = (name, original_id, ep)
-                model["_source"] = name
-                model["_source_host"] = host
-                model["id"] = aggregated_id
-                new_meta[aggregated_id] = model
+        # One endpoint returning something unexpected must not drop the
+        # models of all the others.
+        try:
+            _collect_endpoint_models(ep, user_models, new_routes, new_meta)
+        except Exception as e:
+            _queue_log_line(f"[proxy] Skipped models from {ep.get('name', '')}: {e!r}")
 
     # Build MODELS list: user models first, then top intelligent models,
     # then discovered local models
@@ -934,6 +1101,7 @@ def auto_discover_local_endpoints():
         {"name": "llama.cpp", "type": "llama-server", "host": "localhost:8080", "probe": "/health"},
         {"name": "lmstudio",  "type": "lmstudio",    "host": "localhost:1234", "probe": "/v1/models"},
         {"name": "ollama",    "type": "ollama",       "host": "localhost:11434", "probe": "/api/tags"},
+        {"name": "strata",    "type": "strata",       "host": "127.0.0.1:47831", "probe": "/v1/models"},
     ]
     existing_names = set()
     with _config_lock:
@@ -948,7 +1116,7 @@ def auto_discover_local_endpoints():
         if name in existing_names or host in existing_hosts:
             continue
         try:
-            conn = http.client.HTTPConnection(host, timeout=3)
+            conn = http.client.HTTPConnection(_dial_host(host), timeout=3)
             conn.request("GET", probe["probe"])
             resp = conn.getresponse()
             resp.read()
@@ -1038,6 +1206,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Try to serve as static web UI file
         if self._serve_file(path.lstrip("/")):
             return
+        if path.startswith("/_app/"):
+            # A web UI file that isn't there (e.g. a page from before an
+            # update asking for an old bundle): 404, not an upstream error.
+            self.send_error(404, "Not found")
+            return
 
         # Proxy everything else
         self._proxy()
@@ -1067,8 +1240,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── Static file serving ────────────────────────────────────────────────
     def _serve_file(self, rel_path: str) -> bool:
-        filepath = os.path.normpath(os.path.join(WEBUI_DIR, rel_path))
-        if not filepath.startswith(os.path.normpath(WEBUI_DIR)):
+        root = os.path.normpath(WEBUI_DIR)
+        filepath = os.path.normpath(os.path.join(root, rel_path))
+        # commonpath, not startswith: the sibling "webui-src" starts with
+        # "webui" too, so /..%2fwebui-src/... passed a prefix check.
+        try:
+            if os.path.commonpath([root, filepath]) != root:
+                return False
+        except ValueError:  # different drive on Windows
             return False
         if not os.path.isfile(filepath):
             return False
@@ -1090,7 +1269,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             if "/immutable/" in rel_path:
                 self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-            elif rel_path in ("sw.js", "manifest.webmanifest", "_app/version.json", "build.json"):
+            elif rel_path in ("sw.js", "manifest.webmanifest", "_app/version.json", "build.json") or ext == ".html":
+                # HTML names the hashed bundles of its build, so it must be
+                # revalidated: an index.html cached from before a web UI
+                # update points at bundles that no longer exist.
                 self.send_header("Cache-Control", "no-cache")
             else:
                 self.send_header("Cache-Control", "public, max-age=3600")
@@ -1330,7 +1512,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_model_load(self):
         """Handle /models/load and /models/unload from the web UI.
 
-        /models/load sets the requested model as the new default (model_index)
+        /models/load sets the requested model as the new default (default_model)
         so subsequent requests without an explicit model use it. /models/unload
         is a no-op for cloud-aggregated models (they cannot actually be
         unloaded), but we still validate the model is known.
@@ -1360,7 +1542,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         is_unload = self.path == "/models/unload"
         if not is_unload:
-            set_config("model_index", models.index(model))
+            set_config("default_model", model)
             save_config()
             self._log(f"Web UI selected model: {model}")
 
@@ -1376,6 +1558,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         prefix (verified in webui/sw.js / bundle.js) and are stripped before
         forwarding upstream.
         """
+        if not _cors_proxy_caller_allowed(self.headers):
+            self._log(f"cors-proxy refused: Origin={self.headers.get('Origin')} "
+                      f"Sec-Fetch-Site={self.headers.get('Sec-Fetch-Site')} Host={self.headers.get('Host')}")
+            self._send_json({"error": "cors-proxy only serves the gateway's own web page"}, 403)
+            return
+
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         raw_url = query.get("url", [""])[0]
@@ -1451,7 +1639,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if use_ssl:
             conn = http.client.HTTPSConnection(target.netloc, context=_upstream_ssl_ctx, timeout=60)
         else:
-            conn = http.client.HTTPConnection(target.netloc, timeout=60)
+            conn = http.client.HTTPConnection(_dial_host(target.netloc), timeout=60)
 
         try:
             conn.request(self.command, upstream_path, body=request_body, headers=upstream_headers)
@@ -1577,7 +1765,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if ep_type == "openrouter":
             path = rewrite_path(self.path)
         else:
-            # llama-server, LM Studio, custom — use path as-is
+            # llama-server, LM Studio, Strata, custom — use path as-is
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
             if not path.startswith("/v1/") and not path.startswith("/api/"):
@@ -1602,17 +1790,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body:
             fwd_headers["Content-Length"] = str(len(body))
 
-        # 6. Forward to upstream
+        # 6. Forward to upstream. The timeout is per socket read; local models
+        # can spend minutes on a long prompt before the first token, so they
+        # get longer (an endpoint's "timeout" in config overrides both).
         use_ssl = not _is_local_host(host)
+        read_timeout = target_endpoint.get("timeout") or (180 if use_ssl else 600)
         if use_ssl:
-            conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=180)
+            conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=read_timeout)
         else:
-            conn = http.client.HTTPConnection(host, timeout=180)
+            conn = http.client.HTTPConnection(_dial_host(host), timeout=read_timeout)
 
         bump_endpoint_load_start(ep_name)
+        headers_sent = False
+        streaming = False
         try:
             conn.request(self.command, path, body=body, headers=fwd_headers)
             response = conn.getresponse()
+            streaming = "text/event-stream" in (response.getheader("Content-Type") or "")
 
             # Send status + CORS + upstream response headers
             self.send_response(response.status)
@@ -1623,10 +1817,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     continue
                 self.send_header(header, value)
             self.end_headers()
+            headers_sent = True
 
-            # Stream response body (SSE-safe)
+            # Stream response body (SSE-safe): read1 hands over whatever has
+            # arrived instead of waiting for a full buffer, so tokens reach
+            # the client as the upstream sends them.
             while True:
-                chunk = response.read(4096)
+                chunk = response.read1(65536)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -1637,9 +1834,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._log(f"Error → {ep_name}: {e}")
             try:
-                self.send_error(502, f"Bad Gateway ({ep_name}): {e}")
+                if not headers_sent:
+                    self.send_error(502, f"Bad Gateway ({ep_name}): {e}")
+                elif streaming:
+                    # The status line is already out: end the stream with an
+                    # SSE error event, not a second HTTP response in the body.
+                    err = json.dumps({"error": {"message": f"Bad Gateway ({ep_name}): {e}"}})
+                    self.wfile.write(f"data: {err}\n\n".encode())
+                    self.wfile.flush()
             except Exception:
                 pass
+            self.close_connection = True
         finally:
             conn.close()
             bump_endpoint_load_end(ep_name)
@@ -1697,6 +1902,7 @@ class EndpointEditScreen(ModalScreen):
         ("LM Studio", "lmstudio"),
         ("llama.cpp Server", "llama-server"),
         ("Ollama", "ollama"),
+        ("Strata", "strata"),
         ("Custom", "custom"),
     ]
 
@@ -1817,11 +2023,10 @@ class SettingsScreen(Screen):
             yield Static("Model Settings", classes="section-title")
             yield Label("Default Model")
             current_models = get_models()
-            default_idx = max(0, min(get_config("model_index"), len(current_models) - 1))
             model_options = [(m, m) for m in current_models] if current_models else [("No models available", "")]
             yield Select(
                 model_options,
-                value=current_models[default_idx] if current_models else "",
+                value=get_current_model() if current_models else "",
                 id="model-select",
             )
             yield Checkbox(
@@ -1978,9 +2183,8 @@ class SettingsScreen(Screen):
         model_select = self.query_one("#model-select", Select)
         models = get_models()
         if models:
-            idx = max(0, min(get_config("model_index"), len(models) - 1))
             model_select.set_options([(m, m) for m in models])
-            model_select.value = models[idx]
+            model_select.value = get_current_model()
         else:
             model_select.set_options([("No models available", "")])
 
@@ -1993,7 +2197,7 @@ class SettingsScreen(Screen):
         if model_select.value is not None:
             model_name = str(model_select.value)
             if model_name in models:
-                set_config("model_index", models.index(model_name))
+                set_config("default_model", model_name)
                 _queue_log_line(f"Model set → {model_name}")
 
         # Fetch top models checkbox
@@ -2351,6 +2555,14 @@ _server = None
 _server_thread = None
 
 
+class _GatewayHTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind the same port and
+    # silently share it, so a second instance would split requests with the
+    # first instead of failing. Without it, it gets "address in use"; an
+    # immediate rebind after closing (TUI restart) still works on Windows.
+    allow_reuse_address = os.name != "nt"
+
+
 def _start_server():
     """Bind and start the HTTP server.
 
@@ -2361,7 +2573,7 @@ def _start_server():
     port = get_config("port")
     addr = get_config("addr")
     try:
-        _server = ThreadingHTTPServer((addr, port), ProxyHandler)
+        _server = _GatewayHTTPServer((addr, port), ProxyHandler)
     except OSError as e:
         print(f"[proxy] ERROR: Cannot bind to {addr}:{port} — {e}")
         print(f"[proxy] Is another instance already running?")

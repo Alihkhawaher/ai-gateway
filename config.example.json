@@ -51,7 +51,7 @@
     "openrouter:z-ai/glm-5.3-flash",
     "openrouter:google/gemini-3.5-flash"
   ],
-  "model_index": 0,
+  "default_model": "",
   "port": 8090,
   "addr": "0.0.0.0",
   "fetch_top_models": false
