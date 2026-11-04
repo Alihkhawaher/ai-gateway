@@ -6,3 +6,16 @@ __pycache__/
 *.pyc
 testing/__pycache__/
 supergateway/
+
+# Local settings and runtime files: never in the repo
+presets.json
+runtime-identity.json
+template-context-capability.json
+runtime.owner/
+admin/
+sessions/
+clientSessions/
+server.pid
+*.pid
+*.log
+.env
