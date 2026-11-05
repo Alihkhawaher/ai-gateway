@@ -770,6 +770,505 @@ class SettingsScreenTests(unittest.TestCase):
         with open(proxy.CONFIG_FILE, encoding="utf-8") as f:
             self.assertIs(json.load(f)["force_default_model"], True)
 
+    def test_editing_an_endpoint_keeps_settings_the_dialog_does_not_show(self):
+        import types
+
+        kv = {"enabled": True, "min_tokens": 1}
+        proxy.set_config("endpoints", [{"name": "st", "type": "strata", "host": "h:1", "api_key": "",
+                                        "enabled": True, "timeout": 900, "kv_sessions": kv}])
+        screen = types.SimpleNamespace(notify=lambda *a, **k: None, _populate_endpoint_table=lambda: None,
+                                       _update_model_select=lambda: None)
+        proxy.SettingsScreen._on_endpoint_saved(screen, {"name": "st", "type": "strata", "host": "h:2", "api_key": "",
+                                                         "enabled": False, "_original_name": "st"})
+        ep = proxy.get_config("endpoints")[0]
+        self.assertEqual((ep["host"], ep["enabled"]), ("h:2", False))
+        self.assertEqual((ep["timeout"], ep["kv_sessions"]), (900, kv))
+        proxy.set_endpoint_status("st", "disabled")
+
+
+# ── Mock one-slot engine (Strata's server) ────────────────────────────────
+class MockEngine(BaseHTTPRequestHandler):
+    """A one-slot engine: chat replaces what the slot holds (reusing the common
+    start), /slots reports it, save and restore move it to and from files.
+    Serves the model API and the slot API on one port."""
+
+    protocol_version = "HTTP/1.1"
+    held = ""
+    saved = {}          # file name → text
+    calls = []          # what happened, in order
+    slot_dir = ""
+    api_key = ""
+    fail = {}           # "save" / "restore" → (status, message)
+    chat_status = 200
+    chat_delay = 0.0
+    file_bytes = 1024
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    @classmethod
+    def reset(cls, slot_dir):
+        cls.held, cls.saved, cls.calls = "", {}, []
+        cls.slot_dir, cls.api_key, cls.fail = slot_dir, "", {}
+        cls.chat_status, cls.chat_delay, cls.file_bytes = 200, 0.0, 1024
+        cls.active = cls.max_active = 0
+
+    def _allowed(self):
+        if MockEngine.api_key and self.headers.get("Authorization") != f"Bearer {MockEngine.api_key}":
+            self._json(401, {"error": {"message": "Invalid API key"}})
+            return False
+        return True
+
+    def do_GET(self):
+        if self.path == "/slots":
+            if self._allowed():
+                MockEngine.calls.append(("slots",))
+                self._json(200, [{"id": 0, "n_ctx": 524288, "is_processing": False,
+                                  "n_prompt_tokens": len(MockEngine.held) // 4}])
+        else:
+            self._json(200, {"object": "list", "data": [{"id": "m", "object": "model"}]})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/slots/0":
+            if self._allowed():
+                self._slot(urllib.parse.parse_qs(parsed.query)["action"][0], body["filename"])
+        else:
+            self._chat(body)
+
+    def _slot(self, action, name):
+        MockEngine.calls.append((action, name))
+        if action in MockEngine.fail:
+            status, message = MockEngine.fail[action]
+            self._json(status, {"error": {"code": status, "message": message}})
+        elif action == "save":
+            MockEngine.saved[name] = MockEngine.held
+            with open(os.path.join(MockEngine.slot_dir, name), "wb") as f:
+                f.write(b"\0" * MockEngine.file_bytes)
+            self._json(200, {"id_slot": 0, "filename": name, "n_saved": len(MockEngine.held) // 4,
+                             "n_written": MockEngine.file_bytes, "timings": {"save_ms": 1}})
+        elif name not in MockEngine.saved:
+            self._json(404, {"error": {"code": 404, "message": f"no saved session named {name}"}})
+        else:
+            MockEngine.held = MockEngine.saved[name]
+            self._json(200, {"id_slot": 0, "filename": name, "n_restored": len(MockEngine.held) // 4,
+                             "n_read": MockEngine.file_bytes, "timings": {"restore_ms": 1}})
+
+    def _chat(self, body):
+        with MockEngine.lock:
+            MockEngine.active += 1
+            MockEngine.max_active = max(MockEngine.max_active, MockEngine.active)
+        try:
+            if MockEngine.chat_delay:
+                time.sleep(MockEngine.chat_delay)
+            if MockEngine.chat_status != 200:
+                MockEngine.calls.append(("refused",))
+                self._json(MockEngine.chat_status, {"error": {"message": "refused"}})
+                return
+            text = "\n".join(str(m.get("content")) for m in body.get("messages", []))
+            reused = len(os.path.commonprefix([MockEngine.held, text]))
+            MockEngine.calls.append(("chat", reused, len(text)))
+            MockEngine.held = text
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                data = b'data: {"n": 1}\n\n'
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
+            else:
+                self._json(200, {"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+        finally:
+            with MockEngine.lock:
+                MockEngine.active -= 1
+
+    _json = MockUpstream._json
+
+    def log_message(self, *args):
+        pass
+
+
+class KVChainTests(unittest.TestCase):
+    """How a request becomes a chain of message hashes."""
+
+    PATH = "/v1/chat/completions"
+
+    def test_same_messages_give_the_same_chain(self):
+        msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "hello"}]
+        a = proxy.kv_chain({"messages": msgs}, self.PATH)
+        b = proxy.kv_chain({"messages": [dict(m) for m in msgs], "temperature": 0.2}, self.PATH)
+        self.assertEqual(a.hashes, b.hashes)
+        self.assertEqual(a.lens, [1, 6])
+        self.assertEqual(a.total, 6)
+
+    def test_a_longer_chat_extends_the_chain(self):
+        short = proxy.kv_chain({"messages": [{"role": "user", "content": "hi"}]}, self.PATH)
+        long = proxy.kv_chain({"messages": [{"role": "user", "content": "hi"},
+                                            {"role": "assistant", "content": "yes"},
+                                            {"role": "user", "content": "more"}]}, self.PATH)
+        self.assertEqual(long.hashes[:1], short.hashes)
+        self.assertEqual(proxy._kv_common(short.hashes, short.lens, long.hashes), (1, 2))
+
+    def test_tools_are_part_of_the_chain(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        plain = proxy.kv_chain({"messages": msgs}, self.PATH)
+        tooled = proxy.kv_chain({"messages": msgs, "tools": [{"type": "function"}]}, self.PATH)
+        self.assertNotEqual(plain.hashes[0], tooled.hashes[0])
+
+    def test_text_parts_read_like_plain_text_and_images_count_by_hash(self):
+        plain = proxy.kv_chain({"messages": [{"role": "user", "content": "hi"}]}, self.PATH)
+        parts = proxy.kv_chain({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}, self.PATH)
+        self.assertEqual(plain.hashes, parts.hashes)
+        img = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}}
+        other = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "B" * 5000}}
+        one = proxy.kv_chain({"messages": [{"role": "user", "content": [img]}]}, self.PATH)
+        two = proxy.kv_chain({"messages": [{"role": "user", "content": [other]}]}, self.PATH)
+        self.assertNotEqual(one.hashes, two.hashes)
+        self.assertLess(one.total, 100)
+
+    def test_anthropic_system_prompt_counts(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        a = proxy.kv_chain({"system": "one", "messages": msgs}, "/v1/messages")
+        b = proxy.kv_chain({"system": "two", "messages": msgs}, "/v1/messages")
+        self.assertNotEqual(a.hashes[0], b.hashes[0])
+        self.assertEqual(len(a.hashes), 2)
+
+    def test_no_conversation_gives_no_chain(self):
+        self.assertIsNone(proxy.kv_chain({"messages": []}, self.PATH))
+        self.assertIsNone(proxy.kv_chain({"prompt": "x"}, self.PATH))
+        self.assertIsNone(proxy.kv_chain(["not", "a", "dict"], self.PATH))
+
+    def test_settings_get_defaults_and_bad_numbers_are_ignored(self):
+        self.assertIsNone(proxy._kv_config({"name": "x"}))
+        self.assertIsNone(proxy._kv_config({"kv_sessions": {"enabled": False}}))
+        cfg = proxy._kv_config({"kv_sessions": {"enabled": True, "min_tokens": "oops", "max_gb": -5, "x": 1}})
+        self.assertEqual(cfg["min_tokens"], proxy.KV_DEFAULTS["min_tokens"])
+        self.assertEqual(cfg["max_gb"], 0)
+        self.assertNotIn("x", cfg)
+
+
+class KVSessionSwapTests(unittest.TestCase):
+    """End to end through the gateway against a mock one-slot engine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.en_srv, cls.en_t, cls.en_port = start_server(MockEngine)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.en_srv.shutdown(); cls.en_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._KV_IDLE_POLL_S)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        self.slot_dir = os.path.join(self._tmp.name, "slots")
+        os.mkdir(self.slot_dir)
+        MockEngine.reset(self.slot_dir)
+        proxy._kv_managers.clear()
+        proxy.set_config("force_default_model", False)
+        self._use({})
+
+    def tearDown(self):
+        for m in proxy._kv_managers.values():
+            m.cfg = {**m.cfg, "idle_save_s": 0}  # lets an idle-save thread end
+        proxy._kv_managers.clear()
+        proxy.set_endpoint_status("eng", "disabled")
+        proxy.CONFIG_FILE, proxy._config, proxy._KV_IDLE_POLL_S = self._saved
+        os.environ.pop("STRATA_INSTANCES_DIR", None)
+        self._tmp.cleanup()
+
+    def _use(self, kv, ep_type="custom", enabled=True):
+        settings = {"enabled": enabled, "engine": f"127.0.0.1:{self.en_port}", "min_tokens": 100,
+                    "min_gain_chars": 50, "idle_save_s": 0, "slot_dir": self.slot_dir}
+        settings.update(kv)
+        proxy.set_config("endpoints", [{"name": "eng", "type": ep_type, "host": f"localhost:{self.en_port}",
+                                        "enabled": True, "api_key": "", "kv_sessions": settings}])
+        proxy.set_endpoint_status("eng", "online")
+
+    @staticmethod
+    def _conv(tag, *more):
+        msgs = [{"role": "system", "content": "You help."}, {"role": "user", "content": tag * 2000}]
+        for i, text in enumerate(more):
+            msgs.append({"role": "assistant" if i % 2 == 0 else "user", "content": text})
+        return msgs
+
+    def _chat(self, msgs, stream=False, model="eng:m"):
+        status, _, body = request(self.gw_port, "POST", "/v1/chat/completions",
+                                  body=json.dumps({"model": model, "messages": msgs, "stream": stream}),
+                                  headers={"Content-Type": "application/json"})
+        # The gateway finishes its bookkeeping just after the client has the
+        # whole reply, still holding the lock it took before forwarding.
+        manager = proxy._kv_managers.get("eng")
+        if manager:
+            with manager.lock:
+                pass
+        return status, body
+
+    @staticmethod
+    def _steps():
+        return [c for c in MockEngine.calls if c[0] != "slots"]
+
+    def _names(self, action):
+        return [c[1] for c in MockEngine.calls if c[0] == action]
+
+    def test_switching_saves_the_held_chat_and_restores_the_other(self):
+        a_len = len("You help.\n" + "a" * 2000)
+        self.assertEqual(self._chat(self._conv("a"))[0], 200)
+        self.assertEqual(self._names("save"), [])  # first chat: nothing to save yet
+        self.assertEqual(self._chat(self._conv("b"))[0], 200)
+        self.assertEqual(len(self._names("save")), 1)
+        a_file = self._names("save")[0]
+        self.assertTrue(a_file.startswith("gw-") and a_file.endswith(".bin"))
+        MockEngine.calls.clear()
+        self.assertEqual(self._chat(self._conv("a", "ok", "more"))[0], 200)
+        steps = self._steps()
+        self.assertEqual([s[0] for s in steps], ["save", "restore", "chat"])  # in this order
+        self.assertEqual(steps[1][1], a_file)
+        self.assertNotEqual(steps[0][1], a_file)
+        self.assertEqual(steps[2][1], a_len)  # the whole first chat was reused
+
+    def test_continuing_the_held_chat_touches_nothing(self):
+        self._chat(self._conv("a"))
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"))
+        self._chat(self._conv("a", "ok", "more", "fine", "again"))
+        self.assertEqual([s[0] for s in self._steps()], ["chat", "chat"])
+
+    def test_regenerating_or_editing_the_last_message_is_not_a_switch(self):
+        self._chat(self._conv("a", "ok", "more"))
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"))           # regenerate
+        self._chat(self._conv("a", "ok", "changed"))        # edit: 98% of the chat stays
+        self.assertEqual([s[0] for s in self._steps()], ["chat", "chat"])
+
+    def test_a_short_side_request_is_never_saved_and_the_long_chat_comes_back(self):
+        self._chat(self._conv("a"))
+        self._chat([{"role": "user", "content": "Title this chat."}])
+        self.assertEqual(len(self._names("save")), 1)  # the long chat
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"))
+        self.assertEqual([s[0] for s in self._steps()], ["restore", "chat"])  # side request not saved
+
+    def test_a_saved_chat_keeps_its_file(self):
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        a_file = self._names("save")[0]
+        self._chat(self._conv("a", "ok", "more"))
+        MockEngine.calls.clear()
+        self._chat(self._conv("c"))
+        self.assertEqual(self._names("save"), [a_file])  # same file, newer state
+        self.assertIn("ok\nmore", MockEngine.saved[a_file])
+        self.assertEqual(proxy.kv_status_all()["eng"]["sessions"], 2)
+
+    def test_an_already_saved_chat_is_not_saved_again(self):
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        self._chat(self._conv("a"))  # restored, nothing new since
+        MockEngine.calls.clear()
+        self._chat(self._conv("b"))
+        steps = [s[0] for s in self._steps()]
+        self.assertEqual(steps.count("save"), 1)  # only the chat that changed
+        self.assertEqual(steps[-1], "chat")
+
+    def test_engine_restart_forgets_the_held_chat(self):
+        self._chat(self._conv("a"))
+        MockEngine.held = ""  # the model was unloaded and loaded again
+        MockEngine.calls.clear()
+        self.assertEqual(self._chat(self._conv("b"))[0], 200)
+        self.assertEqual(self._names("save"), [])
+
+    def test_someone_using_the_engine_directly_is_not_saved_under_this_chats_name(self):
+        self._chat(self._conv("a"))
+        MockEngine.held = "x" * 100000
+        MockEngine.calls.clear()
+        self._chat(self._conv("b"))
+        self.assertEqual(self._names("save"), [])
+
+    def test_engine_without_slot_saving_still_answers_and_is_left_alone(self):
+        MockEngine.fail = {"save": (501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")}
+        self._chat(self._conv("a"))
+        self.assertEqual(self._chat(self._conv("b"))[0], 200)
+        self.assertEqual(len(self._names("save")), 1)
+        self.assertGreater(proxy.kv_status_all()["eng"]["paused"], 0)
+        MockEngine.calls.clear()
+        self.assertEqual(self._chat(self._conv("c"))[0], 200)
+        self.assertEqual([c[0] for c in MockEngine.calls], ["chat"])  # not even /slots
+
+    def test_a_failed_save_does_not_stop_the_request(self):
+        MockEngine.fail = {"save": (507, "not enough disk space")}
+        self._chat(self._conv("a"))
+        self.assertEqual(self._chat(self._conv("b"))[0], 200)
+        self.assertEqual(proxy.kv_status_all()["eng"]["errors"], 1)
+        self.assertEqual(proxy.kv_status_all()["eng"]["sessions"], 0)
+
+    def test_a_missing_file_is_forgotten(self):
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        self.assertEqual(proxy.kv_status_all()["eng"]["sessions"], 1)
+        MockEngine.saved.clear()
+        MockEngine.calls.clear()
+        self.assertEqual(self._chat(self._conv("a", "ok", "more"))[0], 200)
+        self.assertEqual(len(self._names("restore")), 1)
+        names = {e["file"] for e in proxy._kv_managers["eng"].index.values()}
+        self.assertNotIn(self._names("restore")[0], names)
+
+    def test_requests_are_served_one_at_a_time(self):
+        MockEngine.chat_delay = 0.2
+        results = []
+        threads = [threading.Thread(target=lambda t=t: results.append(self._chat(self._conv(t))[0]))
+                   for t in "abc"]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, [200, 200, 200])
+        self.assertEqual(MockEngine.max_active, 1)
+
+    def test_endpoint_without_the_setting_is_untouched(self):
+        self._use({}, enabled=False)
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        self.assertEqual([c[0] for c in MockEngine.calls], ["chat", "chat"])  # no /slots at all
+        self.assertEqual(proxy.kv_status_all(), {})
+
+    def test_other_requests_are_not_managed(self):
+        status, _, _ = request(self.gw_port, "POST", "/v1/embeddings",
+                               body=json.dumps({"model": "eng:m", "input": "x"}),
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self._names("slots"), [])
+        self.assertEqual(proxy.kv_status_all(), {})
+
+    def test_streamed_chat_counts_as_held(self):
+        status, body = self._chat(self._conv("a"), stream=True)
+        self.assertEqual(status, 200)
+        self.assertIn(b"data:", body)
+        self._chat(self._conv("b"))
+        self.assertEqual(len(self._names("save")), 1)
+
+    def test_a_refused_request_leaves_the_held_chat_in_place(self):
+        self._chat(self._conv("a"))
+        MockEngine.chat_status = 400
+        self.assertEqual(self._chat(self._conv("b"))[0], 400)
+        MockEngine.chat_status = 200
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"))
+        self.assertEqual([s[0] for s in self._steps()], ["chat"])  # still held, no restore
+
+    def test_sessions_survive_a_gateway_restart(self):
+        a_len = len("You help.\n" + "a" * 2000)
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        proxy._kv_managers.clear()
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"))
+        steps = self._steps()
+        self.assertEqual([s[0] for s in steps], ["restore", "chat"])  # the unknown held chat is not saved
+        self.assertEqual(steps[1][1], a_len)
+
+    def test_idle_save(self):
+        proxy._KV_IDLE_POLL_S = 0.02
+        self._use({"idle_save_s": 0.05})
+        self._chat(self._conv("a"))
+        deadline = time.time() + 5
+        while time.time() < deadline and not self._names("save"):
+            time.sleep(0.02)
+        self.assertEqual(len(self._names("save")), 1)
+        time.sleep(0.2)
+        self.assertEqual(len(self._names("save")), 1)  # once, not over and over
+        self._chat(self._conv("b"))
+        self.assertEqual(self._names("save").count(self._names("save")[0]), 1)  # a was already saved
+        self.assertTrue(proxy.kv_status_all()["eng"]["held"])
+
+    def test_oldest_files_are_deleted_only_when_asked_and_only_our_own(self):
+        foreign = os.path.join(self.slot_dir, "notes.bin")
+        stray = os.path.join(self.slot_dir, "gw-not-in-the-index.bin")
+        for path in (foreign, stray):
+            with open(path, "wb") as f:
+                f.write(b"x")
+        self._use({"max_gb": 1500 / 1024 ** 3})
+        for tag in "abc":
+            self._chat(self._conv(tag))
+        saved = self._names("save")
+        self.assertEqual(len(saved), 2)
+        self.assertFalse(os.path.exists(os.path.join(self.slot_dir, saved[0])))  # the oldest went
+        self.assertTrue(os.path.exists(os.path.join(self.slot_dir, saved[1])))   # the held chat's stays
+        self.assertTrue(os.path.exists(foreign))
+        self.assertTrue(os.path.exists(stray))
+        self.assertEqual(proxy.kv_status_all()["eng"]["sessions"], 1)
+
+    def test_nothing_is_deleted_by_default(self):
+        for tag in "abcd":
+            self._chat(self._conv(tag))
+        self.assertEqual(len(os.listdir(self.slot_dir)), 3)
+
+    def test_finds_stratas_engine_by_model(self):
+        folder = os.path.join(self._tmp.name, "instances")
+        os.mkdir(folder)
+        os.environ["STRATA_INSTANCES_DIR"] = folder
+        now = time.time()
+        files = {
+            "old.json": ({"port": 1111, "api_key": "old", "model_name": "iq3_s"}, now - 100),
+            "new.json": ({"port": 2222, "api_key": "new", "model_name": "iq3_s",
+                          "slot_save_path": os.path.join(self._tmp.name, "s")}, now - 50),
+            "other.json": ({"port": 3333, "api_key": "o", "model_name": "q8_0", "aliases": ["fast"]}, now),
+            "broken.json": (None, now + 10),
+            "drafting-1.json": ({"port": 4444, "api_key": "p", "model_name": "iq3_s"}, now + 20),
+        }
+        for name, (cfg, mtime) in files.items():
+            path = os.path.join(folder, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(cfg) if cfg else "{not json")
+            os.utime(path, (mtime, mtime))
+        self.assertEqual(proxy._kv_find_strata_instance("iq3_s"),
+                         ("127.0.0.1:2222", "new", os.path.join(self._tmp.name, "s")))
+        self.assertEqual(proxy._kv_find_strata_instance("FAST")[0], "127.0.0.1:3333")
+        self.assertEqual(proxy._kv_find_strata_instance("nobody")[0], "127.0.0.1:3333")  # newest
+        os.environ["STRATA_INSTANCES_DIR"] = os.path.join(folder, "missing")
+        self.assertIsNone(proxy._kv_find_strata_instance("iq3_s"))
+
+    def test_strata_endpoint_uses_the_key_strata_wrote(self):
+        folder = os.path.join(self._tmp.name, "instances")
+        os.mkdir(folder)
+        os.environ["STRATA_INSTANCES_DIR"] = folder
+        with open(os.path.join(folder, "i.json"), "w", encoding="utf-8") as f:
+            json.dump({"port": self.en_port, "api_key": "instance-key", "model_name": "iq3_s"}, f)
+        MockEngine.api_key = "instance-key"
+        self._use({"engine": "", "slot_dir": ""}, ep_type="strata")
+        self._chat(self._conv("a"), model="eng:iq3_s")
+        self.assertEqual(self._chat(self._conv("b"), model="eng:iq3_s")[0], 200)
+        self.assertEqual(len(self._names("save")), 1)
+        self.assertEqual(proxy.kv_status_all()["eng"]["errors"], 0)
+
+    def test_no_engine_to_talk_to_only_pauses_swapping(self):
+        self._use({"engine": ""})  # a custom endpoint must name its engine
+        self.assertEqual(self._chat(self._conv("a"))[0], 200)
+        self.assertGreater(proxy.kv_status_all()["eng"]["paused"], 0)
+        self.assertEqual([c[0] for c in MockEngine.calls], ["chat"])
+
+    def test_wrong_engine_key_only_pauses_swapping(self):
+        MockEngine.api_key = "right"
+        self._use({"engine_api_key": "wrong"})
+        self.assertEqual(self._chat(self._conv("a"))[0], 200)
+        self.assertGreater(proxy.kv_status_all()["eng"]["paused"], 0)
+
+    def test_health_reports_sessions_without_secrets(self):
+        self._use({"engine_api_key": ""})
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        status, _, body = request(self.gw_port, "GET", "/health")
+        self.assertEqual(status, 200)
+        kv = json.loads(body)["kv_sessions"]["eng"]
+        self.assertEqual(kv["sessions"], 1)
+        self.assertEqual(kv["saves"], 1)
+        self.assertEqual(kv["bytes"], 1024)
+        self.assertEqual(kv["held"]["saved"], False)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -239,6 +239,51 @@ Edit `config.json`:
 | `strata` | Strata gateway (default `127.0.0.1:47831`) — vision and context follow the model loaded in Strata | `GET /v1/models` |
 | `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` |
 
+## Long Chats on a Local Engine (KV Session Swap)
+
+A local engine like Strata holds one conversation at a time. If several apps each keep a long chat there, every switch throws the held chat away, and the next request reads the other one again from scratch: 15+ minutes at 500k tokens.
+
+With `kv_sessions` on, the gateway saves the held chat to disk and restores the right one before forwarding each request, so a switch takes seconds. Apps need no changes: chats are recognised by hashes of their messages.
+
+**Turn it on (Strata):**
+
+1. Create a folder for the session files, then add it to the model's run config (`strata-<model>.json`) and load the model again:
+   ```json
+   "slot_save_path": "D:\\Strata\\sessions"
+   ```
+2. Add this to the Strata endpoint in `config.json` and restart the gateway:
+   ```json
+   "kv_sessions": {"enabled": true}
+   ```
+
+The gateway finds the engine's port and key in Strata's own run files on each request. For another engine with the same slot API (`POST /slots/0?action=save|restore`), set `engine` and, if it has one, `engine_api_key`.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `enabled` | `false` | Turn the swap on for this endpoint |
+| `engine` | found for Strata | `host:port` of the engine's own server |
+| `engine_api_key` | found for Strata | That server's API key |
+| `slot_dir` | found for Strata | The engine's session folder (only needed for `max_gb`) |
+| `min_tokens` | `30000` | A shorter chat is cheap to read again, so it isn't saved |
+| `min_gain_chars` | `4000` | Restore a saved chat only if it matches this many more characters than the held one |
+| `idle_save_s` | `600` | Save the held chat after this many seconds without requests (`0` = off) |
+| `max_gb` | `0` | Keep at most this much on disk, deleting the oldest of its own files first (`0` = never delete) |
+
+**What it costs:**
+
+| | Measured with Strata on an NVMe drive |
+|---|---|
+| Disk | About 16.7 KB per token: 1.7 GB at 104k tokens, about 8.5 GB at 512k (estimated) |
+| Save / restore | 2.2 s / 3.0 s at 104k tokens, about 11 s / 15 s at 512k (estimated) |
+| Reading the same chat from scratch | 274 s at 104k tokens, over 20 minutes at 370k |
+
+- There is no limit on the number of swaps or saved chats except disk space. Set `max_gb` to cap it.
+- A save rewrites the whole chat, and only happens if the chat changed since its last save. Switching back and forth often writes a lot to the SSD.
+- The engine still runs one request at a time, so apps take turns.
+- A chat comes back in full only if the app resends the same history. If it trims or rewrites older messages, the part after the first change is read again.
+
+The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
+
 ## Connecting Clients
 
 ### Cline (Recommended)
@@ -303,6 +348,8 @@ python testing/test_proxy.py
 ```
 
 The tests spin up an in-process mock MCP server and an ephemeral gateway, then assert on `/props`, `/cors-proxy` forwarding, header precedence, the MCP session handshake, and error handling — no running gateway, online model, or API key needed.
+
+`testing/live_kv_check.py` checks the KV session swap against a real engine. It needs a loaded model, takes a few minutes, and uses only made-up text.
 
 ## Prerequisites
 

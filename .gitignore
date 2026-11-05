@@ -16,6 +16,7 @@ admin/
 sessions/
 clientSessions/
 server.pid
+kv-sessions-*
 *.pid
 *.log
 .env

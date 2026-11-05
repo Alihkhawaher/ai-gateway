@@ -14,12 +14,14 @@ Usage:
 """
 
 import copy
+import hashlib
 import json
 import http.client
 import ipaddress
 import mimetypes
 import os
 import queue
+import secrets
 import ssl
 import sys
 import threading
@@ -1167,6 +1169,587 @@ from textual.widgets import (
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  KV SESSION SWAP — save and restore a local engine's conversation on disk
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A local engine (Strata) holds ONE conversation. When several apps each keep
+# a long chat there, every switch throws the held conversation away and the
+# next request reads the other chat from scratch: 15+ minutes at 500k tokens.
+# Strata can save the held conversation to a file and load it back in seconds
+# (POST /slots/0?action=save|restore, switched on by "slot_save_path" in its
+# run config). This section decides, per request, which conversation the engine
+# should hold and swaps it through those two calls.
+#
+# It never reads a session file: it only passes file names to the engine and
+# remembers each conversation as a list of message hashes (the chain).
+#
+# Opt-in per endpoint in config.json:
+#   "kv_sessions": {"enabled": true}                    (other keys: README)
+
+KV_DEFAULTS = {
+    "enabled": False,
+    "engine": "",           # host:port of the engine's own server; "" = find it (Strata)
+    "engine_api_key": "",   # its API key; "" = the key Strata wrote for that instance
+    "slot_dir": "",         # where the engine writes sessions (only needed to evict)
+    "min_tokens": 30000,    # a conversation shorter than this is cheap to read again: not saved
+    "min_gain_chars": 4000, # restore a saved chat only if it matches this many more characters
+    "idle_save_s": 600,     # save the held chat after this long without requests (0 = off); a save
+                            # rewrites the whole chat (8.5 GB at 512k tokens), so not after every pause
+    "max_gb": 0,            # keep at most this much on disk, oldest first (0 = never delete)
+}
+_KV_KEEP_RATIO = 0.98       # a request that keeps this much of the held chat continues it
+_KV_BACKOFF_S = 60          # after the engine can't swap, leave it alone for this long
+_KV_IDLE_POLL_S = 5.0       # how often the idle saver looks
+_KV_CALL_TIMEOUT = 900      # a save or restore of a 500k chat takes seconds, not minutes
+_kv_managers = {}           # endpoint name → KVSessionManager
+_kv_managers_lock = threading.Lock()
+
+
+def _kv_config(ep: dict):
+    """The endpoint's kv_sessions settings with defaults, or None when off."""
+    raw = ep.get("kv_sessions")
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    cfg = dict(KV_DEFAULTS)
+    cfg.update({k: v for k, v in raw.items() if k in KV_DEFAULTS})
+    for key, cast in (("min_tokens", int), ("min_gain_chars", int),
+                      ("idle_save_s", float), ("max_gb", float)):
+        try:
+            cfg[key] = max(0, cast(cfg[key]))
+        except (TypeError, ValueError):
+            cfg[key] = KV_DEFAULTS[key]
+    for key in ("engine", "engine_api_key", "slot_dir"):
+        cfg[key] = str(cfg[key] or "").strip()
+    return cfg
+
+
+def _kv_text(content) -> str:
+    """A message's content as text for hashing: a string, or the text, tool and
+    image parts of a list (an image counts by a short hash of its reference)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif not isinstance(p, dict):
+                parts.append(str(p))
+            else:
+                kind = p.get("type")
+                if kind in ("text", "input_text", "output_text") or (kind is None and "text" in p):
+                    parts.append(str(p.get("text", "")))
+                elif kind in ("image_url", "input_image", "image"):
+                    ref = p.get("image_url") or p.get("source") or p.get("url") or ""
+                    if isinstance(ref, dict):
+                        ref = ref.get("url") or json.dumps(ref, sort_keys=True)
+                    parts.append("[image:" + hashlib.sha1(str(ref).encode("utf-8", "replace")).hexdigest()[:12] + "]")
+                else:
+                    parts.append(json.dumps(p, sort_keys=True, ensure_ascii=False))
+        return "\n".join(parts)
+    return json.dumps(content, sort_keys=True, ensure_ascii=False)
+
+
+class KVChain:
+    """A conversation as the hashes of its messages (tools and system prompt
+    included, in order) and the running character count at each one."""
+    __slots__ = ("hashes", "lens")
+
+    def __init__(self, hashes, lens):
+        self.hashes = list(hashes)
+        self.lens = list(lens)
+
+    @property
+    def total(self) -> int:
+        return self.lens[-1] if self.lens else 0
+
+
+def kv_chain(data, path: str):
+    """The KVChain of a chat request (OpenAI chat completions or Anthropic
+    messages), or None when the request carries no conversation."""
+    if not isinstance(data, dict):
+        return None
+    msgs = data.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    items = []
+    if data.get("tools"):
+        items.append(("tools", json.dumps(data["tools"], sort_keys=True, ensure_ascii=False)))
+    if path.rstrip("/").endswith("/messages") and data.get("system"):
+        items.append(("system", _kv_text(data["system"])))
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        text = _kv_text(m.get("content"))
+        if m.get("tool_calls"):
+            text += "\n" + json.dumps(m["tool_calls"], sort_keys=True, ensure_ascii=False)
+        for key in ("name", "tool_call_id"):
+            if m.get(key):
+                text += f"\n{key}={m[key]}"
+        items.append((str(m.get("role", "")), text))
+    if not items:
+        return None
+    hashes, lens, total = [], [], 0
+    for label, text in items:
+        hashes.append(hashlib.sha1((label + "\x00" + text).encode("utf-8", "replace")).hexdigest()[:20])
+        total += len(text)
+        lens.append(total)
+    return KVChain(hashes, lens)
+
+
+def _kv_common(hashes, lens, other):
+    """(messages, characters) the two chains share from the start."""
+    n = 0
+    for a, b in zip(hashes, other):
+        if a != b:
+            break
+        n += 1
+    return n, (lens[n - 1] if n else 0)
+
+
+def _kv_instances_dir() -> str:
+    return (os.environ.get("STRATA_INSTANCES_DIR")
+            or os.path.join(os.path.expanduser("~"), ".strata", "data", "native-instances"))
+
+
+def _kv_find_strata_instance(model: str):
+    """(host:port, api key, slot dir) of the engine server Strata started for
+    `model`, read from Strata's own run files (the newest load of that model).
+    The key is used in memory only, never copied or logged."""
+    folder = _kv_instances_dir()
+    try:
+        # drafting-*.json are Strata's short-lived probes, not running engines
+        names = [n for n in os.listdir(folder) if n.endswith(".json") and not n.startswith("drafting-")]
+    except OSError:
+        return None
+    want = (model or "").strip().lower()
+    best = None
+    for name in names:
+        path = os.path.join(folder, name)
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            port = int(cfg.get("port") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if not isinstance(cfg, dict) or not port:
+            continue
+        known = {str(cfg.get("model_name", "")).lower()} | {str(a).lower() for a in (cfg.get("aliases") or [])}
+        rank = (1 if want and want in known else 0, mtime)
+        if best is None or rank > best[0]:
+            slot_dir = str(cfg.get("slot_save_path") or "")
+            if slot_dir and not os.path.isabs(slot_dir) and cfg.get("cwd"):
+                slot_dir = os.path.join(str(cfg["cwd"]), slot_dir)
+            best = (rank, (f"{cfg.get('host') or '127.0.0.1'}:{port}", str(cfg.get("api_key") or ""), slot_dir))
+    return best[1] if best else None
+
+
+class _KVError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class _KVTicket:
+    """One request's hold on its endpoint's engine (taken by begin, given back by end)."""
+
+    def __init__(self, manager, chain, model):
+        self.manager = manager
+        self.chain = chain
+        self.model = model
+        self.target = None      # (host, key, slot dir) once the engine was reached
+        self.inherit_id = None  # the saved session this request continues, if any
+
+
+class KVSessionManager:
+    """Keeps the right conversation in one endpoint's engine slot.
+
+    One request at a time per endpoint (the engine has one slot and queues
+    requests itself, so nothing waits longer than before). Before a request is
+    forwarded: if it continues the conversation the engine already holds, do
+    nothing; otherwise save the held one (when long and unsaved), and restore
+    the saved conversation that matches the request best. After it: remember
+    the engine now holds this request's conversation, unsaved.
+    """
+
+    def __init__(self, ep: dict, cfg: dict):
+        self.name = ep.get("name", "")
+        self.type = ep.get("type", "")
+        self.ep_key = ep.get("api_key", "")
+        self.cfg = cfg
+        self.lock = threading.RLock()
+        self.index = {}             # session id → entry (chain, file, tokens, bytes, times)
+        self.current = None         # what the engine holds: chain, lens, id, tokens, dirty
+        self.unavailable_until = 0.0
+        self.last_activity = time.time()
+        self.stats = {"saves": 0, "restores": 0, "errors": 0}
+        self._loaded = False
+        self._idle_thread = None
+        self._last_target = None
+        self._slot_dir = ""
+
+    # ── logging and persistence ─────────────────────────────────────────
+    def _log(self, msg: str):
+        _queue_log_line(f"[kv:{self.name}] {msg}")
+
+    def _index_path(self) -> str:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.name) or "endpoint"
+        return os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), f"kv-sessions-{safe}.json")
+
+    def _load_index(self):
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            with open(self._index_path(), "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            for sid, e in (raw.get("entries") or {}).items():
+                if (isinstance(e, dict) and isinstance(e.get("chain"), list) and e["chain"]
+                        and isinstance(e.get("lens"), list) and len(e["lens"]) == len(e["chain"])
+                        and isinstance(e.get("file"), str)):
+                    e["id"] = sid
+                    self.index[sid] = e
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _save_index(self):
+        path = self._index_path()
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": self.index}, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            self._log(f"could not write the session index: {e}")
+
+    # ── talking to the engine ───────────────────────────────────────────
+    def _target(self, model: str):
+        cfg = self.cfg
+        if cfg["engine"]:
+            return cfg["engine"], cfg["engine_api_key"] or self.ep_key, cfg["slot_dir"]
+        if self.type == "strata":
+            found = _kv_find_strata_instance(model)
+            if found:
+                host, key, slot_dir = found
+                return host, cfg["engine_api_key"] or key, cfg["slot_dir"] or slot_dir
+        return None
+
+    def _call(self, target, method, path, body=None, timeout=_KV_CALL_TIMEOUT):
+        host, key, _slot_dir = target
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=timeout)
+        try:
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            payload = json.dumps(body).encode("utf-8") if body is not None else None
+            conn.request(method, path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            try:
+                parsed = json.loads(raw) if raw else None
+            except ValueError:
+                parsed = None
+            return resp.status, parsed
+        finally:
+            conn.close()
+
+    def _slot_state(self, target):
+        """(tokens the engine holds, busy) from GET /slots, or None."""
+        try:
+            status, body = self._call(target, "GET", "/slots", timeout=10)
+        except Exception:
+            return None
+        if status != 200 or not isinstance(body, list) or not body or not isinstance(body[0], dict):
+            return None
+        try:
+            held = int(body[0].get("n_prompt_tokens") or 0)
+        except (TypeError, ValueError):
+            held = 0
+        return held, bool(body[0].get("is_processing"))
+
+    def _slot_action(self, target, action: str, filename: str) -> dict:
+        status, body = self._call(target, "POST", f"/slots/0?action={action}", {"filename": filename})
+        if status == 200 and isinstance(body, dict):
+            return body
+        msg = ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            msg = err.get("message", "") if isinstance(err, dict) else str(err or "")
+        raise _KVError(status, msg or f"HTTP {status}")
+
+    def _mark_unavailable(self, why: str):
+        self.unavailable_until = time.time() + _KV_BACKOFF_S
+        self.current = None
+        self._log(f"session swap paused for {_KV_BACKOFF_S} s: {why}")
+
+    # ── the decision (pure: no I/O) ─────────────────────────────────────
+    def _plan(self, cur, req: KVChain) -> dict:
+        cfg = self.cfg
+        cur_chars = 0
+        cur_total = 0
+        if cur and cur.get("chain"):
+            _n, cur_chars = _kv_common(cur["chain"], cur["lens"], req.hashes)
+            cur_total = cur["lens"][-1]
+        if cur and cur.get("chain") and cur_chars >= _KV_KEEP_RATIO * cur_total:
+            return {"keeps": True, "save": False, "restore": None}
+        save = bool(cur and cur.get("chain") and cur.get("dirty") and cur["tokens"] >= cfg["min_tokens"])
+        best, best_chars = None, 0
+        for e in self.index.values():
+            _n, chars = _kv_common(e["chain"], e["lens"], req.hashes)
+            if chars > best_chars or (best and chars == best_chars and e.get("last_used", 0) > best.get("last_used", 0)):
+                best, best_chars = e, chars
+        restore = None
+        if (best and best_chars >= cur_chars + cfg["min_gain_chars"]
+                and int(best.get("tokens", 0)) >= cfg["min_tokens"]):
+            restore = best
+        return {"keeps": False, "save": save, "restore": restore}
+
+    # ── save / restore ──────────────────────────────────────────────────
+    def _save_current(self, target):
+        cur = self.current
+        sid = cur.get("id") or secrets.token_hex(6)
+        fname = f"gw-{sid}.bin"
+        t0 = time.time()
+        r = self._slot_action(target, "save", fname)
+        took = time.time() - t0
+        now = time.time()
+        self.index[sid] = {
+            "id": sid, "file": fname, "chain": list(cur["chain"]), "lens": list(cur["lens"]),
+            "tokens": int(r.get("n_saved") or cur["tokens"]), "bytes": int(r.get("n_written") or 0),
+            "saved_at": now, "last_used": now,
+        }
+        cur["id"] = sid
+        cur["dirty"] = False
+        self.stats["saves"] += 1
+        self._save_index()
+        self._log(f"saved {sid}: {self.index[sid]['tokens']:,} tokens, "
+                  f"{self.index[sid]['bytes'] / 1e6:,.0f} MB in {took:.1f} s")
+        self._evict()
+
+    def _restore(self, target, entry):
+        t0 = time.time()
+        r = self._slot_action(target, "restore", entry["file"])
+        took = time.time() - t0
+        entry["last_used"] = time.time()
+        held = self._slot_state(target)
+        self.stats["restores"] += 1
+        self.current = {"chain": list(entry["chain"]), "lens": list(entry["lens"]), "id": entry["id"],
+                        "tokens": held[0] if held else int(r.get("n_restored") or entry.get("tokens", 0)),
+                        "dirty": False}
+        self._save_index()
+        self._log(f"restored {entry['id']}: {int(r.get('n_restored') or 0):,} tokens in {took:.1f} s")
+
+    def _evict(self):
+        """Delete the oldest session files beyond max_gb. Only files this
+        manager made (gw-*.bin in the engine's session folder); never the
+        held conversation's; never reads one."""
+        limit = int(self.cfg["max_gb"] * (1024 ** 3))
+        if limit <= 0:
+            return
+        total = sum(int(e.get("bytes", 0)) for e in self.index.values())
+        if total <= limit:
+            return
+        if not self._slot_dir:
+            self._log("over max_gb but the engine's session folder is unknown (set slot_dir): nothing deleted")
+            return
+        keep = self.current.get("id") if self.current else None
+        for e in sorted(self.index.values(), key=lambda x: x.get("last_used", 0)):
+            if total <= limit:
+                break
+            name = e.get("file", "")
+            if e["id"] == keep or os.path.basename(name) != name or not name.startswith("gw-"):
+                continue
+            try:
+                os.remove(os.path.join(self._slot_dir, name))
+            except FileNotFoundError:
+                pass
+            except OSError as ex:
+                self._log(f"could not delete {name}: {ex}")
+                continue
+            total -= int(e.get("bytes", 0))
+            del self.index[e["id"]]
+            self._log(f"deleted {name} (over {self.cfg['max_gb']:g} GB)")
+        self._save_index()
+
+    def _revalidate(self, target):
+        """After something went wrong: keep `current` only if the engine still
+        holds about as many tokens as we think it does."""
+        cur = self.current
+        st = self._slot_state(target) if target else None
+        if not cur or not st or st[0] == 0 or abs(st[0] - cur["tokens"]) > max(64, 0.02 * cur["tokens"]):
+            self.current = None
+
+    # ── a request's life ────────────────────────────────────────────────
+    def begin(self, chain: KVChain, model: str = "") -> _KVTicket:
+        self.lock.acquire()
+        ticket = _KVTicket(self, chain, model)
+        try:
+            self._begin_locked(ticket)
+        except Exception as e:  # never let swapping break the request itself
+            self.stats["errors"] += 1
+            self.current = None
+            self._log(f"swap skipped: {e}")
+        return ticket
+
+    def _begin_locked(self, t: _KVTicket):
+        self._load_index()
+        if time.time() < self.unavailable_until:
+            self.current = None
+            return
+        target = self._target(t.model)
+        if not target:
+            self._mark_unavailable("no engine to talk to (set \"engine\" in kv_sessions, or load the model in Strata)")
+            return
+        st = self._slot_state(target)
+        if st is None:
+            self._mark_unavailable("the engine's /slots could not be read")
+            return
+        t.target = self._last_target = target
+        self._slot_dir = target[2] or self._slot_dir
+        held = st[0]
+        cur = self.current
+        if cur and (held == 0 or abs(held - cur["tokens"]) > max(64, 0.02 * cur["tokens"])):
+            self._log("the engine no longer holds the conversation tracked here (restarted, or used directly): not saving it")
+            cur = self.current = None
+        plan = self._plan(cur, t.chain)
+        try:
+            if plan["save"]:
+                self._save_current(target)
+            if plan["restore"]:
+                self._restore(target, plan["restore"])
+        except _KVError as e:
+            self.stats["errors"] += 1
+            if e.status == 501:
+                self._mark_unavailable(f"{e} (add \"slot_save_path\" to Strata's run config and load the model again)")
+                t.target = None
+                return
+            if e.status == 404 and plan["restore"]:
+                self.index.pop(plan["restore"]["id"], None)
+                self._save_index()
+            self._log(f"swap failed: {e}")
+            self._revalidate(target)
+        # Does this request continue what the engine holds now? Then it inherits its session id.
+        cur = self.current
+        if cur and cur.get("chain"):
+            _n, chars = _kv_common(cur["chain"], cur["lens"], t.chain.hashes)
+            if chars >= _KV_KEEP_RATIO * cur["lens"][-1]:
+                t.inherit_id = cur.get("id")
+
+    def end(self, t: _KVTicket, ok: bool):
+        try:
+            if not t.target:
+                self.current = None
+            else:
+                st = self._slot_state(t.target)
+                if ok and st:
+                    self.current = {"chain": list(t.chain.hashes), "lens": list(t.chain.lens),
+                                    "id": t.inherit_id, "tokens": st[0], "dirty": True}
+                else:
+                    self._revalidate(t.target)
+            self.last_activity = time.time()
+            self._ensure_idle_thread()
+        except Exception as e:
+            self._log(f"bookkeeping error: {e}")
+            self.current = None
+        finally:
+            self.lock.release()
+
+    # ── save when idle, so a restart of the engine loses little ─────────
+    def _ensure_idle_thread(self):
+        if self.cfg["idle_save_s"] <= 0:
+            return
+        if self._idle_thread and self._idle_thread.is_alive():
+            return
+        self._idle_thread = threading.Thread(target=self._idle_loop, name=f"kv-idle-{self.name}", daemon=True)
+        self._idle_thread.start()
+
+    def _idle_loop(self):
+        while True:
+            time.sleep(_KV_IDLE_POLL_S)
+            wait = self.cfg["idle_save_s"]
+            if wait <= 0:
+                return
+            cur = self.current
+            if not cur or not cur.get("dirty") or cur["tokens"] < self.cfg["min_tokens"]:
+                continue
+            if time.time() - self.last_activity < wait:
+                continue
+            if not self.lock.acquire(blocking=False):
+                continue
+            try:
+                cur = self.current
+                target = self._last_target
+                if (cur and target and cur.get("dirty") and cur["tokens"] >= self.cfg["min_tokens"]
+                        and time.time() - self.last_activity >= wait):
+                    st = self._slot_state(target)
+                    if st and not st[1] and abs(st[0] - cur["tokens"]) <= max(64, 0.02 * cur["tokens"]):
+                        self._save_current(target)
+                    else:
+                        self.current = None
+            except Exception as e:
+                self.stats["errors"] += 1
+                self.last_activity = time.time()  # try again after another idle period
+                self._log(f"idle save failed: {e}")
+            finally:
+                self.lock.release()
+
+    def status(self) -> dict:
+        cur = self.current
+        entries = list(self.index.values())
+        return {
+            "sessions": len(entries),
+            "bytes": sum(int(e.get("bytes", 0)) for e in entries),
+            "held": ({"id": cur.get("id"), "tokens": cur["tokens"], "saved": not cur.get("dirty")} if cur else None),
+            "paused": max(0, int(self.unavailable_until - time.time())),
+            **self.stats,
+        }
+
+
+def _get_kv_manager(ep: dict, cfg: dict) -> KVSessionManager:
+    name = ep.get("name", "")
+    with _kv_managers_lock:
+        mgr = _kv_managers.get(name)
+        if mgr is None:
+            mgr = _kv_managers[name] = KVSessionManager(ep, cfg)
+        mgr.cfg = cfg
+        mgr.type = ep.get("type", "")
+        mgr.ep_key = ep.get("api_key", "")
+        return mgr
+
+
+def _kv_begin(ep: dict, command: str, path: str, data):
+    """Take the endpoint's engine for this request (None when swapping is off
+    for it). Always pair with _kv_end in a finally."""
+    cfg = _kv_config(ep)
+    if not cfg or command != "POST" or not isinstance(data, dict):
+        return None
+    if not path.rstrip("/").endswith(("/chat/completions", "/messages")):
+        return None
+    try:
+        chain = kv_chain(data, path)
+    except Exception as e:  # an odd request is forwarded as it is, unmanaged
+        _queue_log_line(f"[kv] request not managed: {e}")
+        return None
+    if chain is None:
+        return None
+    return _get_kv_manager(ep, cfg).begin(chain, str(data.get("model") or ""))
+
+
+def _kv_end(ticket, ok: bool):
+    if ticket is not None:
+        ticket.manager.end(ticket, ok)
+
+
+def kv_status_all() -> dict:
+    with _kv_managers_lock:
+        managers = dict(_kv_managers)
+    return {name: m.status() for name, m in managers.items()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  PROXY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1511,7 +2094,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for ep in endpoints:
             name = ep.get("name", "")
             ep_statuses[name] = get_endpoint_status(name)
-        self._send_json({"status": "ok", "endpoints": ep_statuses})
+        health = {"status": "ok", "endpoints": ep_statuses}
+        kv = kv_status_all()
+        if kv:
+            health["kv_sessions"] = kv
+        self._send_json(health)
 
     def _handle_slots(self):
         self._send_json([])
@@ -1717,10 +2304,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         target_endpoint = None
         original_id = None
         requested_source = None  # source prefix explicitly present in model ID
+        req_json = None
 
         if body:
             try:
                 data = json.loads(body)
+                req_json = data
                 model_id = data.get("model", "")
 
                 if not model_id:
@@ -1825,10 +2414,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         bump_endpoint_load_start(ep_name)
         headers_sent = False
         streaming = False
+        kv_ticket = None
+        kv_ok = False
         try:
+            # Before forwarding: put the right conversation in the engine's slot
+            # (kv_sessions endpoints only; holds the engine until _kv_end).
+            kv_ticket = _kv_begin(target_endpoint, self.command, path, req_json)
             conn.request(self.command, path, body=body, headers=fwd_headers)
             response = conn.getresponse()
             streaming = "text/event-stream" in (response.getheader("Content-Type") or "")
+            # The engine took the request: it holds this conversation now, even
+            # if the client presses Stop halfway through the stream.
+            kv_ok = response.status < 400
 
             # Send status + CORS + upstream response headers
             self.send_response(response.status)
@@ -1878,6 +2475,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
             bump_endpoint_load_end(ep_name)
+            _kv_end(kv_ticket, kv_ok)
 
     def _log(self, msg: str):
         """Queue a request log line for the TUI (thread-safe)."""
@@ -2171,9 +2769,10 @@ class SettingsScreen(Screen):
             endpoints = list(_config.get("endpoints", []))
             if original_name:
                 # Editing: replace the endpoint identified by its original name.
+                # Settings the dialog doesn't show (timeout, kv_sessions) stay.
                 for i, ep in enumerate(endpoints):
                     if ep.get("name", "") == original_name:
-                        endpoints[i] = result
+                        endpoints[i] = {**ep, **result}
                         break
                 else:
                     endpoints.append(result)
