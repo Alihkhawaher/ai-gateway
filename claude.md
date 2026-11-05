@@ -120,6 +120,22 @@ proxied requests since start. Only requests routed through `_proxy()` (chat
 completions and other proxied paths) are counted — `/cors-proxy` traffic is
 not, since it isn't tied to a configured upstream gateway.
 
+## KV Session Swap
+
+A local engine (Strata) holds one conversation in its slot. With `"kv_sessions": {"enabled": true}` on an endpoint, `KVSessionManager` in `proxy.py` keeps the right chat in that slot through the engine's `POST /slots/0?action=save|restore`. `_proxy()` calls `_kv_begin()` just before the upstream request and `_kv_end()` in its `finally`.
+
+Rules that must hold:
+
+1. **`_kv_begin` and `_kv_end` always pair.** `begin` takes the manager's lock and `end` releases it. A missed `end` blocks that endpoint forever, so `_kv_begin` stays inside the `try` whose `finally` calls `_kv_end`.
+2. **Swapping never breaks a request.** Any failure is logged and the request is forwarded anyway. A 501 from the engine (slot saving off) or an unreadable `/slots` pauses swapping for `_KV_BACKOFF_S`.
+3. **Chat text never leaves memory.** The index (`kv-sessions-<endpoint>.json`, gitignored) holds message hashes and counts only, and session files are never opened. They are deleted only by `max_gb` eviction, and only `gw-*.bin` files listed in the index.
+4. **Never save a conversation under the wrong name.** `current` is dropped when the token count from `/slots` no longer matches what was recorded (the engine restarted, or a client used it directly).
+5. **A save rewrites the whole chat** (about 16.7 KB per token, 8.5 GB at 512k), so saves happen on a switch and after a long idle only, and only when the chat changed since the last save.
+
+For Strata, the engine's port and per-load API key are read from `~/.strata/data/native-instances/*.json` on each request (`STRATA_INSTANCES_DIR` overrides the folder; tests use it). The key is used in memory only. Strata's host does not forward `/slots`, so these calls go to the engine's own port.
+
+`testing/live_kv_check.py` checks the swap against a real engine with made-up text.
+
 ## API Endpoints
 
 | Endpoint | Format | Purpose |

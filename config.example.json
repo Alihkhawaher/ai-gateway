@@ -41,6 +41,16 @@
       "host": "localhost:11435",
       "enabled": false,
       "api_key": ""
+    },
+    {
+      "name": "strata",
+      "type": "strata",
+      "host": "127.0.0.1:47831",
+      "enabled": false,
+      "api_key": "",
+      "kv_sessions": {
+        "enabled": false
+      }
     }
   ],
   "models": [
