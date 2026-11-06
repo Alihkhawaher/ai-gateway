@@ -98,8 +98,9 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 ### Terminal Dashboard (TUI)
 - Live proxy log showing all requests
 - Endpoint status panel (online/offline with model counts) and a per-endpoint **load** column — in-flight requests and total requests served (e.g. `⚡ 2 active · 17 total`, `idle · 12 total`, `—` if never used)
+- [Live stats](#live-stats) beside the endpoint list, and a full dashboard on `d`: cache hits, speed, GPU, saved chats, and totals per app and model
 - Settings with model selection, port, bind address, fetch top models toggle
-- Footer key bindings: `s` Settings, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
+- Footer key bindings: `s` Settings, `d` Dashboard, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
 - Consistent scrollable layout across all screens
 - Save/load settings from `config.json`
 
@@ -284,6 +285,33 @@ The gateway finds the engine's port and key in Strata's own run files on each re
 
 The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
 
+## Live Stats
+
+The console shows what the gateway and its engine are doing, refreshed every second. The main screen has a short **Live** panel beside the endpoint list. Press `d` for the full dashboard, and `d` or `Esc` to go back. Panels stack when the window is narrow.
+
+| Panel | What it shows |
+|-------|---------------|
+| **Engine** | Model, state (reading with progress and time left, generating with speed, idle, not loaded), chat size against the context limit, requests in flight and queued |
+| **Cache** | Prompt tokens reused, expert hit rate, drafts kept, chats parked in RAM, how each request found its chat (kept, restored, new), swap times, reading time saved |
+| **Speed** | Output speed with a 60-second graph, reading speed, time to first token (median and p95), requests per minute, tokens per day |
+| **Hardware** | GPU load, temperature, power, VRAM, PCIe traffic, CPU, RAM and disk |
+| **Totals** | Requests, errors, tokens, cached share and time saved for this run, today and all time, plus cost when a cloud endpoint reports it |
+| **Saved chats** | Each chat on disk: app, tokens, size, restores, last used. A dot marks the one in the engine |
+| **Endpoints, Models, Apps** | Requests, tokens and cached share for each |
+| **Recent requests** | Time, app, model, tokens, cached share, first token, speed, expert hits, what the swap did and the status |
+
+Where the numbers come from:
+
+- **Tokens and speed** are read from each response as it passes through, in the OpenAI, Anthropic, DeepSeek and Responses API formats, and from llama.cpp's `timings`. If an upstream reports no usage, streamed pieces are counted instead and shown with a `~`.
+- **Engine, Hardware and the expert and draft figures** need an engine that publishes `/metrics`, which today means Strata. Other endpoints still get the gateway's own counts.
+- **The app name** comes from the `X-Title` header. Without one, a browser on the gateway's own page shows as `Web UI`, then the referer's host is used, then the `User-Agent` product.
+- **Time saved is an estimate:** cached tokens divided by the reading speed measured on that endpoint.
+- **A client pressing stop** counts as stopped, not as an error.
+
+No chat text is kept. The gateway reads token counts and timings from responses and passes the bytes on unchanged, and engine data is copied field by field from a fixed list. `gateway-stats.json`, beside `config.json` and gitignored, holds the all-time totals: counts plus endpoint, model and app names, with daily rows for 30 days. It's written every 30 seconds and on exit. Delete it to start the totals over.
+
+`GET /stats` returns the same numbers as JSON. Like `/health` it needs no key, and it includes client addresses and app names, so anyone who can reach the gateway can read them.
+
 ## Connecting Clients
 
 ### Cline (Recommended)
@@ -330,6 +358,7 @@ build-webui.cmd
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — gitignored
 ├── mcp.json              # MCP servers aggregated by 1MCP — gitignored
+├── gateway-stats.json    # All-time stats, counts only — written at run time, gitignored
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files
@@ -393,6 +422,7 @@ This proxy exposes LM Studio-compatible endpoints (`/api/v0/models`, `/api/v1/mo
 | `GET /api/v0/models` | LM Studio | Cline LM Studio provider, LM Studio clients |
 | `GET /api/v1/models` | LM Studio | Alias for `/api/v0/models` |
 | `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
+| `GET /stats` | JSON | [Live stats](#live-stats): the gateway's counts, engine numbers and saved chats |
 
 ## License
 

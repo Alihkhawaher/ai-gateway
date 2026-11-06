@@ -17,6 +17,7 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 ├── config.example.json   # Committed template — copy to config.json
 ├── config.json           # Your settings (endpoints, models, port) — GITIGNORED
 ├── mcp.json              # MCP servers aggregated by 1MCP — GITIGNORED
+├── gateway-stats.json    # All-time stats, counts only — written at run time, GITIGNORED
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files (llama.cpp llama-ui)
@@ -136,6 +137,26 @@ For Strata, the engine's port and per-load API key are read from `~/.strata/data
 
 `testing/live_kv_check.py` checks the swap against a real engine with made-up text.
 
+## Live Stats
+
+The console's **Live** panel, its `d` dashboard (`StatsScreen`) and `GET /stats` all draw from `stats_snapshot()`, which reads memory only:
+
+- `GatewayStats` (`_stats`) counts generation requests. `_proxy()` calls `_stats.begin()` before the upstream request, `stat.tap.feed()` on each chunk and `_stats.end()` in its `finally`. All-time totals persist to `gateway-stats.json`, next to `config.json`.
+- `_ResponseTap` reads usage and timings out of a response as it passes.
+- `EngineProbe` (`_engine_probe`) polls an engine's `/metrics` every 2 seconds, and stops after 30 seconds with no reader. For a Strata or `kv_sessions.engine` endpoint, `_stats.end()` also fetches that request's row from the engine, in a background thread.
+- The `panel_*` functions and `render_live` are pure: a snapshot goes in and Rich renderables come out. They fetch nothing.
+
+Rules that must hold:
+
+1. **Stats never change or break a request.** The tap only reads, `begin`, `feed` and `end` swallow their own errors, and no request waits on an engine lookup. A byte-for-byte test covers this.
+2. **Chat text never leaves the request.** From a request body only the model name and stream flag are kept. Snapshots, `/stats`, the log and `gateway-stats.json` hold counts and names only.
+3. **Engine data is an allow-list.** `_engine_view` copies only the fields named in `_ENGINE_*_KEYS`. Add a field there on purpose, and never pass an engine's dict through whole.
+4. **Client names are never Rich markup.** App and model names come from clients. A plain `str` cell in a Rich table is parsed as markup, so `[/]` in a name would break the panel: wrap them in `RichText`.
+5. **A bad number can't take the console down.** Each panel render has its own `try`, so a failure shows in that panel and nowhere else.
+6. **Group tables are capped.** `_agg_group` keeps `_STATS_MAX_KEYS` names apart and counts the rest as `other`, so clients can't grow memory or the totals file without limit.
+
+Tests must not write real files: `testing/test_proxy.py` points `proxy.CONFIG_FILE` and `STRATA_INSTANCES_DIR` at a temp folder on import, because `gateway-stats.json` is written beside the config.
+
 ## API Endpoints
 
 | Endpoint | Format | Purpose |
@@ -146,6 +167,7 @@ For Strata, the engine's port and per-load API key are read from `~/.strata/data
 | `GET /props` | llama.cpp | Server properties (modalities, context, params) |
 | `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
 | `GET /health` | — | Endpoint statuses |
+| `GET /stats` | JSON | Live stats: the gateway's counts, engine numbers and saved chats |
 | `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the web UI's external fetches |
 
 ## Testing Convention

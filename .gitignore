@@ -17,6 +17,7 @@ sessions/
 clientSessions/
 server.pid
 kv-sessions-*
+gateway-stats.json*
 *.pid
 *.log
 .env
