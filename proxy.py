@@ -13,6 +13,8 @@ Usage:
   python proxy.py 9090 127.0.0.1   # custom bind address
 """
 
+import atexit
+import collections
 import copy
 import hashlib
 import json
@@ -394,6 +396,7 @@ MIME_TYPES = {
 
 # ── Request body size limit ────────────────────────────────────────────────
 _MAX_BODY_SIZE = 50 * 1024 * 1024  # 50MB
+_REFUSED_BODY_READ = 1024 * 1024   # a refused caller gets this much read, so its reply arrives
 
 # ── Shared SSL context for upstream connections ────────────────────────────
 _upstream_ssl_ctx = ssl.create_default_context()
@@ -1159,8 +1162,11 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "textual"])
     import textual  # noqa: F401
 
+from rich.console import Group as RichGroup  # rich comes with textual
+from rich.table import Table as RichTable
+from rich.text import Text as RichText
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import Grid, Horizontal, Vertical, ScrollableContainer
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Header, Footer, Input, Select, Static, Button, Label, Log, Checkbox,
@@ -1356,12 +1362,15 @@ class _KVError(Exception):
 class _KVTicket:
     """One request's hold on its endpoint's engine (taken by begin, given back by end)."""
 
-    def __init__(self, manager, chain, model):
+    def __init__(self, manager, chain, model, app=""):
         self.manager = manager
         self.chain = chain
         self.model = model
+        self.app = app          # which app sent it, for the console's saved-chats table
         self.target = None      # (host, key, slot dir) once the engine was reached
         self.inherit_id = None  # the saved session this request continues, if any
+        self.event = None       # what the swap did: continued, restored or new
+        self.swap_s = 0.0       # time spent saving and restoring for this request
 
 
 class KVSessionManager:
@@ -1385,7 +1394,9 @@ class KVSessionManager:
         self.current = None         # what the engine holds: chain, lens, id, tokens, dirty
         self.unavailable_until = 0.0
         self.last_activity = time.time()
-        self.stats = {"saves": 0, "restores": 0, "errors": 0}
+        self.stats = {"saves": 0, "restores": 0, "errors": 0, "continued": 0, "new": 0,
+                      "restored_tokens": 0, "save_s": 0.0, "restore_s": 0.0, "written_bytes": 0}
+        self.last_event = ""
         self._loaded = False
         self._idle_thread = None
         self._last_target = None
@@ -1516,31 +1527,42 @@ class KVSessionManager:
         r = self._slot_action(target, "save", fname)
         took = time.time() - t0
         now = time.time()
+        before = self.index.get(sid) or {}
         self.index[sid] = {
             "id": sid, "file": fname, "chain": list(cur["chain"]), "lens": list(cur["lens"]),
             "tokens": int(r.get("n_saved") or cur["tokens"]), "bytes": int(r.get("n_written") or 0),
-            "saved_at": now, "last_used": now,
+            "saved_at": now, "last_used": now, "app": cur.get("app") or before.get("app", ""),
+            "restores": int(before.get("restores", 0)),
         }
         cur["id"] = sid
         cur["dirty"] = False
         self.stats["saves"] += 1
+        self.stats["save_s"] += took
+        self.stats["written_bytes"] += self.index[sid]["bytes"]
         self._save_index()
-        self._log(f"saved {sid}: {self.index[sid]['tokens']:,} tokens, "
-                  f"{self.index[sid]['bytes'] / 1e6:,.0f} MB in {took:.1f} s")
+        self.last_event = (f"saved {sid}: {self.index[sid]['tokens']:,} tokens, "
+                           f"{self.index[sid]['bytes'] / 1e6:,.0f} MB in {took:.1f} s")
+        self._log(self.last_event)
         self._evict()
+        return took
 
     def _restore(self, target, entry):
         t0 = time.time()
         r = self._slot_action(target, "restore", entry["file"])
         took = time.time() - t0
         entry["last_used"] = time.time()
+        entry["restores"] = int(entry.get("restores", 0)) + 1
         held = self._slot_state(target)
         self.stats["restores"] += 1
+        self.stats["restore_s"] += took
+        self.stats["restored_tokens"] += int(r.get("n_restored") or 0)
         self.current = {"chain": list(entry["chain"]), "lens": list(entry["lens"]), "id": entry["id"],
                         "tokens": held[0] if held else int(r.get("n_restored") or entry.get("tokens", 0)),
-                        "dirty": False}
+                        "dirty": False, "app": entry.get("app", "")}
         self._save_index()
-        self._log(f"restored {entry['id']}: {int(r.get('n_restored') or 0):,} tokens in {took:.1f} s")
+        self.last_event = f"restored {entry['id']}: {int(r.get('n_restored') or 0):,} tokens in {took:.1f} s"
+        self._log(self.last_event)
+        return took
 
     def _evict(self):
         """Delete the oldest session files beyond max_gb. Only files this
@@ -1583,9 +1605,9 @@ class KVSessionManager:
             self.current = None
 
     # ── a request's life ────────────────────────────────────────────────
-    def begin(self, chain: KVChain, model: str = "") -> _KVTicket:
+    def begin(self, chain: KVChain, model: str = "", app: str = "") -> _KVTicket:
         self.lock.acquire()
-        ticket = _KVTicket(self, chain, model)
+        ticket = _KVTicket(self, chain, model, app)
         try:
             self._begin_locked(ticket)
         except Exception as e:  # never let swapping break the request itself
@@ -1615,16 +1637,19 @@ class KVSessionManager:
             self._log("the engine no longer holds the conversation tracked here (restarted, or used directly): not saving it")
             cur = self.current = None
         plan = self._plan(cur, t.chain)
+        t.event = "continued" if plan["keeps"] else "new"
         try:
             if plan["save"]:
-                self._save_current(target)
+                t.swap_s += self._save_current(target)
             if plan["restore"]:
-                self._restore(target, plan["restore"])
+                t.swap_s += self._restore(target, plan["restore"])
+                t.event = "restored"
         except _KVError as e:
             self.stats["errors"] += 1
             if e.status == 501:
                 self._mark_unavailable(f"{e} (add \"slot_save_path\" to Strata's run config and load the model again)")
                 t.target = None
+                t.event = None
                 return
             if e.status == 404 and plan["restore"]:
                 self.index.pop(plan["restore"]["id"], None)
@@ -1646,7 +1671,9 @@ class KVSessionManager:
                 st = self._slot_state(t.target)
                 if ok and st:
                     self.current = {"chain": list(t.chain.hashes), "lens": list(t.chain.lens),
-                                    "id": t.inherit_id, "tokens": st[0], "dirty": True}
+                                    "id": t.inherit_id, "tokens": st[0], "dirty": True, "app": t.app}
+                    if t.event in ("continued", "new"):
+                        self.stats[t.event] += 1
                 else:
                     self._revalidate(t.target)
             self.last_activity = time.time()
@@ -1699,11 +1726,17 @@ class KVSessionManager:
     def status(self) -> dict:
         cur = self.current
         entries = list(self.index.values())
+        recent = sorted(entries, key=lambda e: e.get("last_used", 0), reverse=True)[:12]
         return {
             "sessions": len(entries),
             "bytes": sum(int(e.get("bytes", 0)) for e in entries),
-            "held": ({"id": cur.get("id"), "tokens": cur["tokens"], "saved": not cur.get("dirty")} if cur else None),
+            "held": ({"id": cur.get("id"), "tokens": cur["tokens"], "saved": not cur.get("dirty"),
+                      "app": cur.get("app", "")} if cur else None),
             "paused": max(0, int(self.unavailable_until - time.time())),
+            "last_event": self.last_event,
+            "chats": [{"id": e["id"], "app": e.get("app", ""), "tokens": int(e.get("tokens", 0)),
+                       "bytes": int(e.get("bytes", 0)), "last_used": e.get("last_used", 0),
+                       "restores": int(e.get("restores", 0))} for e in recent],
             **self.stats,
         }
 
@@ -1720,7 +1753,7 @@ def _get_kv_manager(ep: dict, cfg: dict) -> KVSessionManager:
         return mgr
 
 
-def _kv_begin(ep: dict, command: str, path: str, data):
+def _kv_begin(ep: dict, command: str, path: str, data, app: str = ""):
     """Take the endpoint's engine for this request (None when swapping is off
     for it). Always pair with _kv_end in a finally."""
     cfg = _kv_config(ep)
@@ -1735,7 +1768,7 @@ def _kv_begin(ep: dict, command: str, path: str, data):
         return None
     if chain is None:
         return None
-    return _get_kv_manager(ep, cfg).begin(chain, str(data.get("model") or ""))
+    return _get_kv_manager(ep, cfg).begin(chain, str(data.get("model") or ""), app)
 
 
 def _kv_end(ticket, ok: bool):
@@ -1744,9 +1777,711 @@ def _kv_end(ticket, ok: bool):
 
 
 def kv_status_all() -> dict:
+    """Every endpoint with swapping on, including one with no request since a
+    restart: its saved chats are still there. Reads the index only, never the engine."""
+    for ep in get_config("endpoints") or []:
+        cfg = _kv_config(ep)
+        if cfg:
+            mgr = _get_kv_manager(ep, cfg)
+            if not mgr._loaded and mgr.lock.acquire(blocking=False):  # held means a request has loaded it
+                try:
+                    mgr._load_index()
+                finally:
+                    mgr.lock.release()
     with _kv_managers_lock:
         managers = dict(_kv_managers)
     return {name: m.status() for name, m in managers.items()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LIVE STATS — what passes through the gateway and what the engine reports
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Counts and names only: tokens, times, model and app names. A response is read
+# as it passes for its usage and timing fields, and nothing is ever changed or
+# held up. Chat text is never stored, logged or shown.
+
+_STATS_PATHS = ("/chat/completions", "/completions", "/messages", "/responses", "/embeddings")
+_STATS_MAX_KEYS = 100       # models or apps kept apart; the rest count as "other"
+_STATS_SAVE_EVERY_S = 30    # how often the all-time totals are written
+_STATS_DAYS_KEPT = 30
+_TAP_MAX_BODY = 8 * 1024 * 1024   # a bigger non-streamed reply is passed on, just not read
+_TAP_MAX_LINE = 4 * 1024 * 1024
+_READ_RATE_MIN_TOKENS = 1000      # shorter reads are mostly overhead, not a read speed
+_ENGINE_POLL_S = 2.0
+_ENGINE_IDLE_STOP_S = 30.0        # stop polling when nobody has looked for this long
+
+
+def _stats_name(value, fallback: str = "unknown", limit: int = 48) -> str:
+    """A model or app name as a client sent it, safe to show and store."""
+    text = "".join(c for c in str(value or "") if c.isprintable()).strip()
+    return text[:limit] or fallback
+
+
+def _app_name(headers) -> str:
+    """Which app sent a request: its X-Title, its site, or its User-Agent."""
+    title = headers.get("X-Title")
+    if title:
+        return _stats_name(title)
+    agent = headers.get("User-Agent") or ""
+    if agent.startswith("Mozilla"):
+        referer = urlparse(headers.get("Referer") or "").netloc
+        if referer and referer == (headers.get("Host") or ""):
+            return "Web UI"
+        return _stats_name(referer, "Browser")
+    site = urlparse(headers.get("HTTP-Referer") or "").netloc
+    if site:
+        return _stats_name(site)
+    return _stats_name(agent.split("/")[0].split(" ")[0])
+
+
+def _percentile(values, pct: float):
+    vals = sorted(v for v in values if isinstance(v, (int, float)))
+    if not vals:
+        return None
+    k = (len(vals) - 1) * pct / 100
+    lo = int(k)
+    hi = min(lo + 1, len(vals) - 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+
+
+def _number(*values):
+    """The first real number among values (a bool is not one)."""
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v
+    return None
+
+
+def _norm_usage(u) -> dict:
+    """OpenAI, Anthropic, DeepSeek and Responses usage objects in one shape:
+    prompt (cached included), cached, out, cost. Only what the object says."""
+    if not isinstance(u, dict):
+        return {}
+    details = u.get("prompt_tokens_details") or u.get("input_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    out = {}
+    prompt = _number(u.get("prompt_tokens"))
+    if prompt is None and _number(u.get("input_tokens")) is not None:
+        # Anthropic counts cached and newly cached tokens apart from input_tokens
+        prompt = (u["input_tokens"] + (_number(u.get("cache_read_input_tokens")) or 0)
+                  + (_number(u.get("cache_creation_input_tokens")) or 0))
+    if prompt is not None:
+        out["prompt"] = prompt
+    cached = _number(details.get("cached_tokens"), u.get("cache_read_input_tokens"), u.get("prompt_cache_hit_tokens"))
+    if cached is not None:
+        out["cached"] = cached
+    generated = _number(u.get("completion_tokens"), u.get("output_tokens"))
+    if generated is not None:
+        out["out"] = generated
+    cost = _number(u.get("cost"))
+    if cost is not None:
+        out["cost"] = cost
+    return out
+
+
+class _ResponseTap:
+    """Reads usage and speed out of a response as it passes. It never changes
+    the response; anything it can't read is skipped."""
+
+    def __init__(self):
+        self.first_byte = None
+        self.first_token = None
+        self.last_token = None
+        self.deltas = 0         # streamed pieces: roughly tokens, when no usage comes
+        self.usage = {}
+        self.timings = {}
+        self.bytes = 0
+        self._line = bytearray()
+        self._body = bytearray()
+        self._too_big = False
+
+    def feed(self, chunk: bytes, streaming: bool):
+        try:
+            now = time.time()
+            if self.first_byte is None:
+                self.first_byte = now
+            self.bytes += len(chunk)
+            if streaming:
+                self._feed_sse(chunk, now)
+            elif not self._too_big:
+                if len(self._body) + len(chunk) > _TAP_MAX_BODY:
+                    self._too_big = True
+                    self._body = bytearray()
+                else:
+                    self._body.extend(chunk)
+        except Exception:
+            pass
+
+    def _feed_sse(self, chunk: bytes, now: float):
+        self._line.extend(chunk)
+        if b"\n" not in chunk:
+            if len(self._line) > _TAP_MAX_LINE:
+                self._line = bytearray()
+            return
+        lines = self._line.split(b"\n")
+        self._line = lines.pop()
+        for line in lines:
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                self._event(json.loads(payload), now)
+            except ValueError:
+                continue
+
+    def _event(self, obj, now: float):
+        if not isinstance(obj, dict):
+            return
+        for holder in (obj, obj.get("message"), obj.get("response")):
+            if isinstance(holder, dict) and isinstance(holder.get("usage"), dict):
+                self.usage.update(_norm_usage(holder["usage"]))
+        if isinstance(obj.get("timings"), dict):
+            self.timings = obj["timings"]
+        if self._is_token(obj):
+            if self.first_token is None:
+                self.first_token = now
+            self.last_token = now
+            self.deltas += 1
+
+    @staticmethod
+    def _is_token(obj: dict) -> bool:
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta")
+            if isinstance(delta, dict):
+                return any(delta.get(k) for k in ("content", "reasoning_content", "reasoning", "tool_calls", "function_call"))
+            return bool(choices[0].get("text"))
+        kind = obj.get("type")
+        return isinstance(kind, str) and (kind == "content_block_delta" or kind.endswith(".delta"))
+
+    def finish(self):
+        """Read a non-streamed reply's body, once it has all passed."""
+        if self._body:
+            try:
+                self._event(json.loads(bytes(self._body)), 0.0)
+            except ValueError:
+                pass
+            self.first_token = self.last_token = None  # one body: no token timing in it
+            self.deltas = 0
+            self._body = bytearray()
+
+
+def _new_agg() -> dict:
+    return {"requests": 0, "errors": 0, "prompt": 0, "cached": 0, "out": 0, "cost": 0.0, "saved_s": 0.0, "last": 0.0}
+
+
+def _agg_add(agg: dict, rec: dict):
+    agg["requests"] += 1
+    agg["errors"] += 1 if rec.get("error") else 0
+    for key in ("prompt", "cached", "out", "cost", "saved_s"):
+        agg[key] += rec.get(key) or 0
+    agg["last"] = rec["time"]
+
+
+def _agg_group(groups: dict, key: str) -> dict:
+    """The group's counters; past _STATS_MAX_KEYS, new names share one "other"."""
+    if key not in groups and len(groups) >= _STATS_MAX_KEYS:
+        key = "other"
+    return groups.setdefault(key, _new_agg())
+
+
+class _RequestStats:
+    """One request on its way through the gateway."""
+
+    def __init__(self, ep: dict, path: str, model: str, client: str, app: str, stream: bool):
+        self.ep = ep
+        self.ep_name = ep.get("name", "unknown")
+        self.path = path
+        self.model = _stats_name(model)
+        self.client = client
+        self.app = app
+        self.stream = stream
+        self.started = time.time()
+        self.tap = _ResponseTap()
+        self.status = None
+        self.failed = False
+        self.cancelled = False      # the client left halfway (pressed Stop)
+        self.swap_s = None
+        self.kv_event = None
+
+
+class GatewayStats:
+    """Everything the console shows about traffic. Thread-safe, in memory, with
+    the all-time totals in gateway-stats.json beside config.json (gitignored)."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.started = time.time()
+        self.active = {}
+        self.recent = collections.deque(maxlen=200)
+        self.session = _new_agg()
+        self.by_endpoint = {}
+        self.by_model = {}
+        self.by_app = {}
+        self.samples = {}           # endpoint or "*" → {"ttft", "tok_s", "read"} deques
+        self.minutes = collections.deque(maxlen=120)  # [minute, requests, in, out]
+        self.life = None            # the all-time totals, loaded on first use
+        self.read_rate = {}         # endpoint → recent read speed, tokens/s
+        self._dirty = False
+        self._last_save = 0.0
+        self._next_id = 0
+        self._pending = set()       # threads still asking the engine about a request
+
+    # ── all-time totals on disk ─────────────────────────────────────────
+    @staticmethod
+    def _path() -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), "gateway-stats.json")
+
+    def _ensure_loaded(self):
+        if self.life is not None:
+            return
+        life = {"since": time.time(), **_new_agg(), "by_endpoint": {}, "by_model": {}, "by_app": {}, "days": {}}
+        try:
+            with open(self._path(), "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                for key in list(_new_agg()) + ["since"]:
+                    if isinstance(saved.get(key), (int, float)):
+                        life[key] = saved[key]
+                for key in ("by_endpoint", "by_model", "by_app", "days"):
+                    if isinstance(saved.get(key), dict):
+                        life[key] = {k: {**_new_agg(), **{f: n for f, n in v.items() if f in _new_agg() and isinstance(n, (int, float))}}
+                                     for k, v in saved[key].items() if isinstance(v, dict)}
+                if isinstance(saved.get("read_rate"), dict):
+                    self.read_rate = {k: v for k, v in saved["read_rate"].items() if isinstance(v, (int, float))}
+        except (OSError, ValueError, TypeError):
+            pass
+        self.life = life
+
+    def save(self, force: bool = False):
+        with self.lock:
+            if self.life is None or not self._dirty:
+                return
+            if not force and time.time() - self._last_save < _STATS_SAVE_EVERY_S:
+                return
+            self._last_save = time.time()
+            self._dirty = False
+            text = json.dumps({**self.life, "read_rate": self.read_rate})
+        path = self._path()
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    # ── a request's life ────────────────────────────────────────────────
+    def begin(self, ep: dict, command: str, path: str, data, client: str, headers):
+        """Start counting a generation request; None for anything else."""
+        try:
+            if command != "POST" or not path.rstrip("/").endswith(_STATS_PATHS):
+                return None
+            data = data if isinstance(data, dict) else {}
+            req = _RequestStats(ep, path, data.get("model"), client, _app_name(headers), bool(data.get("stream")))
+            with self.lock:
+                self._next_id += 1
+                req.id = self._next_id
+                self.active[req.id] = req
+            return req
+        except Exception:
+            return None
+
+    def end(self, req):
+        """The request is over. An engine with its own numbers is asked about
+        it in the background, so nothing waits for that."""
+        if req is None:
+            return
+        try:
+            req.tap.finish()
+            ep = req.ep
+            kv = ep.get("kv_sessions") if isinstance(ep.get("kv_sessions"), dict) else {}
+            if (ep.get("type") == "strata" or kv.get("engine")) and req.status and req.status < 400 and not req.failed:
+                worker = threading.Thread(target=self._finish_with_engine, args=(req,), daemon=True)
+                with self.lock:
+                    self._pending.add(worker)
+                worker.start()
+            else:
+                self._record(req, None)
+        except Exception:
+            with self.lock:
+                self.active.pop(getattr(req, "id", None), None)
+
+    def _finish_with_engine(self, req):
+        row = None
+        try:
+            for attempt in range(2):
+                row = _engine_probe.request_row(req.ep, req.model, req.started)
+                if row or attempt:
+                    break
+                time.sleep(0.4)
+        except Exception:
+            pass
+        try:
+            self._record(req, row)
+        except Exception:
+            pass
+        finally:
+            with self.lock:
+                self.active.pop(req.id, None)
+                self._pending.discard(threading.current_thread())
+
+    def wait_idle(self, timeout: float = 5.0):
+        """For tests: wait for the background engine lookups to finish."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if not self._pending:
+                    return True
+            time.sleep(0.01)
+        return False
+
+    def _record(self, req, row):
+        tap = req.tap
+        usage, timings = tap.usage, tap.timings
+        row = row or {}
+        prompt = _number(row.get("prompt_tokens"), usage.get("prompt"))
+        if prompt is None and _number(timings.get("prompt_n")) is not None:
+            prompt = timings["prompt_n"] + (_number(timings.get("cache_n")) or 0)
+        cached = _number(row.get("reused"), usage.get("cached"), timings.get("cache_n"))
+        out = _number(row.get("output_tokens"), usage.get("out"), timings.get("predicted_n"))
+        estimated = out is None and tap.deltas > 0
+        if estimated:
+            out = tap.deltas
+        ttft = tap.first_token - req.started if tap.first_token else None
+        if ttft is None and req.stream and tap.first_byte:
+            ttft = tap.first_byte - req.started
+        tok_s = _number(row.get("decode_tok_s"), timings.get("predicted_per_second"))
+        if tok_s is None and tap.first_token and tap.last_token and tap.last_token - tap.first_token > 0.2 and (out or 0) > 1:
+            tok_s = (out - 1) / (tap.last_token - tap.first_token)
+        read_n = None
+        if row.get("prompt_ms") and _number(row.get("prompt_read")) is not None:
+            read_n = row["prompt_read"]
+            read_s = row["prompt_ms"] / 1000
+        elif timings.get("prompt_ms") and _number(timings.get("prompt_n")) is not None:
+            read_n = timings["prompt_n"]
+            read_s = timings["prompt_ms"] / 1000
+        read_tok_s = read_n / read_s if read_n and read_s > 0 else None
+        now = time.time()
+        rec = {
+            "time": req.started, "endpoint": req.ep_name, "model": req.model, "app": req.app, "client": req.client,
+            "status": req.status, "error": req.failed or not req.status or req.status >= 400,
+            "cancelled": req.cancelled, "stream": req.stream, "duration_s": round(now - req.started, 2),
+            "ttft_s": round(ttft, 3) if ttft is not None else None,
+            "prompt": prompt, "cached": cached, "out": out, "out_estimated": estimated,
+            "tok_s": round(tok_s, 1) if tok_s else None, "read_tok_s": round(read_tok_s, 1) if read_tok_s else None,
+            "read": read_n, "cost": usage.get("cost"), "bytes": tap.bytes,
+            "swap_s": round(req.swap_s, 2) if req.swap_s else None, "swap": req.kv_event,
+            "expert_hit": row.get("hit_rate"), "drafts": row.get("drafts_offered"),
+            "drafts_accepted": row.get("drafts_accepted"),
+        }
+        with self.lock:
+            self._ensure_loaded()
+            self.active.pop(req.id, None)
+            if read_tok_s and read_n >= _READ_RATE_MIN_TOKENS:
+                old = self.read_rate.get(req.ep_name)
+                self.read_rate[req.ep_name] = read_tok_s if old is None else old * 0.7 + read_tok_s * 0.3
+            rate = self.read_rate.get(req.ep_name) or _engine_probe.read_speed(req.ep_name)
+            rec["saved_s"] = round(cached / rate, 1) if cached and rate else 0.0
+            self.recent.appendleft(rec)
+            day = time.strftime("%Y-%m-%d", time.localtime(req.started))
+            for agg in (self.session, self.life, _agg_group(self.by_endpoint, req.ep_name),
+                        _agg_group(self.by_model, req.model), _agg_group(self.by_app, req.app),
+                        _agg_group(self.life["by_endpoint"], req.ep_name), _agg_group(self.life["by_model"], req.model),
+                        _agg_group(self.life["by_app"], req.app), self.life["days"].setdefault(day, _new_agg())):
+                _agg_add(agg, rec)
+            for old_day in sorted(self.life["days"])[:-_STATS_DAYS_KEPT]:
+                del self.life["days"][old_day]
+            for key in ("*", req.ep_name):
+                bucket = self.samples.setdefault(key, {"ttft": collections.deque(maxlen=300), "tok_s": collections.deque(maxlen=300),
+                                                       "read": collections.deque(maxlen=300)})
+                if rec["ttft_s"] is not None:
+                    bucket["ttft"].append(rec["ttft_s"])
+                if rec["tok_s"]:
+                    bucket["tok_s"].append(rec["tok_s"])
+                if read_tok_s and read_n >= _READ_RATE_MIN_TOKENS:
+                    bucket["read"].append(read_tok_s)
+            minute = int(req.started // 60)
+            if not self.minutes or self.minutes[-1][0] != minute:
+                self.minutes.append([minute, 0, 0, 0])
+            self.minutes[-1][1] += 1
+            self.minutes[-1][2] += rec["prompt"] or 0
+            self.minutes[-1][3] += rec["out"] or 0
+            self._dirty = True
+        if rec["status"]:  # a request that never got a reply has its own error line already
+            _queue_log_line(f"[{req.client}] {_log_line(rec)}")
+        self.save()
+
+    # ── what the console reads ──────────────────────────────────────────
+    def snapshot(self) -> dict:
+        with self.lock:
+            self._ensure_loaded()
+            now = time.time()
+            today = self.life["days"].get(time.strftime("%Y-%m-%d", time.localtime(now)), _new_agg())
+            days = sorted(self.life["days"].items())[-14:]
+            everything = self.samples.get("*", {})
+            top = lambda groups, n=10: dict(sorted(groups.items(), key=lambda kv: -kv[1]["requests"])[:n])
+            last_minute = int(now // 60)
+            per_minute = {m[0]: m for m in self.minutes}
+            return {
+                "uptime_s": round(now - self.started),
+                "active": [{"endpoint": r.ep_name, "model": r.model, "app": r.app, "elapsed_s": round(now - r.started, 1)}
+                           for r in self.active.values()],
+                "session": dict(self.session),
+                "today": dict(today),
+                "all_time": {k: self.life[k] for k in list(_new_agg()) + ["since"]},
+                "ttft_p50": _percentile(everything.get("ttft", ()), 50),
+                "ttft_p95": _percentile(everything.get("ttft", ()), 95),
+                "tok_s_p50": _percentile(everything.get("tok_s", ()), 50),
+                "tok_s_best": max(everything.get("tok_s", ()), default=None),
+                "read_tok_s_p50": _percentile(everything.get("read", ()), 50),
+                "by_endpoint": {name: {**agg,
+                                       "ttft_p50": _percentile(self.samples.get(name, {}).get("ttft", ()), 50),
+                                       "tok_s_p50": _percentile(self.samples.get(name, {}).get("tok_s", ()), 50)}
+                                for name, agg in self.by_endpoint.items()},
+                "by_model": top(self.by_model),
+                "by_app": top(self.by_app),
+                "all_time_by_app": top(self.life["by_app"]),
+                # Engine lookups finish in their own threads, so requests can land out of order
+                "recent": sorted(self.recent, key=lambda r: r["time"], reverse=True)[:30],
+                "per_minute": [{"requests": per_minute.get(m, [0, 0, 0, 0])[1], "in": per_minute.get(m, [0, 0, 0, 0])[2],
+                                "out": per_minute.get(m, [0, 0, 0, 0])[3]} for m in range(last_minute - 59, last_minute + 1)],
+                "per_day": [{"day": d, "requests": a["requests"], "in": a["prompt"], "out": a["out"]} for d, a in days],
+            }
+
+
+def _log_line(rec: dict) -> str:
+    """One finished request for the proxy log."""
+    head = f"→ {rec['endpoint']} [{rec['status']}]"
+    bits = ["stopped by the client"] if rec.get("cancelled") else []
+    if rec.get("prompt") is not None:
+        cached = rec.get("cached")
+        share = f" ({cached * 100 / rec['prompt']:.0f}% cached)" if cached is not None and rec["prompt"] else ""
+        bits.append(f"{fmt_count(rec['prompt'])} in{share}")
+    if rec.get("out") is not None:
+        bits.append(f"{'~' if rec.get('out_estimated') else ''}{fmt_count(rec['out'])} out")
+    if rec.get("ttft_s") is not None:
+        bits.append(f"first token {fmt_secs(rec['ttft_s'])}")
+    if rec.get("tok_s"):
+        bits.append(f"{rec['tok_s']:.1f} t/s")
+    if rec.get("expert_hit") is not None:
+        bits.append(f"experts {rec['expert_hit'] * 100:.0f}% hit")
+    if rec.get("swap") == "restored":
+        bits.append(f"chat restored, swap {fmt_secs(rec.get('swap_s'))}")
+    elif rec.get("swap_s"):
+        bits.append(f"saved held chat, {fmt_secs(rec['swap_s'])}")
+    return head + ("  " + " · ".join(bits) if bits else "")
+
+
+def fmt_count(n) -> str:
+    if n is None:
+        return "—"
+    n = float(n)
+    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= limit:
+            return f"{n / limit:.1f}{suffix}"
+    return f"{n:.0f}"
+
+
+def fmt_secs(s) -> str:
+    if s is None:
+        return "—"
+    s = float(s)
+    if s < 1:
+        return f"{s * 1000:.0f} ms"
+    if s < 60:
+        return f"{s:.1f} s"
+    if s < 3600:
+        return f"{int(s // 60)}m {int(s % 60)}s"
+    if s < 86400:
+        return f"{int(s // 3600)}h {int(s % 3600 // 60)}m"
+    return f"{int(s // 86400)}d {int(s % 86400 // 3600)}h"
+
+
+def fmt_bytes(n) -> str:
+    if n is None:
+        return "—"
+    n = float(n)
+    for limit, suffix in ((1024 ** 4, "TB"), (1024 ** 3, "GB"), (1024 ** 2, "MB"), (1024, "KB")):
+        if abs(n) >= limit:
+            return f"{n / limit:.1f} {suffix}"
+    return f"{n:.0f} B"
+
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+_BAR_PARTS = " ▏▎▍▌▋▊▉█"
+
+
+def spark(values, width: int = 0, top=None) -> str:
+    """A one-line chart. A gap in the data (None) shows as a space."""
+    vals = list(values or [])
+    if width:
+        vals = vals[-width:]
+    real = [v for v in vals if isinstance(v, (int, float))]
+    if not real:
+        return ""
+    peak = top if top else max(real)
+    if peak <= 0:
+        return "".join(" " if not isinstance(v, (int, float)) else _SPARK_CHARS[0] for v in vals)
+    out = []
+    for v in vals:
+        if not isinstance(v, (int, float)):
+            out.append(" ")
+        else:
+            out.append(_SPARK_CHARS[max(0, min(len(_SPARK_CHARS) - 1, int(v / peak * (len(_SPARK_CHARS) - 1) + 0.5)))])
+    return "".join(out)
+
+
+def meter(fraction, width: int = 12) -> str:
+    """A bar made of eighths of a cell, padded with a light shade."""
+    fraction = max(0.0, min(1.0, float(fraction or 0)))
+    eighths = int(fraction * width * 8 + 0.5)
+    full, part = eighths // 8, eighths % 8
+    text = "█" * full + (_BAR_PARTS[part] if part else "")
+    return text + "░" * (width - len(text))
+
+
+_ENGINE_LIVE_KEYS = ("state", "queued", "phase", "prompt_tokens", "prompt_read", "prompt_total", "generated", "max_tokens",
+                     "elapsed_s", "tok_s", "tok_s_mean", "prefill_tok_s_mean")
+_ENGINE_ROW_KEYS = ("time", "duration_s", "finish", "prompt_tokens", "reused", "output_tokens", "first_engine_token_s",
+                    "prompt_read", "prompt_ms", "decode_ms", "decode_tok_s", "hit_rate", "pcie_share", "drafts_offered", "drafts_accepted")
+_ENGINE_TOTAL_KEYS = ("since", "requests", "prompt_tokens", "reused", "output_tokens", "prompt_ms", "decode_ms",
+                      "drafts_offered", "drafts_accepted")
+_ENGINE_PARK_KEYS = ("enabled", "budget_mib", "slots", "parked", "bytes", "evictions", "parks", "restores")
+_ENGINE_INFO_KEYS = ("version", "max_context", "kv", "kv_resident", "expert_slots", "expert_cache_mib", "arena_mib",
+                     "vram_free_mib", "pool_workers")
+_ENGINE_HISTORY_KEYS = ("tok_s", "gpu_util", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used", "disk_read_mb", "prefill_tok_s_mean")
+
+
+def _pick(source, keys) -> dict:
+    source = source if isinstance(source, dict) else {}
+    return {k: source.get(k) for k in keys}
+
+
+def _engine_view(m: dict) -> dict:
+    """The parts of an engine's /metrics the console uses, by allow-list: numbers
+    and status words, nothing a client wrote."""
+    static = m.get("hardware_static") if isinstance(m.get("hardware_static"), dict) else {}
+    engine = m.get("engine") if isinstance(m.get("engine"), dict) else {}
+    return {
+        "model": _stats_name(engine.get("model"), ""),
+        "info": _pick(engine, _ENGINE_INFO_KEYS),
+        "live": _pick(m.get("live"), _ENGINE_LIVE_KEYS),
+        "totals": _pick(m.get("totals"), _ENGINE_TOTAL_KEYS),
+        "parking": _pick(m.get("conversation_cache"), _ENGINE_PARK_KEYS),
+        "hardware": dict(m["hardware"]) if isinstance(m.get("hardware"), dict) else {},
+        "gpu_name": _stats_name(static.get("gpu_name"), ""),
+        "cpu_name": _stats_name(static.get("cpu_name"), ""),
+        "history": _pick(m.get("history"), _ENGINE_HISTORY_KEYS),
+        "requests": [_pick(r, _ENGINE_ROW_KEYS) for r in (m.get("requests") or []) if isinstance(r, dict)],
+    }
+
+
+class EngineProbe:
+    """Polls the /metrics of engines that have one (Strata), only while someone
+    is looking, and answers from memory so the console never waits on it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = {}          # endpoint name → {"ok", "at", ...view}
+        self.last_read = 0.0
+        self.thread = None
+
+    @staticmethod
+    def _target(ep: dict, model: str = ""):
+        """(host, key) of the engine's own server for this endpoint, or None."""
+        kv = ep.get("kv_sessions") if isinstance(ep.get("kv_sessions"), dict) else {}
+        engine = str(kv.get("engine") or "").strip()
+        if engine:
+            return engine, kv.get("engine_api_key") or ep.get("api_key", "")
+        if ep.get("type") == "strata":
+            found = _kv_find_strata_instance(model)
+            if found:
+                return found[0], kv.get("engine_api_key") or found[1]
+        return None
+
+    @staticmethod
+    def _get_metrics(target) -> dict:
+        host, key = target
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=3)
+        try:
+            conn.request("GET", "/metrics", headers={"Authorization": f"Bearer {key}"} if key else {})
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                raise ValueError(f"HTTP {resp.status}")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict) or "engine" not in parsed:
+                raise ValueError("no engine metrics here")
+            return parsed
+        finally:
+            conn.close()
+
+    def _poll_one(self, ep: dict, model: str = ""):
+        name = ep.get("name", "")
+        target = self._target(ep, model)
+        if not target:
+            return None
+        try:
+            view = {"ok": True, "at": time.time(), **_engine_view(self._get_metrics(target))}
+        except Exception as e:
+            view = {"ok": False, "at": time.time(), "error": str(e)[:120]}
+        with self.lock:
+            self.data[name] = view
+        return view
+
+    def _loop(self):
+        while time.time() - self.last_read < _ENGINE_IDLE_STOP_S:
+            for ep in list(get_config("endpoints") or []):
+                if ep.get("enabled") and get_endpoint_status(ep.get("name", "")) == "online":
+                    self._poll_one(ep)
+            time.sleep(_ENGINE_POLL_S)
+        with self.lock:
+            self.thread = None
+
+    def read(self) -> dict:
+        """The latest numbers per endpoint; starts polling if it had stopped."""
+        self.last_read = time.time()
+        with self.lock:
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._loop, name="engine-probe", daemon=True)
+                self.thread.start()
+            return dict(self.data)
+
+    def read_speed(self, name: str):
+        """The engine's overall prompt reading speed since it loaded, tokens/s."""
+        totals = (self.data.get(name) or {}).get("totals") or {}
+        read = (totals.get("prompt_tokens") or 0) - (totals.get("reused") or 0)
+        if read >= _READ_RATE_MIN_TOKENS and totals.get("prompt_ms"):
+            return read / (totals["prompt_ms"] / 1000)
+        return None
+
+    def request_row(self, ep: dict, model: str, started: float):
+        """The engine's own numbers for the request that started at `started`."""
+        view = self._poll_one(ep, model)
+        if not view or not view.get("ok"):
+            return None
+        for row in view.get("requests", []):  # newest first
+            if isinstance(row.get("time"), (int, float)) and row["time"] >= started - 1:
+                return row
+        return None
+
+
+_stats = GatewayStats()
+_engine_probe = EngineProbe()
+atexit.register(lambda: _stats.save(force=True))
+
+
+def stats_snapshot() -> dict:
+    """Everything the console and GET /stats show. Fast: reads memory only."""
+    return {"gateway": _stats.snapshot(), "engines": _engine_probe.read(), "kv_sessions": kv_status_all()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1788,6 +2523,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/health" or path == "/v1/health":
             self._handle_health()
+            return
+        if path == "/stats":
+            self._send_json(stats_snapshot())
             return
         if path == "/slots":
             self._handle_slots()
@@ -2161,6 +2899,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not _cors_proxy_caller_allowed(self.headers):
             self._log(f"cors-proxy refused: Origin={self.headers.get('Origin')} "
                       f"Sec-Fetch-Site={self.headers.get('Sec-Fetch-Site')} Host={self.headers.get('Host')}")
+            # Closing with the body unread resets the connection on Windows, and the client can lose this reply
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if 0 < length <= _REFUSED_BODY_READ:
+                    self.rfile.read(length)
+            except (ValueError, OSError):
+                pass
             self._send_json({"error": "cors-proxy only serves the gateway's own web page"}, 403)
             return
 
@@ -2416,16 +3161,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
         streaming = False
         kv_ticket = None
         kv_ok = False
+        client_gone = False
+        stat = _stats.begin(target_endpoint, self.command, path, req_json, self.address_string(), self.headers)
         try:
             # Before forwarding: put the right conversation in the engine's slot
             # (kv_sessions endpoints only; holds the engine until _kv_end).
-            kv_ticket = _kv_begin(target_endpoint, self.command, path, req_json)
+            kv_ticket = _kv_begin(target_endpoint, self.command, path, req_json, stat.app if stat else "")
+            if stat and kv_ticket:
+                stat.kv_event, stat.swap_s = kv_ticket.event, kv_ticket.swap_s
             conn.request(self.command, path, body=body, headers=fwd_headers)
             response = conn.getresponse()
             streaming = "text/event-stream" in (response.getheader("Content-Type") or "")
             # The engine took the request: it holds this conversation now, even
             # if the client presses Stop halfway through the stream.
             kv_ok = response.status < 400
+            if stat:
+                stat.status = response.status
 
             # Send status + CORS + upstream response headers
             self.send_response(response.status)
@@ -2445,12 +3196,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 chunk = response.read1(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                if stat:
+                    stat.tap.feed(chunk, streaming)
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except OSError:
+                    client_gone = True
+                    raise
 
-            self._log(f"→ {ep_name} [{response.status}]")
+            if not stat:  # a counted request gets a fuller line when its numbers are in
+                self._log(f"→ {ep_name} [{response.status}]")
 
         except Exception as e:
+            if stat:
+                stat.failed = not client_gone
+                stat.cancelled = client_gone
             self._log(f"Error → {ep_name}: {e}")
             try:
                 if not headers_sent:
@@ -2476,6 +3237,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.close()
             bump_endpoint_load_end(ep_name)
             _kv_end(kv_ticket, kv_ok)
+            _stats.end(stat)
 
     def _log(self, msg: str):
         """Queue a request log line for the TUI (thread-safe)."""
@@ -2942,19 +3704,526 @@ def fetch_top_intelligent_models(limit: int = 20):
 #  TUI — MAIN SCREEN
 # ═══════════════════════════════════════════════════════════════════════════
 
-class MainScreen(Screen):
-    """Main screen: toolbar + endpoint status + live log."""
+# ── Console rendering: pure functions from a stats snapshot to Rich text ──
+# (Rich Text, never markup: model and app names come from clients.)
+
+_GIB = 1024 ** 3
+_LABEL_WIDTH = 10
+# Plain ANSI red and friends are too dark to read on the console's background
+_RED, _RED_BOLD = "#ff6b6b", "bold #ff6b6b"
+_YELLOW, _YELLOW_BOLD = "#ffd166", "bold #ffd166"
+_GREEN, _GREEN_BOLD = "#5fd787", "bold #5fd787"
+_CYAN = "#5fd7ff"
+_MAGENTA = "#d7a0ff"
+
+
+def _line(label: str, *parts) -> RichText:
+    """A labelled line. A part is plain text, or (text, style)."""
+    line = RichText()
+    line.append(f"{label:<{_LABEL_WIDTH}}", style="dim")
+    for part in parts:
+        if isinstance(part, tuple):
+            line.append(str(part[0]), style=part[1] or "")
+        else:
+            line.append(str(part))
+    return line
+
+
+def _lines(rows) -> RichText:
+    return RichText("\n", no_wrap=True, overflow="ellipsis").join(rows)
+
+
+def _pct(part, whole):
+    return part * 100 / whole if part is not None and whole else None
+
+
+def _pct_style(value) -> str:
+    if value is None:
+        return "dim"
+    return _GREEN if value >= 80 else _YELLOW if value >= 40 else "dim"  # a first read at 0% is normal
+
+
+def _temp_style(c) -> str:
+    return "dim" if c is None else _RED_BOLD if c >= 90 else _YELLOW if c >= 85 else _GREEN
+
+
+def _load_style(fraction) -> str:
+    return "dim" if fraction is None else _RED_BOLD if fraction >= 0.97 else _YELLOW if fraction >= 0.9 else _CYAN
+
+
+def _fmt_pct(value, digits: int = 1) -> str:
+    return "—" if value is None else f"{value:.{digits}f}%"
+
+
+def _ago(ts, now=None) -> str:
+    if not ts:
+        return "—"
+    return fmt_secs(max(0, (now or time.time()) - ts)) + " ago"
+
+
+def _main_engine(snap: dict):
+    """(endpoint name, engine view) of the engine to feature: the first that
+    answers, or (name, None) when one is configured but silent."""
+    engines = snap.get("engines") or {}
+    for name, view in engines.items():
+        if view.get("ok"):
+            return name, view
+    return (next(iter(engines)), None) if engines else (None, None)
+
+
+def _main_kv(snap: dict, name) -> dict:
+    kv = snap.get("kv_sessions") or {}
+    if name in kv:
+        return kv[name]
+    return next(iter(kv.values()), {}) if kv else {}
+
+
+def _expert_hits(engine: dict):
+    """(last request's expert cache hit %, average of the requests the engine lists)."""
+    rates = [r["hit_rate"] * 100 for r in engine.get("requests", []) if isinstance(r.get("hit_rate"), (int, float))]
+    return (rates[0], sum(rates) / len(rates)) if rates else (None, None)
+
+
+def _state_parts(engine: dict, spark_width: int = 14) -> list:
+    """The engine's state as line parts: reading, generating, idle or not loaded."""
+    live = engine.get("live") or {}
+    state = live.get("state")
+    if state == "reading":
+        read, total, rate = live.get("prompt_read"), live.get("prompt_total"), live.get("prefill_tok_s_mean")
+        parts = [("◐ reading ", _YELLOW_BOLD)]
+        if read is not None and total:
+            parts += [(meter(read / total, 10), _YELLOW), f" {fmt_count(read)}/{fmt_count(total)}"]
+            if rate:
+                parts.append(f" · {rate:.0f} t/s · {fmt_secs((total - read) / rate)} left")
+        return parts
+    if state == "generating":
+        tok_s = live.get("tok_s")
+        parts = [("● generating ", _GREEN_BOLD)]
+        if tok_s:
+            parts.append((f"{tok_s:.1f} t/s ", "bold"))
+        if live.get("generated"):
+            parts.append(f"· {fmt_count(live['generated'])} tokens ")
+        return parts + [(spark((engine.get("history") or {}).get("tok_s"), spark_width), _GREEN)]
+    if state == "unloaded":
+        return [("○ not loaded", "dim")]
+    return [("○ idle", "dim")]
+
+
+def _plural(count, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def _chat_parts(kv: dict, engine, show_saved: bool = True) -> list:
+    held = kv.get("held")
+    if not held:
+        return [("none tracked yet", "dim")]  # after a restart the engine may still hold one
+    context = ((engine or {}).get("info") or {}).get("max_context")
+    parts = [(str(held.get("id") or "new")[:6], "bold")]
+    if held.get("app"):
+        parts.append(f" {held['app'][:14]}")
+    parts.append(f" {fmt_count(held.get('tokens'))}")
+    if context:
+        fraction = (held.get("tokens") or 0) / context
+        parts += [f"/{fmt_count(context)} ", (meter(fraction, 8), _load_style(fraction)), f" {fraction * 100:.0f}%"]
+    if show_saved and not held.get("saved"):
+        parts.append((" unsaved", "dim"))
+    return parts
+
+
+def _gpu_parts(engine: dict) -> list:
+    hw = engine.get("hardware") or {}
+    if hw.get("gpu_util") is None and hw.get("gpu_temp") is None:
+        return [("no GPU readings", "dim")]
+    used, total = hw.get("gpu_mem_used"), hw.get("gpu_mem_total")
+    fraction = used / total if used is not None and total else None
+    parts = [f"{hw.get('gpu_util', 0):.0f}% ", (f"{hw.get('gpu_temp', 0):.0f}°C", _temp_style(hw.get("gpu_temp")))]
+    if hw.get("gpu_power") is not None:
+        parts.append(f" {hw['gpu_power']:.0f}/{hw.get('gpu_power_limit') or 0:.0f} W")
+    if fraction is not None:
+        parts += [" · VRAM ", (f"{used / _GIB:.1f}/{total / _GIB:.1f} GB", _load_style(fraction))]
+    return parts
+
+
+def render_live(snap: dict) -> RichText:
+    """The live panel beside the endpoints on the main screen."""
+    gw = snap.get("gateway") or {}
+    name, engine = _main_engine(snap)
+    kv = _main_kv(snap, name)
+    rows = []
+    if engine:
+        rows.append(_line("Engine", *_state_parts(engine, spark_width=6)))
+        rows.append(_line("Chat", *_chat_parts(kv, engine, show_saved=False)))
+        totals = engine.get("totals") or {}
+        prompt = _pct(totals.get("reused"), totals.get("prompt_tokens"))
+        hit = _expert_hits(engine)[0]
+        drafts = _pct(totals.get("drafts_accepted"), totals.get("drafts_offered"))
+        rows.append(_line("Cache", "prompt ", (_fmt_pct(prompt), _pct_style(prompt)),
+                          " · experts ", (_fmt_pct(hit, 0), _pct_style(hit)),
+                          " · drafts ", (_fmt_pct(drafts, 0), _CYAN)))
+    else:
+        rows.append(_line("Engine", ("no engine metrics" if name else "no engine with metrics", "dim")))
+        session = gw.get("session") or {}
+        prompt = _pct(session.get("cached"), session.get("prompt"))
+        rows.append(_line("Cache", "prompt ", (_fmt_pct(prompt), _pct_style(prompt))))
+    if kv:
+        rows.append(_line("Swaps", f"{kv.get('continued', 0)} kept · {kv.get('restores', 0)} restored · "
+                                   f"{_plural(kv.get('sessions', 0), 'chat')}, {fmt_bytes(kv.get('bytes', 0))}"))
+    life = gw.get("all_time") or {}
+    if life.get("saved_s"):
+        rows.append(_line("Saved", (f"≈ {fmt_secs(life['saved_s'])}", _GREEN_BOLD), " of prompt reading"))
+    if engine:
+        rows.append(_line("GPU", *_gpu_parts(engine)))
+    today = gw.get("today") or {}
+    errors = today.get("errors", 0)
+    rows.append(_line("Today", f"{today.get('requests', 0)} req · {fmt_count(today.get('prompt', 0))} in · "
+                               f"{fmt_count(today.get('out', 0))} out · ", (_plural(errors, "error"), _RED_BOLD if errors else "dim")))
+    recent = gw.get("recent") or []
+    if recent:
+        last = recent[0]
+        route = f"{last['app'][:14]} → {last['endpoint'][:12]} "
+        if last.get("error"):
+            rows.append(_line("Last", route, (f"failed {last.get('status') or ''}".strip(), _RED_BOLD)))
+        else:
+            speed = f"{last['tok_s']:.1f} t/s" if last.get("tok_s") else fmt_secs(last.get("duration_s"))
+            rows.append(_line("Last", route + f"{fmt_count(last.get('prompt'))} in {fmt_count(last.get('out'))} out {speed}"))
+    return _lines(rows)
+
+
+def panel_engine(snap: dict):
+    gw = snap.get("gateway") or {}
+    name, engine = _main_engine(snap)
+    kv = _main_kv(snap, name)
+    rows = []
+    if engine:
+        info = engine.get("info") or {}
+        live = engine.get("live") or {}
+        rows.append(_line("Model", (engine.get("model") or "—", "bold"),
+                          (f"  engine {info['version']}" if info.get("version") else "", "dim")))
+        rows.append(_line("State", *_state_parts(engine)))
+        if live.get("elapsed_s") is not None:
+            rows.append(_line("This turn", f"{fmt_secs(live['elapsed_s'])} so far"))
+        rows.append(_line("Chat", *_chat_parts(kv, engine)))
+    else:
+        message = "not reachable" if name else "none configured with metrics"
+        rows.append(_line("State", (f"engine {message}", "dim")))
+    active = gw.get("active") or []
+    queued = (engine.get("live", {}).get("queued") or 0) if engine else 0
+    if active:
+        rows.append(_line("In flight", f"{len(active)} · " + ", ".join(sorted({a['app'][:14] for a in active}))[:60]))
+    else:
+        rows.append(_line("In flight", ("none", "dim")))
+    if queued:
+        rows.append(_line("Queued", (str(queued), _YELLOW)))
+    rows.append(_line("Gateway", f"up {fmt_secs(gw.get('uptime_s'))}"))
+    if kv.get("last_event"):
+        rows.append(_line("Last swap", (kv["last_event"], "dim")))
+    if kv.get("paused"):
+        rows.append(_line("Swap", (f"paused for {kv['paused']} s (see the log)", _YELLOW)))
+    return _lines(rows)
+
+
+def panel_cache(snap: dict):
+    gw = snap.get("gateway") or {}
+    name, engine = _main_engine(snap)
+    kv = _main_kv(snap, name)
+    rows = []
+    if engine:
+        totals = engine.get("totals") or {}
+        prompt = _pct(totals.get("reused"), totals.get("prompt_tokens"))
+        rows.append(_line("Prompt", (_fmt_pct(prompt), _pct_style(prompt)), " ",
+                          (meter((prompt or 0) / 100, 12), _pct_style(prompt)),
+                          f" {fmt_count(totals.get('reused'))} of {fmt_count(totals.get('prompt_tokens'))} reused"))
+        last_hit, avg_hit = _expert_hits(engine)
+        info = engine.get("info") or {}
+        expert_tail = (f" · {fmt_count(info.get('expert_slots'))} in VRAM ({fmt_bytes((info.get('expert_cache_mib') or 0) * 1024 ** 2)})"
+                       if info.get("expert_slots") else "")
+        rows.append(_line("Experts", (_fmt_pct(last_hit), _pct_style(last_hit)), " last",
+                          f" · {_fmt_pct(avg_hit)} avg{expert_tail}"))
+        drafts = _pct(totals.get("drafts_accepted"), totals.get("drafts_offered"))
+        rows.append(_line("Drafts", (_fmt_pct(drafts), _CYAN), " ", (meter((drafts or 0) / 100, 12), _CYAN),
+                          f" {fmt_count(totals.get('drafts_accepted'))} of {fmt_count(totals.get('drafts_offered'))} kept"))
+        parking = engine.get("parking") or {}
+        if parking.get("enabled"):
+            rows.append(_line("In RAM", f"{parking.get('parked', 0)} of {parking.get('slots', 0)} chats parked · "
+                                        f"{fmt_bytes(parking.get('bytes'))} of {fmt_bytes((parking.get('budget_mib') or 0) * 1024 ** 2)}"
+                                        f" · {parking.get('evictions', 0)} evicted"))
+    session = gw.get("session") or {}
+    if session.get("prompt"):
+        share = _pct(session.get("cached"), session.get("prompt"))
+        rows.append(_line("Gateway", (_fmt_pct(share), _pct_style(share)),
+                          f" of {fmt_count(session['prompt'])} tokens cached, all endpoints"))
+    if kv:
+        seen = kv.get("continued", 0) + kv.get("restores", 0) + kv.get("new", 0)
+        ready = _pct(kv.get("continued", 0) + kv.get("restores", 0), seen)
+        rows.append(_line("Chats", (_fmt_pct(ready), _pct_style(ready)),
+                          f" ready: {kv.get('continued', 0)} kept, {kv.get('restores', 0)} restored, {kv.get('new', 0)} new"))
+        avg_save = kv.get("save_s", 0) / kv["saves"] if kv.get("saves") else None
+        avg_restore = kv.get("restore_s", 0) / kv["restores"] if kv.get("restores") else None
+        rows.append(_line("On disk", f"{_plural(kv.get('sessions', 0), 'chat')}, {fmt_bytes(kv.get('bytes', 0))} · "
+                                     f"{fmt_bytes(kv.get('written_bytes', 0))} written"))
+        rows.append(_line("Swap time", f"save {fmt_secs(avg_save)} · restore {fmt_secs(avg_restore)} (average)"))
+    life = gw.get("all_time") or {}
+    if life.get("saved_s"):
+        rows.append(_line("Saved", (f"≈ {fmt_secs(life['saved_s'])}", _GREEN_BOLD),
+                          f" of reading, {fmt_count(life.get('cached'))} tokens not read again"))
+    if not rows:
+        rows.append(_line("Prompt", ("no requests yet", "dim")))
+    return _lines(rows)
+
+
+def panel_speed(snap: dict):
+    gw = snap.get("gateway") or {}
+    _name, engine = _main_engine(snap)
+    rows = []
+    median, best = gw.get("tok_s_p50"), gw.get("tok_s_best")
+    rows.append(_line("Output", (f"{median:.1f} t/s" if median else "—", "bold"), " median",
+                      f" · {best:.1f} best" if best else ""))
+    history = (engine or {}).get("history") or {}
+    if history.get("tok_s"):
+        rows.append(_line("  60 s", (spark(history["tok_s"], 44) or "", _GREEN)))
+    totals = (engine or {}).get("totals") or {}
+    read = (totals.get("prompt_tokens") or 0) - (totals.get("reused") or 0)
+    read_rate = gw.get("read_tok_s_p50") or (read / (totals["prompt_ms"] / 1000) if totals.get("prompt_ms") else None)
+    rows.append(_line("Reading", f"{read_rate:.0f} t/s" if read_rate else "—", " prompt speed"))
+    rows.append(_line("First tok", (fmt_secs(gw.get("ttft_p50")), "bold"), " median",
+                      f" · {fmt_secs(gw.get('ttft_p95'))} p95" if gw.get("ttft_p95") is not None else ""))
+    per_minute = [m["requests"] for m in gw.get("per_minute") or []]
+    rows.append(_line("Req/min", (spark(per_minute, 44) if any(per_minute) else "none in the last hour", _CYAN if any(per_minute) else "dim")))
+    per_day = gw.get("per_day") or []
+    if per_day:
+        rows.append(_line("Tok/day", (spark([d["in"] + d["out"] for d in per_day], 14), _MAGENTA),
+                          f"  {fmt_count(per_day[-1]['in'] + per_day[-1]['out'])} today"))
+    return _lines(rows)
+
+
+def panel_hardware(snap: dict):
+    _name, engine = _main_engine(snap)
+    if not engine:
+        return _lines([_line("Hardware", ("no engine metrics", "dim"))])
+    hw = engine.get("hardware") or {}
+    history = engine.get("history") or {}
+    rows = []
+    gpu = (engine.get("gpu_name") or "GPU").replace("NVIDIA ", "")
+    rows.append(_line("GPU", f"{hw.get('gpu_util', 0):.0f}% ", (spark(history.get("gpu_util"), 26, top=100), _GREEN), f" {gpu}"))
+    rows.append(_line("Temp", (f"{hw.get('gpu_temp', 0):.0f}°C ", _temp_style(hw.get("gpu_temp"))),
+                      (spark(history.get("gpu_temp"), 26, top=100), _temp_style(hw.get("gpu_temp")))))
+    if hw.get("gpu_power") is not None and hw.get("gpu_power_limit"):
+        rows.append(_line("Power", (meter(hw["gpu_power"] / hw["gpu_power_limit"], 12), _CYAN),
+                          f" {hw['gpu_power']:.0f} / {hw['gpu_power_limit']:.0f} W"))
+    if hw.get("gpu_mem_used") is not None and hw.get("gpu_mem_total"):
+        fraction = hw["gpu_mem_used"] / hw["gpu_mem_total"]
+        rows.append(_line("VRAM", (meter(fraction, 12), _load_style(fraction)),
+                          f" {hw['gpu_mem_used'] / _GIB:.1f} / {hw['gpu_mem_total'] / _GIB:.1f} GB"))
+    if hw.get("gpu_pcie_gen"):
+        rows.append(_line("PCIe", f"Gen{hw['gpu_pcie_gen']} x{hw.get('gpu_pcie_width')} · "
+                                  f"rx {hw.get('gpu_pcie_rx_mb') or 0:.0f} · tx {hw.get('gpu_pcie_tx_mb') or 0:.0f} MB/s"))
+    if hw.get("cpu") is not None:
+        rows.append(_line("CPU", f"{hw['cpu']:.0f}% ", (spark(history.get("cpu"), 26, top=100), _CYAN)))
+    if hw.get("ram_used") is not None and hw.get("ram_total"):
+        fraction = hw["ram_used"] / hw["ram_total"]
+        rows.append(_line("RAM", (meter(fraction, 12), _load_style(fraction)),
+                          f" {hw['ram_used'] / _GIB:.1f} / {hw['ram_total'] / _GIB:.1f} GB"))
+    if hw.get("disk_read_mb") is not None:
+        rows.append(_line("Disk", f"read {hw['disk_read_mb']:.0f} · write {hw.get('disk_write_mb') or 0:.0f} MB/s"))
+    return _lines(rows)
+
+
+def _table(*columns) -> RichTable:
+    """A borderless table. A column is a name: ending in > it is right-aligned;
+    ending in * it takes the spare width, and gives way first when space is short."""
+    table = RichTable(box=None, expand=True, pad_edge=False, show_edge=False, header_style="bold dim", padding=(0, 1, 0, 0))
+    for col in columns:
+        name = col.rstrip(">*")
+        table.add_column(name, justify="right" if col.endswith(">") else "left", no_wrap=True, overflow="ellipsis",
+                         min_width=len(name) or None, ratio=1 if col.endswith("*") else None)
+    return table
+
+
+def _cached_cell(agg: dict):
+    share = _pct(agg.get("cached"), agg.get("prompt"))
+    return RichText(_fmt_pct(share, 0), style=_pct_style(share))
+
+
+def panel_totals(snap: dict):
+    gw = snap.get("gateway") or {}
+    table = _table("*", "This run>", "Today>", "All time>")
+    groups = [gw.get("session") or {}, gw.get("today") or {}, gw.get("all_time") or {}]
+    table.add_row("Requests", *[f"{g.get('requests', 0):,}" for g in groups])
+    table.add_row("Errors", *[RichText(f"{g.get('errors', 0):,}", style=_RED_BOLD if g.get("errors") else "dim") for g in groups])
+    table.add_row("Tokens in", *[fmt_count(g.get("prompt", 0)) for g in groups])
+    table.add_row("  cached", *[_cached_cell(g) for g in groups])
+    table.add_row("Tokens out", *[fmt_count(g.get("out", 0)) for g in groups])
+    table.add_row("Time saved", *[RichText("≈ " + fmt_secs(g.get("saved_s", 0)) if g.get("saved_s") else "—", style=_GREEN) for g in groups])
+    if any(g.get("cost") for g in groups):
+        table.add_row("Cloud cost", *[f"${g.get('cost', 0):.2f}" for g in groups])
+    since = (gw.get("all_time") or {}).get("since")
+    if since:
+        return RichGroup(table, RichText(f"All time since {time.strftime('%d %b %Y', time.localtime(since))}", style="dim"))
+    return table
+
+
+def panel_chats(snap: dict):
+    name, _engine = _main_engine(snap)
+    kv = _main_kv(snap, name)
+    chats = kv.get("chats") or []
+    if not kv:
+        return _lines([_line("Off", ("turn on kv_sessions on an endpoint to swap chats to disk", "dim"))])
+    if not chats:
+        return _lines([_line("None yet", ("a long chat is saved the first time you switch away from it", "dim"))])
+    held = (kv.get("held") or {}).get("id")
+    now = time.time()
+    table = _table("", "Chat", "App*", "Tokens>", "Size>", "Restored>", "Used>")
+    for chat in chats[:8]:
+        table.add_row(RichText("●", style=_GREEN) if chat["id"] == held else "", chat["id"][:8], RichText(chat.get("app", "")[:16] or "—"),
+                      fmt_count(chat["tokens"]), fmt_bytes(chat["bytes"]), f"{chat['restores']}×", _ago(chat["last_used"], now))
+    return table
+
+
+def panel_endpoints(snap: dict):
+    gw = snap.get("gateway") or {}
+    table = _table("Endpoint*", "Status", "Now>", "Requests>", "Errors>", "In>", "Cached>", "Out>", "First tok>", "Speed>", "Cost>")
+    stats = gw.get("by_endpoint") or {}
+    for ep in get_config("endpoints") or []:
+        name = ep.get("name", "")
+        status = get_endpoint_status(name)
+        style = _GREEN if status == "online" else _YELLOW if status == "checking" else "dim"
+        agg = stats.get(name) or {}
+        active, _total = get_endpoint_load(name)
+        table.add_row(RichText(name), RichText(status, style=style),
+                      RichText(str(active), style=_YELLOW_BOLD) if active else "—",
+                      f"{agg.get('requests', 0):,}" if agg else "—",
+                      RichText(str(agg.get("errors", 0)), style=_RED_BOLD if agg.get("errors") else "dim") if agg else "—",
+                      fmt_count(agg.get("prompt")), _cached_cell(agg), fmt_count(agg.get("out")),
+                      fmt_secs(agg.get("ttft_p50")), f"{agg['tok_s_p50']:.1f} t/s" if agg.get("tok_s_p50") else "—",
+                      f"${agg['cost']:.2f}" if agg.get("cost") else "—")
+    return table
+
+
+def _model_short(model: str) -> str:
+    """The model's name without its vendor prefix."""
+    return model.rstrip("/").rsplit("/", 1)[-1] or model
+
+
+def _group_table(title: str, groups: dict, short=str):
+    table = _table(title + "*", "Requests>", "In>", "Cached>", "Out>", "Used>")
+    now = time.time()
+    for name, agg in list(groups.items())[:6]:
+        # Names come from clients: a plain str cell would be read as Rich markup
+        table.add_row(RichText(short(name)), f"{agg['requests']:,}", fmt_count(agg["prompt"]), _cached_cell(agg),
+                      fmt_count(agg["out"]), _ago(agg["last"], now))
+    if not groups:
+        table.add_row(RichText("none yet", style="dim"), "", "", "", "", "")
+    return table
+
+
+def panel_models(snap: dict):
+    return _group_table("Model", (snap.get("gateway") or {}).get("by_model") or {}, _model_short)
+
+
+def panel_apps(snap: dict):
+    gw = snap.get("gateway") or {}
+    return _group_table("App", gw.get("by_app") or gw.get("all_time_by_app") or {})
+
+
+def panel_recent(snap: dict):
+    table = _table("Time", "App", "Model*", "In>", "Cached>", "Out>", "First tok>", "Speed>", "Experts>", "Swap", "Status>")
+    recent = (snap.get("gateway") or {}).get("recent") or []
+    for r in recent[:12]:
+        cached = _pct(r.get("cached"), r.get("prompt"))
+        status = "stopped" if r.get("cancelled") else str(r.get("status") or "failed")
+        swap = r.get("swap") or ""
+        swap_text = {"restored": f"restored {fmt_secs(r.get('swap_s'))}", "continued": "kept",
+                     "new": f"new, saved {fmt_secs(r.get('swap_s'))}" if r.get("swap_s") else "new"}.get(swap, "—")
+        hit = r["expert_hit"] * 100 if isinstance(r.get("expert_hit"), (int, float)) else None
+        table.add_row(time.strftime("%H:%M:%S", time.localtime(r["time"])), RichText(r["app"][:14]), RichText(_model_short(r["model"])),
+                      fmt_count(r.get("prompt")), RichText(_fmt_pct(cached, 0), style=_pct_style(cached)),
+                      ("~" if r.get("out_estimated") else "") + fmt_count(r.get("out")), fmt_secs(r.get("ttft_s")),
+                      f"{r['tok_s']:.1f} t/s" if r.get("tok_s") else "—", RichText(_fmt_pct(hit, 0), style=_pct_style(hit)),
+                      RichText(swap_text, style=_GREEN if swap == "restored" else "dim"),
+                      RichText(status, style=_RED_BOLD if r.get("error") else "dim" if r.get("cancelled") else _GREEN))
+    if not recent:
+        table.add_row(RichText("no requests yet", style="dim"), *[""] * 10)
+    return table
+
+
+_DASHBOARD_PANELS = (
+    ("panel-engine", "Engine", panel_engine, False),
+    ("panel-cache", "Cache", panel_cache, False),
+    ("panel-speed", "Speed", panel_speed, False),
+    ("panel-hardware", "Hardware", panel_hardware, False),
+    ("panel-totals", "Totals", panel_totals, False),
+    ("panel-chats", "Saved chats", panel_chats, False),
+    ("panel-endpoints", "Endpoints", panel_endpoints, True),
+    ("panel-models", "Models (this run)", panel_models, False),
+    ("panel-apps", "Apps (this run)", panel_apps, False),
+    ("panel-recent", "Recent requests", panel_recent, True),
+)
+
+
+class StatsScreen(Screen):
+    """The full dashboard: what the engine is doing, how the caches are paying
+    off, the hardware, and where the traffic comes from."""
 
     BINDINGS = [
+        ("d", "app.pop_screen", "Back"),
+        ("escape", "app.pop_screen", "Back"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with ScrollableContainer(id="stats-scroll"):
+            with Grid(id="stats-grid"):
+                for widget_id, title, _render, wide in _DASHBOARD_PANELS:
+                    panel = Static("", id=widget_id, classes="panel panel-wide" if wide else "panel")
+                    panel.border_title = title
+                    yield panel
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._refresh_panels()
+        self.set_interval(1.0, self._refresh_panels)
+        self.query_one("#stats-scroll").focus()
+
+    def on_resize(self, event) -> None:
+        self.query_one("#stats-grid").set_class(event.size.width < 110, "narrow")
+
+    def _refresh_panels(self):
+        snap = stats_snapshot()
+        for widget_id, title, render, _wide in _DASHBOARD_PANELS:
+            try:
+                self.query_one(f"#{widget_id}", Static).update(render(snap))
+            except Exception as e:  # a bad number must never take the console down
+                self.query_one(f"#{widget_id}", Static).update(RichText(f"{title}: {e}", style="dim"))
+
+
+class MainScreen(Screen):
+    """Main screen: endpoints, live stats and the proxy log."""
+
+    BINDINGS = [
+        ("d", "open_dashboard", "Dashboard"),
         ("s", "open_settings", "Settings"),
         ("q", "quit", "Quit"),
     ]
+
+    def _compose_overview(self) -> ComposeResult:
+        """The top of the main screen: endpoints beside live stats. A subclass
+        with its own layout yields this too, so the widget IDs stay the same."""
+        with Horizontal(id="overview"):
+            with Vertical(id="overview-left"):
+                yield Static("Endpoints", classes="section-title")
+                yield Static("Loading...", id="endpoint-status")
+                yield Static("", id="server-info")
+            with Vertical(id="overview-right"):
+                yield Static("Live", classes="section-title")
+                yield Static("", id="live-stats")
 
     def on_mount(self) -> None:
         log = self.query_one("#log", Log)
         ProxyHandler.tui_log = log
         self._update_endpoint_status()
         self._show_server_info()
+        self._update_live_stats()
+        self.set_interval(1.0, self._update_live_stats)
         # Periodic status refresh
         self.set_interval(5.0, self._update_endpoint_status)
         # Periodic server-info refresh: the aggregated model catalog is merged
@@ -2991,15 +4260,25 @@ class MainScreen(Screen):
             f"Default   : {model}{forced}"
         )
 
+    def _update_live_stats(self):
+        try:
+            self.query_one("#live-stats", Static).update(render_live(stats_snapshot()))
+        except Exception as e:  # a bad number must never take the console down
+            self.query_one("#live-stats", Static).update(RichText(f"Stats unavailable: {e}", style="dim"))
+
+    def on_resize(self, event) -> None:
+        self.query_one("#overview").set_class(event.size.width < 120, "narrow")
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with ScrollableContainer(id="main-screen"):
-            yield Static("Endpoints", classes="section-title")
-            yield Static("Loading...", id="endpoint-status")
-            yield Static("", id="server-info")
+            yield from self._compose_overview()
             yield Static("Proxy Log", classes="section-title")
             yield Log(id="log", highlight=True)
         yield Footer()
+
+    def action_open_dashboard(self):
+        self.app.push_screen(StatsScreen())
 
     def action_open_settings(self):
         self.app.push_screen(SettingsScreen())
@@ -3011,7 +4290,7 @@ class MainScreen(Screen):
         lines = []
         # Column header (aligned to the row template below)
         lines.append(
-            f"    {'ENDPOINT':<12} → {'HOST':<24} [{'STATUS':<8}] {'MODELS':>6}   LOAD"
+            f"    {'ENDPOINT':<12} → {'HOST':<18} [{'STATUS':<8}] {'MODELS':>6}   LOAD"
         )
         for ep in endpoints:
             name = ep.get("name", "")
@@ -3026,7 +4305,7 @@ class MainScreen(Screen):
             model_count = sum(1 for m in get_models() if m.startswith(f"{name}:"))
             load_str = format_endpoint_load(name)
             lines.append(
-                f"  {icon} {name:<12} → {host:<24} [{status:<8}] {model_count:>6}   {load_str}"
+                f"  {icon} {name:<12} → {host:<18} [{status:<8}] {model_count:>6}   {load_str}"
             )
         status_widget.update("\n".join(lines) if lines else "  No endpoints configured")
 
@@ -3053,6 +4332,64 @@ class ProxyTUI(App):
     #main-screen {
         padding: 0 2;
         height: 1fr;
+    }
+    #overview {
+        height: auto;
+        width: 100%;
+    }
+    #overview-left {
+        width: 76;
+        height: auto;
+        margin-right: 2;
+    }
+    #overview-right {
+        width: 1fr;
+        height: auto;
+    }
+    #overview.narrow {
+        layout: vertical;
+    }
+    #overview.narrow #overview-left, #overview.narrow #overview-right {
+        width: 100%;
+        margin-right: 0;
+    }
+    #live-stats {
+        height: auto;
+        width: 100%;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    #stats-scroll {
+        height: 1fr;
+        padding: 0 1;
+    }
+    #stats-grid {
+        grid-size: 2;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+        height: auto;
+    }
+    #stats-grid.narrow {
+        grid-size: 1;
+    }
+    .panel {
+        height: auto;
+        min-height: 3;
+        border: round $primary;
+        border-title-color: $accent;
+        border-title-style: bold;
+        padding: 0 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    #stats-grid .panel {
+        height: 100%;
+    }
+    .panel-wide {
+        column-span: 2;
+    }
+    #stats-grid.narrow .panel-wide {
+        column-span: 1;
     }
     #endpoint-status {
         height: auto;

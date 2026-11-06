@@ -187,9 +187,9 @@ class SplitMainScreen(proxy.MainScreen):
     """Main screen with the full proxy GUI on top and the MCP bridge below.
 
     Only compose() is overridden — the inherited on_mount(),
-    _update_endpoint_status(), _show_server_info(), _drain_log_queue() and
-    the 's' (settings) binding all keep working because the original widget
-    IDs (#endpoint-status, #server-info, #log) are preserved.
+    _update_endpoint_status(), _show_server_info(), _drain_log_queue(), the
+    live stats and the 's' (settings) and 'd' (dashboard) bindings all keep
+    working because the original widget IDs are preserved.
     """
 
     def compose(self) -> ComposeResult:
@@ -197,9 +197,7 @@ class SplitMainScreen(proxy.MainScreen):
         with Vertical(id="split-root"):
             # ── Top pane: the original proxy GUI (same widget IDs) ─────────
             with Vertical(id="proxy-pane"):
-                yield Static("Endpoints", classes="section-title")
-                yield Static("Loading...", id="endpoint-status")
-                yield Static("", id="server-info")
+                yield from self._compose_overview()
                 yield Static("Proxy Log", classes="section-title")
                 yield Log(id="log", highlight=True)
             # ── Bottom pane: MCP bridge (1MCP) ────────────────────────────
