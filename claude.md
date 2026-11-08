@@ -130,8 +130,11 @@ Rules that must hold:
 1. **`_kv_begin` and `_kv_end` always pair.** `begin` takes the manager's lock and `end` releases it. A missed `end` blocks that endpoint forever, so `_kv_begin` stays inside the `try` whose `finally` calls `_kv_end`.
 2. **Swapping never breaks a request.** Any failure is logged and the request is forwarded anyway. A 501 from the engine (slot saving off) or an unreadable `/slots` pauses swapping for `_KV_BACKOFF_S`.
 3. **Chat text never leaves memory.** The index (`kv-sessions-<endpoint>.json`, gitignored) holds message hashes and counts only, and session files are never opened. They are deleted only by `max_gb` eviction, and only `gw-*.bin` files listed in the index.
-4. **Never save a conversation under the wrong name.** `current` is dropped when the token count from `/slots` no longer matches what was recorded (the engine restarted, or a client used it directly).
+4. **Never save a conversation under the wrong name.** `current` is dropped when the token count from `/slots` no longer matches what was recorded (the engine restarted, or a client used it directly), or when the engine's `host:port` changed.
 5. **A save rewrites the whole chat** (about 16.7 KB per token, 8.5 GB at 512k), so saves happen on a switch and after a long idle only, and only when the chat changed since the last save.
+6. **A 500 from a save or restore turns swapping off for that engine load** (`_suspend`), until the model is reloaded (Strata gives each load a new key) or `_KV_SUSPEND_S` passes. Strata 0.1.57 can get into a state where every snapshot answers `500 "conversation snapshot: invalid K/V extent"`. After that, `/slots` reports 0 tokens although the engine still holds the chat, so nothing, not even `/slots`, is asked while suspended. The engine's error text (never chat text) is kept in `last_error` and shown in the console.
+7. **A gateway restart doesn't forget what the engine holds.** `current` is also kept in the index as `held` (hashes, counts, session id and engine `host:port`, never the key) by `_persist_held()`, which `end()` and the idle loop call before giving the lock back. It is written only when it changed. The first request checks it with rule 4.
+8. **Never restore over a long chat that can't be identified.** With no `current` and the engine holding `min_tokens` or more, the restore is skipped: that chat may be this one, newer than its saved copy. If the request continues the skipped saved chat, it takes that chat's id, so the next save replaces that file instead of writing a second copy.
 
 For Strata, the engine's port and per-load API key are read from `~/.strata/data/native-instances/*.json` on each request (`STRATA_INSTANCES_DIR` overrides the folder; tests use it). The key is used in memory only. Strata's host does not forward `/slots`, so these calls go to the engine's own port.
 
@@ -156,6 +159,25 @@ Rules that must hold:
 6. **Group tables are capped.** `_agg_group` keeps `_STATS_MAX_KEYS` names apart and counts the rest as `other`, so clients can't grow memory or the totals file without limit.
 
 Tests must not write real files: `testing/test_proxy.py` points `proxy.CONFIG_FILE` and `STRATA_INSTANCES_DIR` at a temp folder on import, because `gateway-stats.json` is written beside the config.
+
+## Tool Call Healing
+
+With `"tool_heal": {"enabled": true}` on an endpoint, `_new_healer()` gives a `/chat/completions` request that offers tools a `ToolHealer`, which reads the reply on its way to the client. `_parse_tool_blocks()` turns calls written as text into real ones, and `guard_tool_call()` / `_guard_command()` check every call that would run. Rule ids and reasons are in `_GUARD_REASONS`.
+
+Rules that must hold:
+
+1. **Off is byte for byte, and with nothing to do every character survives.** No healer means the old path. With a healer, a reply with nothing to repair passes raw, except that text which could have started a call is held until it can't and may arrive split differently (`test_replies_with_nothing_to_heal_pass_byte_for_byte`, `test_re_chunked_text_keeps_every_character`).
+2. **Never guess.** A tool name is never mapped or re-cased, and parameter bytes are never edited. A call with an unknown name goes through under that name: nothing runs, and the client tells the model what exists. Unknown names must stay safe to send, which is why they aren't renamed to something that would run.
+3. **Never heal what isn't whole.** A written call needs its closing tags and `finish_reason` `stop` or `tool_calls`. Anything else stays text. All calls in a reply are healed, or none.
+4. **A quotation isn't a call.** Only outside code fences, at the start of a line, in `content`, never from reasoning.
+5. **Nothing of a call is sent until it's judged.** Structured `tool_calls` deltas are held to the end of the reply. A cut-off stream must send no part of a command.
+6. **Broken arguments on a command or file tool never reach the client (A1).** Cline's `experimental_repairToolCall` runs `jsonrepair`, which turns `rm -rf C:\Users\me` into `rm -rf C:Usersme` and runs half a batch. Verified with its real code.
+7. **Stopped calls keep the agent loop alive.** `ask_question` if the request offers it, otherwise a tool call to an unknown name that carries the rule. An HTTP error or an SSE error stops the loop in Cline, and plain text ends the turn.
+8. **A failure inside the healer hands over what it holds** and passes the rest as it came (`_give_up`). Healing must never break a reply.
+9. **No text is kept.** The log and stats get counts and rule ids only. The command appears only in the question sent to the client.
+10. **The guard is for accidents, not a security boundary.** False positives break real work, so any new rule needs near misses added to `MUST_PASS` in `CommandGuardTests`.
+
+Test with made-up text only, through `run_healer()`, `sse_text()` and `sse_native()`. Never send test traffic to a real engine: it would displace the chat it holds.
 
 ## API Endpoints
 

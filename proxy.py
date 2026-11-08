@@ -23,6 +23,7 @@ import ipaddress
 import mimetypes
 import os
 import queue
+import re
 import secrets
 import ssl
 import sys
@@ -1205,6 +1206,7 @@ KV_DEFAULTS = {
 }
 _KV_KEEP_RATIO = 0.98       # a request that keeps this much of the held chat continues it
 _KV_BACKOFF_S = 60          # after the engine can't swap, leave it alone for this long
+_KV_SUSPEND_S = 1800        # after a 500 from a save or restore: off until the engine reloads, or this long
 _KV_IDLE_POLL_S = 5.0       # how often the idle saver looks
 _KV_CALL_TIMEOUT = 900      # a save or restore of a 500k chat takes seconds, not minutes
 _kv_managers = {}           # endpoint name → KVSessionManager
@@ -1397,7 +1399,10 @@ class KVSessionManager:
         self.stats = {"saves": 0, "restores": 0, "errors": 0, "continued": 0, "new": 0,
                       "restored_tokens": 0, "save_s": 0.0, "restore_s": 0.0, "written_bytes": 0}
         self.last_event = ""
+        self.last_error = None      # the last swap that failed: action, status and the engine's words
+        self.suspended = None       # swapping is off for this engine load: reason, since, until
         self._loaded = False
+        self._held_sig = None       # what the index file says the engine holds, to write it only on a change
         self._idle_thread = None
         self._last_target = None
         self._slot_dir = ""
@@ -1423,18 +1428,63 @@ class KVSessionManager:
                         and isinstance(e.get("file"), str)):
                     e["id"] = sid
                     self.index[sid] = e
-        except (OSError, ValueError, AttributeError):
-            pass
+        except (OSError, ValueError, AttributeError, TypeError):
+            return
+        if self.current is None:
+            self.current = self._held_from(raw.get("held") if isinstance(raw, dict) else None)
+        self._held_sig = self._held_signature()
+
+    @staticmethod
+    def _held_from(rec):
+        """What the engine held when the gateway last ran, as the index file says, or None.
+        The first request checks it against the engine's own token count before using it."""
+        try:
+            if not isinstance(rec, dict):
+                return None
+            chain, lens, tokens = rec.get("chain"), rec.get("lens"), rec.get("tokens")
+            if (not isinstance(chain, list) or not chain or not isinstance(lens, list) or len(lens) != len(chain)
+                    or not all(isinstance(h, str) for h in chain) or isinstance(tokens, bool)
+                    or not isinstance(tokens, int) or tokens <= 0):
+                return None
+            sid = rec.get("id")
+            return {"chain": list(chain), "lens": [int(n) for n in lens],
+                    "id": sid if isinstance(sid, str) and sid else None, "tokens": tokens,
+                    "dirty": bool(rec.get("dirty", True)), "app": str(rec.get("app") or ""),
+                    "engine": str(rec.get("engine") or "")}
+        except (TypeError, ValueError):
+            return None
+
+    def _held_record(self):
+        """`current` as the index file keeps it: message hashes and counts, never text."""
+        cur = self.current
+        if not cur or not cur.get("chain"):
+            return None
+        return {"chain": list(cur["chain"]), "lens": list(cur["lens"]), "id": cur.get("id"),
+                "tokens": int(cur.get("tokens") or 0), "dirty": bool(cur.get("dirty")),
+                "app": cur.get("app", ""), "engine": cur.get("engine", "")}
+
+    def _held_signature(self):
+        rec = self._held_record()
+        if rec is None:
+            return None
+        return (rec["id"], rec["tokens"], rec["dirty"], rec["engine"], len(rec["chain"]), rec["chain"][-1])
 
     def _save_index(self):
         path = self._index_path()
         tmp = path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "entries": self.index}, f)
+                json.dump({"version": 1, "entries": self.index, "held": self._held_record()}, f)
             os.replace(tmp, path)
+            self._held_sig = self._held_signature()
         except OSError as e:
             self._log(f"could not write the session index: {e}")
+
+    def _persist_held(self):
+        """Write the index when what the engine holds changed, so a gateway restart
+        still knows which chat that is (and doesn't restore an older copy over it)."""
+        if self._loaded and self._held_signature() != self._held_sig:
+            self._save_index()
 
     # ── talking to the engine ───────────────────────────────────────────
     def _target(self, model: str):
@@ -1495,6 +1545,34 @@ class KVSessionManager:
         self.unavailable_until = time.time() + _KV_BACKOFF_S
         self.current = None
         self._log(f"session swap paused for {_KV_BACKOFF_S} s: {why}")
+
+    def _note_failure(self, action, error):
+        """Keep why a swap failed: the engine's error text, never anything from a chat."""
+        message = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", str(error))).strip()[:200]
+        self.last_error = {"time": time.time(), "action": action or "swap",
+                           "status": getattr(error, "status", None), "message": message}
+
+    def _suspend(self, target, action):
+        """A 500 from a save or restore means this engine load can't snapshot at all
+        (Strata 0.1.57: "conversation snapshot: invalid K/V extent", from then on). Leave it
+        alone until the model is reloaded, which gives it a new key, or for _KV_SUSPEND_S."""
+        reason = (self.last_error or {}).get("message", "")
+        now = time.time()
+        self.suspended = {"load": tuple(target[:2]), "action": action, "reason": reason,
+                          "since": now, "until": now + _KV_SUSPEND_S}
+        self.current = None
+        self._log(f"session swap off until the model is reloaded (or for {_KV_SUSPEND_S // 60} min): "
+                  f"the engine could not {action}: {reason}")
+
+    def _suspended_for(self, target) -> bool:
+        s = self.suspended
+        if not s:
+            return False
+        if time.time() < s["until"] and s["load"] == tuple(target[:2]):
+            return True
+        self.suspended = None
+        self._log("trying session swap again: " + ("the model was reloaded" if s["load"] != tuple(target[:2]) else "time is up"))
+        return False
 
     # ── the decision (pure: no I/O) ─────────────────────────────────────
     def _plan(self, cur, req: KVChain) -> dict:
@@ -1558,7 +1636,7 @@ class KVSessionManager:
         self.stats["restored_tokens"] += int(r.get("n_restored") or 0)
         self.current = {"chain": list(entry["chain"]), "lens": list(entry["lens"]), "id": entry["id"],
                         "tokens": held[0] if held else int(r.get("n_restored") or entry.get("tokens", 0)),
-                        "dirty": False, "app": entry.get("app", "")}
+                        "dirty": False, "app": entry.get("app", ""), "engine": target[0]}
         self._save_index()
         self.last_event = f"restored {entry['id']}: {int(r.get('n_restored') or 0):,} tokens in {took:.1f} s"
         self._log(self.last_event)
@@ -1612,6 +1690,7 @@ class KVSessionManager:
             self._begin_locked(ticket)
         except Exception as e:  # never let swapping break the request itself
             self.stats["errors"] += 1
+            self._note_failure("swap", e)
             self.current = None
             self._log(f"swap skipped: {e}")
         return ticket
@@ -1625,6 +1704,11 @@ class KVSessionManager:
         if not target:
             self._mark_unavailable("no engine to talk to (set \"engine\" in kv_sessions, or load the model in Strata)")
             return
+        if self._suspended_for(target):
+            # Not even /slots: after a failed snapshot it reports 0 tokens while it still holds the chat.
+            self.current = None
+            t.event = None
+            return
         st = self._slot_state(target)
         if st is None:
             self._mark_unavailable("the engine's /slots could not be read")
@@ -1633,19 +1717,38 @@ class KVSessionManager:
         self._slot_dir = target[2] or self._slot_dir
         held = st[0]
         cur = self.current
-        if cur and (held == 0 or abs(held - cur["tokens"]) > max(64, 0.02 * cur["tokens"])):
+        if cur and ((cur.get("engine") and cur["engine"] != target[0])
+                    or held == 0 or abs(held - cur["tokens"]) > max(64, 0.02 * cur["tokens"])):
             self._log("the engine no longer holds the conversation tracked here (restarted, or used directly): not saving it")
             cur = self.current = None
         plan = self._plan(cur, t.chain)
+        if plan["restore"] and cur is None and held >= self.cfg["min_tokens"]:
+            # The engine holds a long chat this gateway can't name: it may be this very chat, newer
+            # than any saved copy. A restore would throw it away unsaved, so let the engine reuse it.
+            skipped, plan["restore"] = plan["restore"], None
+            _n, chars = _kv_common(skipped["chain"], skipped["lens"], t.chain.hashes)
+            if chars >= _KV_KEEP_RATIO * skipped["lens"][-1]:
+                t.inherit_id = skipped["id"]  # it carries that saved chat on: its next save replaces that file
+            self.last_event = f"left the engine's {held:,}-token chat in place: the gateway can't tell which chat it is"
+            self._log(self.last_event + ", so no saved chat was restored over it")
         t.event = "continued" if plan["keeps"] else "new"
+        doing = None
         try:
             if plan["save"]:
+                doing = "save"
                 t.swap_s += self._save_current(target)
             if plan["restore"]:
+                doing = "restore"
                 t.swap_s += self._restore(target, plan["restore"])
                 t.event = "restored"
         except _KVError as e:
             self.stats["errors"] += 1
+            self._note_failure(doing, e)
+            if e.status == 500:
+                self._suspend(target, doing)
+                t.target = None
+                t.event = None
+                return
             if e.status == 501:
                 self._mark_unavailable(f"{e} (add \"slot_save_path\" to Strata's run config and load the model again)")
                 t.target = None
@@ -1671,7 +1774,8 @@ class KVSessionManager:
                 st = self._slot_state(t.target)
                 if ok and st:
                     self.current = {"chain": list(t.chain.hashes), "lens": list(t.chain.lens),
-                                    "id": t.inherit_id, "tokens": st[0], "dirty": True, "app": t.app}
+                                    "id": t.inherit_id, "tokens": st[0], "dirty": True, "app": t.app,
+                                    "engine": t.target[0]}
                     if t.event in ("continued", "new"):
                         self.stats[t.event] += 1
                 else:
@@ -1682,7 +1786,10 @@ class KVSessionManager:
             self._log(f"bookkeeping error: {e}")
             self.current = None
         finally:
-            self.lock.release()
+            try:
+                self._persist_held()
+            finally:
+                self.lock.release()
 
     # ── save when idle, so a restart of the engine loses little ─────────
     def _ensure_idle_thread(self):
@@ -1718,10 +1825,22 @@ class KVSessionManager:
                         self.current = None
             except Exception as e:
                 self.stats["errors"] += 1
+                self._note_failure("idle save", e)
                 self.last_activity = time.time()  # try again after another idle period
                 self._log(f"idle save failed: {e}")
+                if isinstance(e, _KVError) and e.status == 500 and self._last_target:
+                    self._suspend(self._last_target, "save")
             finally:
-                self.lock.release()
+                try:
+                    self._persist_held()
+                finally:
+                    self.lock.release()
+
+    def _suspension_status(self):
+        s = self.suspended
+        if not s or time.time() >= s["until"]:
+            return None
+        return {"action": s["action"], "reason": s["reason"], "since": s["since"], "until": s["until"]}  # never the key
 
     def status(self) -> dict:
         cur = self.current
@@ -1733,6 +1852,8 @@ class KVSessionManager:
             "held": ({"id": cur.get("id"), "tokens": cur["tokens"], "saved": not cur.get("dirty"),
                       "app": cur.get("app", "")} if cur else None),
             "paused": max(0, int(self.unavailable_until - time.time())),
+            "suspended": self._suspension_status(),
+            "last_error": dict(self.last_error) if self.last_error else None,
             "last_event": self.last_event,
             "chats": [{"id": e["id"], "app": e.get("app", ""), "tokens": int(e.get("tokens", 0)),
                        "bytes": int(e.get("bytes", 0)), "last_used": e.get("last_used", 0),
@@ -1971,13 +2092,14 @@ class _ResponseTap:
 
 
 def _new_agg() -> dict:
-    return {"requests": 0, "errors": 0, "prompt": 0, "cached": 0, "out": 0, "cost": 0.0, "saved_s": 0.0, "last": 0.0}
+    return {"requests": 0, "errors": 0, "prompt": 0, "cached": 0, "out": 0, "cost": 0.0, "saved_s": 0.0, "last": 0.0,
+            "healed": 0, "stopped": 0}
 
 
 def _agg_add(agg: dict, rec: dict):
     agg["requests"] += 1
     agg["errors"] += 1 if rec.get("error") else 0
-    for key in ("prompt", "cached", "out", "cost", "saved_s"):
+    for key in ("prompt", "cached", "out", "cost", "saved_s", "healed", "stopped"):
         agg[key] += rec.get(key) or 0
     agg["last"] = rec["time"]
 
@@ -2007,6 +2129,7 @@ class _RequestStats:
         self.cancelled = False      # the client left halfway (pressed Stop)
         self.swap_s = None
         self.kv_event = None
+        self.heal = None            # what the tool call healer did: counts and a rule id
 
 
 class GatewayStats:
@@ -2170,7 +2293,10 @@ class GatewayStats:
             read_s = timings["prompt_ms"] / 1000
         read_tok_s = read_n / read_s if read_n and read_s > 0 else None
         now = time.time()
+        heal = req.heal or {}
         rec = {
+            "healed": heal.get("healed", 0), "heal_unknown": heal.get("unknown", 0), "stopped": heal.get("stopped", 0),
+            "heal_left": heal.get("left", 0), "heal_rule": heal.get("rule"),
             "time": req.started, "endpoint": req.ep_name, "model": req.model, "app": req.app, "client": req.client,
             "status": req.status, "error": req.failed or not req.status or req.status >= 400,
             "cancelled": req.cancelled, "stream": req.stream, "duration_s": round(now - req.started, 2),
@@ -2277,6 +2403,13 @@ def _log_line(rec: dict) -> str:
         bits.append(f"chat restored, swap {fmt_secs(rec.get('swap_s'))}")
     elif rec.get("swap_s"):
         bits.append(f"saved held chat, {fmt_secs(rec['swap_s'])}")
+    if rec.get("healed"):
+        unknown = f", {rec['heal_unknown']} with a name the app doesn't have" if rec.get("heal_unknown") else ""
+        bits.append(f"healed {rec['healed']} tool call{'' if rec['healed'] == 1 else 's'}{unknown}")
+    if rec.get("stopped"):
+        bits.append(f"stopped a tool call: rule {rec.get('heal_rule')}")
+    if rec.get("heal_left"):
+        bits.append(f"tool call left as text{': rule ' + rec['heal_rule'] if rec.get('heal_rule') else ''}")
     return head + ("  " + " · ".join(bits) if bits else "")
 
 
@@ -2482,6 +2615,1158 @@ atexit.register(lambda: _stats.save(force=True))
 def stats_snapshot() -> dict:
     """Everything the console and GET /stats show. Fast: reads memory only."""
     return {"gateway": _stats.snapshot(), "engines": _engine_probe.read(), "kv_sessions": kv_status_all()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TOOL CALL HEALING — gives damaged tool calls their shape back, and stops
+#  the ones that could do damage because of an error
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Off unless an endpoint has "tool_heal": {"enabled": true}, and then only for
+# /chat/completions requests that offer tools. Replies are read in memory and
+# nothing about them is kept: the log and stats get counts and rule ids only.
+#
+# The guard is for accidents (bad escaping, cut-off replies, a lost path), not a
+# security boundary: a command can always hide what it does. Client approval
+# settings stay the real protection.
+
+_HEAL_MAX_HOLD = 8 * 1024 * 1024    # past this, a held reply is passed on as it came
+_HEAL_KEEPALIVE_S = 10.0            # an idle client may give up while a long call is held
+_TOOL_TRIGGERS = ("<tool_call>", "<function=")
+_FENCES = ("```", "~~~")
+_TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
+_PARAM_CLOSE_RE = re.compile(r"</parameter>\s*(?=<parameter=|</function>)")
+_NUMBER_RE = re.compile(r"-?\d+(\.\d+)?([eE][-+]?\d+)?\Z")
+
+# Tools that run or write something: their calls are always checked.
+_GUARDED_TOOLS = {"run_commands", "run_command", "execute_command", "bash", "shell", "powershell",
+                  "terminal", "editor", "edit", "write_to_file", "replace_in_file", "apply_patch"}
+_COMMAND_KEYS = ("commands", "command", "cmd", "script")
+
+_GUARD_REASONS = {
+    "A1": "its arguments are broken, and repairing them could change what it does",
+    "T1": "the reply was cut off, so the call may be incomplete",
+    "S01": "it deletes a path that is only a variable, which may be empty",
+    "S02": "it deletes a root, home or whole working folder",
+    "S03": "its path has lost its backslashes",
+    "S04": "it uses a PowerShell variable that was never set, so the path starts at the drive root",
+    "S05": "it deletes a drive, system or top-level folder",
+    "S06": "it deletes everything a recursive listing finds, with no filter",
+    "S09": "its redirect would empty a file",
+    "S10": "its path contains a control character, usually a damaged \\n or \\t",
+    "S11": "it throws away uncommitted work",
+    "S12": "it rewrites or deletes git history that may not be recoverable",
+    "S13": "it deletes an unfiltered list of files",
+    "S14": "it writes directly to a disk",
+    "S15": "it changes permissions on a root folder",
+    "S16": "it shuts the machine down or deletes registry keys",
+    "S17": "the real command is hidden, so it can't be checked",
+    "S18": "its path climbs out of the working folder",
+    "S19": "an unquoted space seems to have split its path",
+    "S20": "it deletes an empty path",
+}
+_STOP_NAMES = {"A1": "broken_arguments_send_valid_json", "T1": "reply_was_cut_off_send_a_shorter_call"}
+
+_SHELL_WRAPPERS = {"sudo", "command", "builtin", "exec", "time", "nohup", "nice", "env", "&", "call", "start", "timeout", "npx", "bunx",
+                   "do", "then", "else", "elif", "if", "while", "until", "!"}
+_WRAPPER_VALUE_FLAGS = {"nice": {"-n"}, "sudo": {"-u", "-g", "-p"}, "timeout": {"-k", "-s"}, "env": {"-u"}}
+_DELETE_VERBS = {"rm", "rmdir", "rd", "del", "erase", "ri", "remove-item", "unlink", "shred", "rimraf"}
+_CMD_DELETE_VERBS = {"rd", "rmdir", "del", "erase"}
+_DISK_VERBS = {"fdisk", "parted", "wipefs", "sgdisk", "diskpart", "clear-disk", "format-volume", "initialize-disk"}
+_SYSTEM_VERBS = {"shutdown", "reboot", "halt", "poweroff", "stop-computer", "restart-computer"}
+_LISTING_VERBS = {"get-childitem", "gci", "dir", "ls"}
+_POSIX_SYSTEM_DIRS = ("etc", "bin", "sbin", "lib", "lib64", "boot", "sys", "proc", "dev")     # at any depth
+_POSIX_SHALLOW_DIRS = ("usr", "var", "opt", "root", "home", "users")                         # the top two levels
+_HOME_CACHES = (".npm", ".cache", ".pnpm-store", ".yarn", ".nuget", ".gradle")
+_TEMP_PATH_RE = re.compile(r"(/tmp/|/var/tmp/|\$\{?tmpdir|\$env:te?mp|%te?mp%|/dev/null$|nul$)", re.I)
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([\w.-]+)\1")
+_HERE_STRING_RE = re.compile(r"@'[ \t]*\r?\n.*?\n'@|@\"[ \t]*\r?\n.*?\n\"@", re.S)
+_WINDOWS_SYSTEM_DIRS = ("windows", "program files", "program files (x86)", "programdata")
+_PS_SAFE_VARS = {"_", "psitem", "home", "pwd", "pshome", "true", "false", "null"}
+_WIDE_TARGETS = {".", "./", "..", "../", "*", ".*", "*.*", "**", "./*", "./.*", "../*", "~", "~/", "~/*", "/", "/*", "/.*",
+                 "$home", "${home}", "$home/", "$home/*", "$pwd", "${pwd}", "$(pwd)", "$env:userprofile", "$env:home",
+                 "%userprofile%", "%homepath%", "%cd%", "%systemroot%", "%windir%", "%programfiles%", "$env:systemroot",
+                 "$env:windir", "$env:programfiles"}
+
+
+def _split_shell(cmd: str, shell: str):
+    """A command line as the shell would read it: a list of simple commands, each
+    {"words": [(text, quoted, lost_backslash)], "redirects": [...], "piped": whether
+    the next command reads this one's output, "nested": commands inside $(...)}."""
+    esc = "`" if shell == "powershell" else "^" if shell == "cmd" else "\\"
+    segments, nested = [], []
+    state = {"words": [], "redirects": [], "cur": None, "quoted": False, "lost": False, "redirect": False, "glued": None}
+
+    def end_word():
+        if state["cur"] is None:
+            return
+        text = "".join(state["cur"])
+        if state["redirect"]:
+            state["redirects"].append(text)
+            state["redirect"] = False
+        else:
+            state["words"].append((text, state["quoted"], state["lost"]))
+        state.update(cur=None, quoted=False, lost=False)
+
+    def end_segment(piped=False):
+        end_word()
+        if state["words"] or state["redirects"]:
+            segments.append({"words": state["words"], "redirects": state["redirects"], "piped": piped, "glued": state["glued"]})
+        state.update(words=[], redirects=[], redirect=False, glued=None)
+
+    def add(text):
+        if state["cur"] is None:
+            state["cur"] = []
+        state["cur"].append(text)
+
+    i, n, quote = 0, len(cmd), None
+    while i < n:
+        c = cmd[i]
+        if quote == "'":
+            if c == "'":
+                if shell == "powershell" and cmd[i + 1:i + 2] == "'":
+                    add("'")
+                    i += 2
+                    continue
+                quote = None
+            else:
+                add(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+            elif c == esc and shell != "cmd" and i + 1 < n and (shell == "powershell" or cmd[i + 1] in '"$`\\\n'):
+                add(cmd[i + 1])
+                i += 1
+            elif c == "$" and cmd[i + 1:i + 2] == "(":
+                end = _matching_paren(cmd, i + 1)
+                nested.append(cmd[i + 2:end])
+                add(cmd[i:end + 1])
+                i = end
+            else:
+                add(c)
+            i += 1
+            continue
+        if c == '"' or (c == "'" and shell != "cmd"):
+            quote = c
+            state["quoted"] = True
+            add("")
+            i += 1
+            continue
+        if c == esc and i + 1 < n:
+            if cmd[i + 1] in "\r\n":    # a line continuation
+                i += 2
+                continue
+            if shell == "posix" and cmd[i + 1].isalnum():
+                state["lost"] = True    # bash drops this backslash: C:\Users becomes C:Users
+            add(cmd[i + 1])
+            i += 2
+            continue
+        if c == "#" and shell != "cmd" and state["cur"] is None:
+            end = cmd.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if c in " \t":
+            # A tab or line break right against a word may be a \t or \n that JSON decoded out of a path
+            if c == "\t" and state["cur"] is not None and not cmd[i + 1:i + 2].isspace() and i + 1 < n:
+                state["glued"] = "tab"
+            end_word()
+        elif c in "\r\n":
+            if state["cur"] is not None and not state["quoted"] and cmd[i:i + 2] != "\r\n" and cmd[i + 1:].strip():
+                state["glued"] = "line"
+            end_segment()
+        elif c == ";" and shell != "cmd":
+            end_segment()
+        elif c == "{" and cmd[i + 1:i + 2] == "}":
+            add("{}")
+            i += 1
+        elif c == "&":
+            if shell == "posix" and cmd[i + 1:i + 2] == ">":    # &> file: both streams into a file
+                end_word()
+                i += 2 if cmd[i + 2:i + 3] == ">" else 1
+                state["redirect"] = True
+            elif cmd[i + 1:i + 2] == "&":
+                end_segment()
+                i += 1
+            elif shell == "powershell" and state["cur"] is None and not state["words"]:
+                state["words"].append(("&", False, False))
+            else:
+                end_segment()
+        elif c == "|":
+            if cmd[i + 1:i + 2] == "|":
+                end_segment()
+                i += 1
+            else:
+                end_segment(piped=True)
+        elif c in "(){}" and shell != "cmd":
+            end_segment()
+        elif c == "$" and shell != "cmd" and cmd[i + 1:i + 2] == "(":
+            end = _matching_paren(cmd, i + 1)
+            nested.append(cmd[i + 2:end])
+            add(cmd[i:end + 1])
+            i = end
+        elif c == "$" and shell != "cmd" and cmd[i + 1:i + 2] == "{":
+            end = cmd.find("}", i)
+            end = n - 1 if end < 0 else end
+            add(cmd[i:end + 1])
+            i = end
+        elif c == ">":
+            if state["cur"] is not None and "".join(state["cur"]) in ("1", "2", "*"):
+                state["cur"] = None
+            end_word()
+            if cmd[i + 1:i + 2] == ">":
+                i += 1
+            if cmd[i + 1:i + 2] == "&":     # 2>&1
+                i += 2
+                while i + 1 < n and cmd[i + 1].isdigit():
+                    i += 1
+            else:
+                state["redirect"] = True
+        else:
+            add(c)
+        i += 1
+    end_segment()
+    return segments, nested
+
+
+def _matching_paren(text: str, start: int) -> int:
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(text) - 1
+
+
+def _verb_of(words: list):
+    """(the program's name in lower case, its arguments), past env assignments and wrappers."""
+    i = 0
+    while i < len(words):
+        text, quoted, _lost = words[i]
+        if not quoted and re.match(r"[A-Za-z_]\w*=", text):
+            i += 1
+            continue
+        name = re.split(r"[\\/]", text)[-1].lower()
+        name = re.sub(r"\.(exe|cmd|bat|com)$", "", name)
+        if name in _SHELL_WRAPPERS and not quoted and i + 1 < len(words):
+            i += 1
+            while i < len(words) and name != "&" and not words[i][1]:
+                word = words[i][0]
+                if word.startswith("-"):
+                    i += 2 if word in _WRAPPER_VALUE_FLAGS.get(name, ()) else 1
+                elif name in ("nice", "timeout") and re.fullmatch(r"\d+(\.\d+)?[smhd]?", word):
+                    i += 1
+                else:
+                    break
+            continue
+        return name, words[i + 1:]
+    return "", []
+
+
+def _assigned_vars(cmd: str, shell: str) -> set:
+    """Variables this command sets itself. Each command runs in its own shell, so these
+    are the only ordinary ones that can hold a value."""
+    if shell == "powershell":
+        found = re.findall(r"\$(\w+)\s*=[^=]", cmd) + re.findall(r"foreach\s*\(\s*\$(\w+)", cmd, re.I)
+    elif shell == "cmd":
+        found = re.findall(r"\bset\s+\"?(\w+)=", cmd, re.I) + re.findall(r"\bfor\s+%%?(\w)\b", cmd, re.I)
+    else:
+        found = re.findall(r"(?:^|[;&|\s(])(\w+)=", cmd) + re.findall(r"\bfor\s+(\w+)\s+in\b", cmd) + re.findall(r"\bread\s+(?:-\w+\s+)*(\w+)", cmd)
+    return {name.lower() for name in found}
+
+
+def _bad_target(target, recursive: bool, shell: str, assigned: set):
+    """Why deleting this path is an accident waiting to happen, as a rule id, or None."""
+    text, _quoted, lost = target
+    if any(ord(ch) < 32 for ch in text):
+        return "S10"
+    s = text.strip()
+    if not s:
+        return "S20"
+    if lost:
+        return "S03"
+    if shell == "powershell":
+        s = re.sub(r"^\$\(\$(\w+)\)", r"$\1", s)        # "$($root)\build" is $root\build
+    low = s.lower().replace("\\", "/")
+    low = re.sub(r"^/mnt/([a-z])(/|$)", r"\1:/", low)   # WSL's view of a Windows drive
+    if low in _WIDE_TARGETS or re.fullmatch(r"/+\*?", low):
+        return "S02"
+    if re.match(r"hk(lm|cu|cr|u|cc):", low):
+        return "S16"
+    if re.match(r"[a-z]:/*(\*|\*\.\*|\.\*)?\Z", low):
+        return "S05"
+    if re.match(r"[a-z]:[^/]", low):
+        return "S03"
+    pattern = {"powershell": r"\$\{?(env:)?([A-Za-z_]\w*)\}?(.*)\Z",
+               "cmd": r"%()([A-Za-z_]\w*)%(.*)\Z"}.get(shell, r"\$\{?()([A-Za-z_]\w*|[0-9@*])(?::?[-=+?][^}]*)?\}?(.*)\Z")
+    var = re.match(pattern, s, re.S)
+    if var:
+        name, rest = var.group(2).lower(), var.group(3)
+        if name in assigned or (shell == "powershell" and name in _PS_SAFE_VARS):
+            return None
+        if rest in ("", "/", "\\", "/*", "\\*", "/.", "\\.", "/.*", "\\.*"):
+            return "S01"
+        if shell == "powershell" and not var.group(1):
+            return "S04"
+    if not recursive:
+        return None
+    parts = [p for p in low.split("/") if p]
+    if parts and parts[-1] == ".." or parts.count("..") >= 2:
+        return "S18"
+    meaningful = [p for p in parts if p.strip("*.") and p != "~"]
+    if low.startswith("~/") and len(meaningful) <= 1 and parts[-1] not in _HOME_CACHES:
+        return "S02"
+    if low.startswith("/") and not low.startswith("//"):
+        if len(meaningful) <= 1 or meaningful[0] in _POSIX_SYSTEM_DIRS or (meaningful[0] in _POSIX_SHALLOW_DIRS and len(meaningful) <= 2):
+            return "S02"
+    drive = re.match(r"[a-z]:/(.*)\Z", low)
+    if drive:
+        inner = [p for p in drive.group(1).split("/") if p.strip("*.")]
+        if len(inner) <= 1 or inner[0] in _WINDOWS_SYSTEM_DIRS or (inner[0] == "users" and len(inner) <= 2):
+            return "S05"
+    return None
+
+
+def _check_delete(verb: str, args: list, shell: str, assigned: set):
+    """The rule a delete command breaks, or None."""
+    targets, recursive, filtered, skip = [], verb == "rimraf", False, False
+    for word in args:
+        if skip:
+            skip = False
+            continue
+        text, quoted, _lost = word
+        low = text.lower()
+        if not quoted and low.startswith("-") and len(low) > 1:
+            if low == "-whatif":
+                return None
+            if low in ("-path", "-literalpath", "-lp"):
+                continue
+            if low in ("-filter", "-include", "-exclude"):
+                filtered, skip = True, True
+                continue
+            if low == "--recursive" or low.startswith("-rec") or (re.fullmatch(r"-[a-z]{1,4}", low) and "r" in low and not low.startswith("-fo")):
+                recursive = True
+            continue
+        if not quoted and shell != "posix" and verb in _CMD_DELETE_VERBS and re.fullmatch(r"/[a-z](:\S*)?", low):
+            recursive = recursive or low.startswith("/s")
+            continue
+        parts = [p for p in text.split(",") if p] if shell == "powershell" and not quoted else []
+        targets.extend((part, quoted, word[2]) for part in parts or [text])
+    for target in targets:
+        rule = _bad_target(target, recursive, shell, assigned)
+        if rule and not (filtered and rule in ("S02", "S01")):
+            return rule
+    if recursive and len(targets) >= 2 and not targets[0][1]:
+        # C:\work\My Project read as two paths. On Linux, /tmp/a dist is a normal list.
+        first = targets[0][0]
+        windows = bool(re.match(r"[A-Za-z]:[\\/]|\\", first))
+        if windows or first.startswith("/"):
+            for text, quoted, _lost in targets[1:]:
+                relative = not quoted and not re.match(r"([A-Za-z]:)?[\\/]|\.", text) and "*" not in text
+                if relative and (windows or re.search(r"[\\/]", text)):
+                    return "S19"
+    return None
+
+
+def _check_git(args: list):
+    words = [w[0] for w in args]
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in ("-c", "-C") else 1
+    if i >= len(words):
+        return None
+    sub, rest = words[i].lower(), words[i + 1:]
+    low = [w.lower() for w in rest]
+    if sub == "reset" and "--hard" in low:
+        return "S11"
+    if sub == "checkout" and ("." in rest or "*" in rest) and (low[:1] == ["."] or "--" in low):
+        return "S11"
+    if sub == "restore" and ("." in rest or "*" in rest) and "--staged" not in low and "-s" not in low:
+        return "S11"
+    if sub == "clean":
+        flags = [w for w in rest if w.startswith("-")]
+        dry = any(w == "--dry-run" or re.fullmatch(r"-[a-zA-Z]*n[a-zA-Z]*", w) for w in flags)
+        force = any(w == "--force" or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", w) for w in flags)
+        ignored_only = any(re.fullmatch(r"-[a-zA-Z]*X[a-zA-Z]*", w) for w in flags)     # build output, easily made again
+        named = any(not w.startswith("-") and w not in (".", "*") for w in rest)
+        if force and not dry and not ignored_only and not named:
+            return "S11"
+    if sub == "rm" and any(w in (".", "*") for w in rest) and "--cached" not in low:
+        return "S11"
+    if sub == "push":
+        forced = any(w == "--force" or w == "-f" or re.fullmatch(r"-[a-z]*f[a-z]*", w) for w in low)
+        names = [w for w in low if not w.startswith("-")]
+        if forced and (len(names) < 2 or any(re.search(r"(^|[:+])(main|master)$", w) for w in names[1:])):
+            return "S12"
+        if any(w.startswith("+") and re.search(r"(main|master)$", w) for w in names[1:]):
+            return "S12"
+    if sub == "branch" and "-D" in rest:
+        return "S12"
+    if sub == "stash" and low[:1] in (["drop"], ["clear"]):
+        return "S12"
+    return None
+
+
+def _check_find(args: list, assigned: set):
+    words = [w[0] for w in args]
+    low = [w.lower() for w in words]
+    deletes = "-delete" in low
+    for flag in ("-exec", "-execdir", "-ok"):
+        if flag in low:
+            after = low[low.index(flag) + 1:low.index(flag) + 2]
+            deletes = deletes or (after and re.split(r"[\\/]", after[0])[-1] in _DELETE_VERBS)
+    if not deletes:
+        return None
+    start = next((w for w in args if not w[0].startswith("-")), None)
+    if start and start[0] not in (".", "./", ".\\"):     # a named folder is as scoped as rm -rf build
+        return "S13" if _bad_target(start, True, "posix", assigned) else None
+    filters = ("-name", "-iname", "-path", "-ipath", "-wholename", "-regex", "-iregex", "-newer", "-mtime", "-mmin", "-size", "-user")
+    return None if any(f in low for f in filters) else "S13"
+
+
+def _check_simple(segment: dict, shell: str, assigned: set, depth: int):
+    """One simple command against the rules, or None."""
+    words, redirects = segment["words"], segment["redirects"]
+    for target in redirects:
+        if any(ord(ch) < 32 for ch in target):
+            return "S10"
+        if re.match(r"/dev/(sd|hd|nvme|vd|xvd|disk|mmcblk)", target.lower()):
+            return "S14"
+    lasting = [target for target in redirects if not _TEMP_PATH_RE.search(target)]
+    if not words:
+        return "S09" if lasting else None       # "> file" alone empties it
+    verb, args = _verb_of(words)
+    low = [a[0].lower() for a in args]
+    if redirects and verb and verb not in ("echo", "printf") and any(a[0] == target for a in args for target in redirects):
+        return "S09"                            # sort a > a: the shell empties a first
+    if lasting and (verb in (":", "true") or (verb == "type" and low[:1] == ["nul"]) or (verb == "cat" and low[:1] == ["/dev/null"])):
+        return "S09"
+    if verb in _DELETE_VERBS:
+        rule = _check_delete(verb, args, shell, assigned)
+        if rule:
+            return rule
+        glued = segment.get("glued")
+        ends_on_path = args and (args[-1][1] or not args[-1][0].startswith(("-", "/" if shell != "posix" else "-")))
+        # In bash a line ending in a path is a normal script, so only a tab says damage there.
+        if ends_on_path and (glued == "tab" or (glued == "line" and shell != "posix")):
+            return "S10"
+        return None
+    if verb == "git":
+        return _check_git(args)
+    if verb == "find":
+        return _check_find(args, assigned)
+    helping = bool({"--help", "/?"} & set(low))     # not -h: that means halt to shutdown
+    if (verb.startswith("mkfs") or verb in _DISK_VERBS) and not helping:
+        return "S14"
+    if verb == "format" and any(re.fullmatch(r"[a-z]:", w) for w in low):
+        return "S14"
+    if verb == "dd" and any(re.match(r"of=/dev/(?!null\b|zero\b|stdout\b|stderr\b)", w) for w in low):
+        return "S14"
+    if verb in ("chmod", "chown", "icacls", "takeown") and any(w in ("-r", "--recursive", "/t", "/r") or re.fullmatch(r"-[a-z]*r[a-z]*", w) for w in low):
+        for arg in args:
+            if not arg[0].startswith("-") and _bad_target(arg, True, shell, assigned) in ("S02", "S05", "S18"):
+                return "S15"
+    if verb == "shutdown" and (helping or {"/a", "-a", "-c"} & set(low)):      # cancels one
+        return None
+    if verb in _SYSTEM_VERBS or (verb == "init" and low[:1] in (["0"], ["6"])):
+        return "S16"
+    if verb == "reg" and low[:1] == ["delete"]:
+        return "S16"
+    if verb == "remove-itemproperty" and any(w.startswith(("hklm:", "hkcu:")) for w in low):
+        return "S16"
+    if verb in ("iex", "invoke-expression"):
+        return "S17"
+    if words[0][0] == "&" and len(words) > 1 and words[1][0].startswith("$") and words[1][0][1:].lower() not in assigned:
+        return "S17"
+    if verb == "eval" and len(args) == 1 and re.fullmatch(r"\$\{?\w+\}?", args[0][0]):
+        return "S17"
+    if verb == "wsl":
+        i = 0
+        while i < len(args) and args[i][0].startswith("-"):
+            flag = args[i][0].lower()
+            if flag in ("--", "-e", "--exec"):
+                i += 1
+                break
+            i += 2 if flag in ("-d", "--distribution", "-u", "--user", "--cd") else 1
+        return _guard_command(" ".join(a[0] for a in args[i:]), "posix", depth + 1)
+    if verb in ("bash", "sh", "zsh", "dash", "ksh", "powershell", "pwsh", "cmd"):
+        inner_shell = "powershell" if verb in ("powershell", "pwsh") else "cmd" if verb == "cmd" else "posix"
+        if inner_shell == "powershell" and any(w == "-ec" or (w.startswith(("-e", "/e")) and "encodedcommand".startswith(w[1:])) for w in low):
+            return "S17"
+        flag = next((i for i, w in enumerate(low) if w in ("-c", "-command", "/c", "/k") or (inner_shell == "posix" and re.fullmatch(r"-[a-z]*c", w))), None)
+        if flag is not None and flag + 1 < len(args):
+            inner = " ".join(a[0] for a in args[flag + 1:])
+            if inner.startswith("$(") and inner_shell == "posix":
+                return "S17"
+            return _guard_command(inner, inner_shell, depth + 1)
+    return None
+
+
+def _guard_command(cmd: str, shell: str, depth: int = 0):
+    """The rule this command line breaks, or None."""
+    if depth > 3 or not isinstance(cmd, str) or not cmd.strip():
+        return None
+    fed_to_shells = []
+    if shell == "posix":
+        cmd, fed_to_shells = _strip_heredocs(cmd)
+    elif shell == "powershell":
+        cmd = _HERE_STRING_RE.sub("''", cmd)        # here-strings are text
+    # A JSON \t or \r inside a Windows path decodes to a control character.
+    if re.search(r"[A-Za-z]:[\t\r\f\b\v]|[A-Za-z]:[\\/][^\s\"']*[\t\r\f\b\v]\S", cmd):
+        return "S10"
+    if re.search(r"(?:^|[\s;&|])(?:bash|sh|zsh|dash|source|\.)\s+<\(\s*(?:curl|wget)\b", cmd):
+        return "S17"
+    segments, nested = _split_shell(cmd, shell)
+    assigned = _assigned_vars(cmd, shell)
+    for inner in nested + fed_to_shells:
+        rule = _guard_command(inner, shell, depth + 1)
+        if rule:
+            return rule
+    pipeline = []
+    for segment in segments:
+        rule = _check_simple(segment, shell, assigned, depth)
+        if rule:
+            return rule
+        verb, args = _verb_of(segment["words"])
+        if pipeline and verb in ("sh", "bash", "zsh", "dash"):
+            if any(v in ("curl", "wget", "iwr", "irm", "invoke-webrequest", "invoke-restmethod") for v, _a in pipeline):
+                return "S17"
+        if pipeline and verb == "xargs":
+            target = next((a[0].lower() for a in args if not a[0].startswith("-")), "")
+            filtered = any(v in ("grep", "rg", "findstr") or (v == "find" and "-name" in [w[0].lower() for w in a]) for v, a in pipeline)
+            if re.split(r"[\\/]", target)[-1] in _DELETE_VERBS and not filtered:
+                return "S13"
+        if pipeline and verb in ("set-content", "sc", "out-file", "tee", "tee-object"):     # Get-Content a | Set-Content a
+            read = {a[0].lower() for v, stage in pipeline if v in ("get-content", "gc", "cat", "type") for a in stage}
+            if any(a[0].lower() in read for a in args if not a[0].startswith("-")):
+                return "S09"
+        pipeline = pipeline + [(verb, args)] if segment["piped"] else []
+    return _check_listing_delete(segments)
+
+
+def _strip_heredocs(cmd: str):
+    """(the command without its heredoc bodies, the bodies a shell will run). A body is
+    text unless it feeds a shell: cat <<EOF prints it, bash <<EOF runs it."""
+    if "<<" not in cmd:
+        return cmd, []
+    lines, out, run, i = cmd.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        match = _HEREDOC_RE.search(line)
+        if not match or line[:match.start()].count('"') % 2 or line[:match.start()].count("'") % 2:
+            out.append(line)
+            continue
+        body = []
+        while i < len(lines) and lines[i].strip() != match.group(2):
+            body.append(lines[i])
+            i += 1
+        i += 1
+        out.append(line[:match.start()] + line[match.end():])
+        if re.search(r"(?:^|[|;&\s])(?:bash|sh|zsh|dash)\b", line[:match.start()]):
+            run.append("\n".join(body))
+    return "\n".join(out), run
+
+
+def _check_listing_delete(segments: list):
+    """Get-ChildItem -Recurse | Remove-Item, with nothing that narrows the list."""
+    listed = False
+    for segment in segments:
+        verb, args = _verb_of(segment["words"])
+        low = [a[0].lower() for a in args]
+        if verb in ("where-object", "where", "?"):
+            return None
+        if verb in _LISTING_VERBS and any(w.startswith("-rec") for w in low):
+            filtered = any(w.startswith(("-filt", "-inc", "-ex")) for w in low)
+            named = any(not w.startswith("-") and w.replace("\\", "/") not in (".", "./", "*", "./*") for w in low)
+            listed = listed or not (filtered or named)
+        elif listed and verb in _DELETE_VERBS:
+            targets = [w for w in low if not w.startswith("-")]
+            if not targets or targets[0] in ("$_", "$psitem", "$_.fullname", "$psitem.fullname"):
+                return "S06"
+    return None
+
+
+def _commands_in(args) -> list:
+    """Every command in a tool's arguments, in the shapes clients accept."""
+    found = []
+    if isinstance(args, str):
+        return [args]
+    if isinstance(args, list):
+        for item in args:
+            found.extend(_commands_in(item))
+        return found
+    if isinstance(args, dict):
+        if isinstance(args.get("command"), str) and isinstance(args.get("args"), list):
+            quoted = [f'"{a}"' if isinstance(a, str) and (" " in a or not a) else str(a) for a in args["args"]]
+            return [" ".join([args["command"]] + quoted)]
+        for key in _COMMAND_KEYS:
+            if key in args:
+                found.extend(_commands_in(args[key]))
+    return found
+
+
+def _paths_in(args):
+    if not isinstance(args, dict):
+        return
+    for key in ("path", "file_path", "target_file"):
+        if isinstance(args.get(key), str):
+            yield args[key]
+    for key in ("files", "edits", "paths", "file_paths"):
+        items = args.get(key)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, str):
+                    yield item
+                else:
+                    yield from _paths_in(item)
+
+
+def guard_tool_call(name: str, arguments: str, shell: str, allow=()):
+    """(rule id, the command it is about), or (None, None) when the call may go ahead."""
+    guarded = (name or "").lower() in _GUARDED_TOOLS
+    if isinstance(arguments, str) and not arguments.strip():
+        return None, None       # nothing to run, and nothing a repair could invent
+    try:
+        args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except ValueError:
+        # A client's lenient repair can turn C:\Users into C:Users, or run half a batch.
+        hits = guarded or any(f'"{key}"' in (arguments or "") for key in _COMMAND_KEYS)
+        return ("A1", None) if hits and "A1" not in allow else (None, None)
+    tool_shell = {"bash": "posix", "powershell": "powershell"}.get((name or "").lower(), shell)
+    commands = [args] if isinstance(args, str) and guarded else _commands_in(args) if isinstance(args, dict) else _commands_in(args) if guarded else []
+    for command in commands:
+        rule = _guard_command(command, tool_shell)
+        if rule and rule not in allow:
+            return rule, command
+    if "S10" not in allow:
+        for path in _paths_in(args):
+            if any(ord(ch) < 32 for ch in path):
+                return "S10", path
+    return None, None
+
+
+def _parse_tool_blocks(text: str, tools=None):
+    """Tool calls written out as text: ([{name, arguments}], any prose after them), or
+    None unless every call is complete. Parameter bytes are never edited."""
+    calls, pos, n = [], 0, len(text)
+    tools = tools or {}
+
+    def skip(at):
+        while at < n and text[at].isspace():
+            at += 1
+        return at
+
+    while True:
+        pos = skip(pos)
+        wrapped = text.startswith("<tool_call>", pos)
+        if wrapped:
+            pos = skip(pos + len("<tool_call>"))
+        if text.startswith("<function=", pos):
+            close = text.find(">", pos)
+            if close < 0:
+                return None
+            name = text[pos + len("<function="):close].strip()
+            if not _TOOL_NAME_RE.match(name):
+                return None
+            pos, params = close + 1, {}
+            schema = (tools.get(name) or {}).get("parameters")
+            known = schema.get("properties") if isinstance(schema, dict) else None
+            while True:
+                pos = skip(pos)
+                if text.startswith("</function>", pos):
+                    pos += len("</function>")
+                    break
+                if not text.startswith("<parameter=", pos):
+                    return None
+                close = text.find(">", pos)
+                if close < 0:
+                    return None
+                key = text[pos + len("<parameter="):close].strip()
+                if not _TOOL_NAME_RE.match(key) or key in params:
+                    return None
+                start = close + 1
+                start += 2 if text.startswith("\r\n", start) else 1 if text.startswith("\n", start) else 0
+                end = _PARAM_CLOSE_RE.search(text, start)
+                # The tag itself inside a value: a parameter the tool doesn't have isn't a real next one.
+                while end and isinstance(known, dict):
+                    following = re.compile(r"<parameter=([^>]*)>").match(text, end.end())
+                    if not following or following.group(1).strip() in known:
+                        break
+                    end = _PARAM_CLOSE_RE.search(text, end.end())
+                if not end:
+                    return None
+                value = text[start:end.start()]
+                params[key] = value[:-2] if value.endswith("\r\n") else value[:-1] if value.endswith("\n") else value
+                pos = end.start() + len("</parameter>")
+            calls.append({"name": name, "params": params})
+        elif wrapped and text.startswith("{", pos):     # {"name": ..., "arguments": {...}}
+            close = text.find("</tool_call>", pos)
+            if close < 0:
+                return None
+            try:
+                obj = json.loads(text[pos:close])
+            except ValueError:
+                return None
+            name = obj.get("name") if isinstance(obj, dict) else None
+            args = obj.get("arguments", obj.get("parameters", {})) if isinstance(obj, dict) else None
+            if not isinstance(name, str) or not _TOOL_NAME_RE.match(name) or not isinstance(args, (dict, str)):
+                return None
+            calls.append({"name": name, "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)})
+            pos = close
+        else:
+            return None
+        pos = skip(pos)
+        if text.startswith("</tool_call>", pos):
+            pos = skip(pos + len("</tool_call>"))
+        elif wrapped and pos < n and not text.startswith(_TOOL_TRIGGERS, pos):
+            return None
+        if not text.startswith(_TOOL_TRIGGERS, pos):
+            break
+    trailing = text[pos:]
+    return None if any(t in trailing for t in _TOOL_TRIGGERS) else (calls, trailing)
+
+
+def _decode_params(call: dict, tools: dict) -> str:
+    """The call's arguments as a JSON string, typed by the tool's schema where known. A
+    value that doesn't fit stays as written, and the client tells the model what's wrong."""
+    if "arguments" in call:
+        return call["arguments"]
+    function = tools.get(call["name"]) or {}
+    parameters = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+    schema = parameters.get("properties") if isinstance(parameters.get("properties"), dict) else {}
+    out = {}
+    for key, value in call["params"].items():
+        spec = schema.get(key) if isinstance(schema.get(key), dict) else {}
+        kinds = spec.get("type")
+        kinds = {kinds} if isinstance(kinds, str) else set(kinds) if isinstance(kinds, list) else set()
+        if "string" in kinds and not kinds & {"array", "object", "number", "integer", "boolean"}:
+            out[key] = value
+            continue
+        stripped = value.strip()
+        if stripped[:1] in ("[", "{", '"') or stripped in ("true", "false", "null") or _NUMBER_RE.match(stripped):
+            try:
+                out[key] = json.loads(stripped)
+                continue
+            except ValueError:
+                pass
+        out[key] = value
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _tools_shell(tools: dict) -> str:
+    """Which shell the client runs commands in, from how its tool describes itself."""
+    for function in tools.values():
+        description = function.get("description") if isinstance(function.get("description"), str) else ""
+        said = re.search(r"run through ([^;]*)", description, re.I)
+        text = (said.group(1) if said else "").lower()
+        if "powershell" in text or "pwsh" in text:
+            return "powershell"
+        if "cmd.exe" in text:
+            return "cmd"
+    return "posix"
+
+
+class ToolHealer:
+    """Reads one /chat/completions reply on its way to the client, in memory.
+
+    A reply with nothing to repair passes unchanged; only text that could have started
+    a call may arrive split differently. From the moment a reply looks like a tool call
+    it is held, because a client must only ever receive a call that is whole and safe to
+    run. A failure in here hands over what is held, as it came."""
+
+    def __init__(self, cfg: dict, data: dict):
+        self.allow = set(cfg.get("allow_rules") or []) if cfg.get("guard", True) else None
+        self.tools = {}
+        for tool in data.get("tools") or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                self.tools[function["name"]] = function
+        self.shell = _tools_shell(self.tools)
+        self.result = {}            # counts and a rule id, for stats and the log
+        self._line = bytearray()
+        self._event_lines = []
+        self._tail = ""             # sent content stops here: this much could still start a call
+        self._mid_line = False
+        self._fence = False
+        self._text = None           # held content, from where a call seems to start
+        self._text_size = 0
+        self._native = {}           # index -> id, name, arguments of structured calls
+        self._held = []             # raw events that wait for the verdict
+        self._after = []            # raw events after the finish reason
+        self._finish = None
+        self._finish_obj = {}
+        self._template = {}
+        self._rewrite_native = False
+        self._resolved = False
+        self._done = False
+        self._broken = False
+        self._last_write = time.time()
+
+    # ── building replies ────────────────────────────────────────────────
+    def _chunk(self, delta: dict, finish=None, extra=None) -> bytes:
+        obj = {**self._template, "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **(extra or {})}
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+    def _tool_chunks(self, calls: list) -> bytes:
+        out = [self._chunk({"tool_calls": [{"index": i, "id": f"call_gw_{i + 1}", "type": "function",
+                                            "function": {"name": call["name"], "arguments": call["arguments"]}}]})
+               for i, call in enumerate(calls)]
+        usage = {k: self._finish_obj[k] for k in ("usage", "timings") if k in self._finish_obj}
+        out.append(self._chunk({}, "tool_calls", usage))
+        return b"".join(out) + b"".join(self._after)
+
+    def _stopped_call(self, rule: str, command) -> dict:
+        reason = _GUARD_REASONS.get(rule, "it looked unsafe")
+        function = self.tools.get("ask_question")
+        properties = ((function or {}).get("parameters") or {}).get("properties") or {}
+        if rule not in _STOP_NAMES and "question" in properties and "options" in properties:
+            shown = f"\n\n{command[:300]}" if command else ""
+            return {"name": "ask_question", "arguments": json.dumps({
+                "question": f"The gateway stopped a command because {reason} (rule {rule}).{shown}\n\nWhat should happen next?",
+                "options": ["Skip it and try another way", "I'll run it myself"]}, ensure_ascii=False)}
+        slug = _STOP_NAMES.get(rule, "destructive_command_was_not_run")
+        return {"name": f"gateway_stopped_{rule}_{slug}", "arguments": "{}"}
+
+    # ── the verdict ─────────────────────────────────────────────────────
+    def _judge(self, calls: list):
+        if self.allow is None:
+            return None, None
+        for call in calls:
+            rule, command = guard_tool_call(call["name"], call["arguments"], self.shell, self.allow)
+            if rule:
+                return rule, command
+        return None, None
+
+    def _stop(self, rule: str, command=None) -> bytes:
+        self.result = {"stopped": 1, "rule": rule}
+        return self._tool_chunks([self._stopped_call(rule, command)])
+
+    def _was_cut(self) -> bool:
+        """An engine may leave the finish reason out: [DONE] then says the reply ended well."""
+        return self._finish not in ("stop", "tool_calls", "function_call") if self._finish else not self._done
+
+    def _resolve_native(self) -> bytes:
+        calls = [self._native[i] for i in sorted(self._native)]
+        if self.allow is not None and self._was_cut() and "T1" not in self.allow:
+            for call in calls:
+                if call["name"].lower() in _GUARDED_TOOLS or any(f'"{k}"' in call["arguments"] for k in _COMMAND_KEYS):
+                    return self._stop("T1")
+        rule, command = self._judge(calls)
+        if rule:
+            return self._stop(rule, command)
+        if self._rewrite_native:
+            return self._tool_chunks(calls)
+        return b"".join(self._held) + b"".join(self._after)
+
+    def _resolve_text(self) -> bytes:
+        text = "".join(self._text)
+        parsed = _parse_tool_blocks(text, self.tools)
+        if parsed is None or self._was_cut():
+            self.result = {"left": 1, "rule": "T1"} if self._was_cut() else {"left": 1}
+            return self._flush_text(text)
+        blocks, trailing = parsed
+        calls = [{"name": b["name"], "arguments": _decode_params(b, self.tools)} for b in blocks]
+        rule, command = self._judge(calls)
+        if rule:
+            return self._stop(rule, command)
+        self.result = {"healed": len(calls), "unknown": sum(1 for c in calls if c["name"] not in self.tools)}
+        prose = self._chunk({"content": trailing}) if trailing.strip() else b""
+        return prose + self._tool_chunks(calls)
+
+    def _flush_text(self, text: str) -> bytes:
+        finish = b"".join(self._held)
+        return (self._chunk({"content": text}) if text else b"") + finish + b"".join(self._after)
+
+    def _resolve(self) -> bytes:
+        if self._resolved:
+            return b""
+        self._resolved = True
+        if self._native:
+            return (self._chunk({"content": self._tail + "".join(self._text or [])}) if self._tail or self._text else b"") + self._resolve_native()
+        if self._text is not None:
+            return self._resolve_text()
+        return self._flush_text(self._tail)
+
+    # ── content as it arrives ───────────────────────────────────────────
+    def _scan(self, content: str) -> str:
+        """What can be sent now. From a call's opening on, content is held."""
+        buf, pos, sent = self._tail + content, 0, []
+        self._tail = ""
+        while pos < len(buf):
+            end = buf.find("\n", pos)
+            line = buf[pos:] if end < 0 else buf[pos:end + 1]
+            if self._mid_line:
+                sent.append(line)
+                self._mid_line = end < 0
+                pos += len(line)
+                continue
+            stripped = line.lstrip(" \t")
+            indent = len(line) - len(stripped)
+            if not self._fence and indent <= 3 and stripped.startswith(_TOOL_TRIGGERS):
+                self._text = [buf[pos:]]
+                self._text_size = len(buf) - pos
+                return "".join(sent)
+            if stripped.startswith(_FENCES):
+                self._fence = not self._fence
+                self._mid_line = end < 0
+            elif end < 0:
+                undecided = not stripped or any(t.startswith(stripped) for t in _TOOL_TRIGGERS + _FENCES)
+                if undecided and indent <= 3:
+                    self._tail = buf[pos:]
+                    return "".join(sent)
+                self._mid_line = True
+            sent.append(line)
+            pos += len(line)
+        return "".join(sent)
+
+    def _hold_text(self, content: str):
+        self._text.append(content)
+        self._text_size += len(content)
+        if self._text_size > _HEAL_MAX_HOLD:
+            raise OverflowError("held reply too long")
+
+    # ── one SSE event ───────────────────────────────────────────────────
+    def _holding(self) -> bool:
+        return self._text is not None or bool(self._native)
+
+    def _event(self, raw: bytes) -> bytes:
+        data = None
+        for line in raw.split(b"\n"):
+            if line.startswith(b"data:"):
+                data = line[5:].strip()
+                break
+        if data is None:
+            return raw
+        if data == b"[DONE]":
+            self._done = True
+            return self._resolve() + raw
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            return raw
+        if not isinstance(obj, dict) or not isinstance(obj.get("choices"), list):
+            return raw
+        for key in ("id", "created", "model"):
+            if key in obj:
+                self._template[key] = obj[key]
+        choices = obj["choices"]
+        if not choices:                                 # usage arrives after the finish reason
+            if self._holding() or self._tail:
+                self._after.append(raw)
+                return b""
+            return raw
+        if len(choices) != 1:
+            raise ValueError("more than one choice")
+        choice = choices[0]
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        out = []
+        content = delta.get("content")
+        pass_raw = True
+        if isinstance(content, str) and content:
+            if self._text is not None:
+                self._hold_text(content)
+                sent = ""
+            else:
+                sent = self._scan(content)
+            if sent != content:
+                pass_raw = False
+                rest = {k: v for k, v in delta.items() if k != "content"}
+                if sent:
+                    rest["content"] = sent
+                if any(v for k, v in rest.items()):
+                    out.append(b"data: " + json.dumps({**obj, "choices": [{**choice, "delta": rest, "finish_reason": None}]},
+                                                      ensure_ascii=False).encode("utf-8") + b"\n\n")
+        calls = delta.get("tool_calls")
+        finish_in_held = False
+        if isinstance(calls, list) and calls:
+            self._note_native(calls)
+            if pass_raw:                # the raw event carries any finish reason with it
+                self._held.append(raw)
+                finish_in_held = True
+            else:
+                self._held.append(b"data: " + json.dumps({**obj, "choices": [{**choice, "delta": {"tool_calls": calls}, "finish_reason": None}]},
+                                                         ensure_ascii=False).encode("utf-8") + b"\n\n")
+            pass_raw = False
+        finish = choice.get("finish_reason")
+        if finish:
+            self._finish = finish
+            self._finish_obj = obj
+            if self._holding() or self._tail:
+                if not finish_in_held:
+                    self._held.append(self._finish_event(obj, choice))
+                return b"".join(out)
+            if not pass_raw:
+                out.append(self._finish_event(obj, choice))
+        return raw if pass_raw else b"".join(out)
+
+    @staticmethod
+    def _finish_event(obj: dict, choice: dict) -> bytes:
+        return b"data: " + json.dumps({**obj, "choices": [{**choice, "delta": {}}]}, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+    def _note_native(self, calls: list):
+        for item in calls:
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index", 0)
+            call = self._native.setdefault(index, {"name": "", "arguments": ""})
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            if isinstance(function.get("name"), str):
+                call["name"] += function["name"]
+            args = function.get("arguments")
+            if isinstance(args, str):
+                call["arguments"] += args
+            elif args is not None:      # an object where a string belongs: send it once, as a string
+                call["arguments"] = json.dumps(args, ensure_ascii=False)
+                self._rewrite_native = True
+
+    # ── the stream ──────────────────────────────────────────────────────
+    def feed(self, chunk: bytes) -> bytes:
+        if self._broken:
+            return chunk
+        self._line.extend(chunk)
+        out = []
+        try:
+            while True:
+                at = self._line.find(b"\n")
+                if at < 0:
+                    break
+                line = bytes(self._line[:at + 1])
+                del self._line[:at + 1]
+                self._event_lines.append(line)
+                if not line.strip():
+                    raw = b"".join(self._event_lines)
+                    self._event_lines = []
+                    try:
+                        out.append(self._event(raw))
+                    except OverflowError:       # this event's text is already among what is held
+                        return b"".join(out) + self._give_up()
+                    except Exception:
+                        return b"".join(out) + self._give_up(raw)
+            if len(self._line) > _HEAL_MAX_HOLD:
+                raise OverflowError("line too long")
+            sent = b"".join(out)
+            now = time.time()
+            if sent:
+                self._last_write = now
+            elif self._holding() and now - self._last_write >= _HEAL_KEEPALIVE_S:
+                self._last_write = now
+                sent = self._chunk({})
+            return sent
+        except Exception:
+            return b"".join(out) + self._give_up()
+
+    def _give_up(self, current: bytes = b"") -> bytes:
+        """Something unexpected: from here on the reply passes as it came."""
+        self._broken = True
+        self._resolved = True
+        self.result = {}
+        if self._text is not None or self._tail:
+            head = self._chunk({"content": self._tail + "".join(self._text or [])})
+        else:
+            head = b""
+        out = head + b"".join(self._held) + b"".join(self._after) + current + b"".join(self._event_lines) + bytes(self._line)
+        self._held, self._after, self._event_lines, self._line = [], [], [], bytearray()
+        self._text, self._tail = None, ""
+        return out
+
+    def finish(self) -> bytes:
+        """The upstream has ended. A reply that never finished is never healed."""
+        if self._broken:
+            return b""
+        out = b""
+        leftover = b"".join(self._event_lines) + bytes(self._line)
+        self._event_lines, self._line = [], bytearray()
+        try:
+            if leftover.strip():
+                out = self._event(leftover)
+                leftover = b""
+            return out + self._resolve()
+        except OverflowError:
+            return out + self._give_up()
+        except Exception:
+            return out + self._give_up(leftover)
+
+    # ── a whole reply ───────────────────────────────────────────────────
+    def rewrite_body(self, raw: bytes) -> bytes:
+        """The same for a reply that isn't streamed; unchanged replies stay byte for byte."""
+        try:
+            obj = json.loads(raw)
+            choices = obj.get("choices") if isinstance(obj, dict) else None
+            if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0].get("message"), dict):
+                return raw
+            choice, message = choices[0], choices[0]["message"]
+            finish = choice.get("finish_reason")
+            calls = message.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                found = []
+                for item in calls:
+                    function = item.get("function") or {}
+                    args = function.get("arguments", "")
+                    found.append({"name": str(function.get("name") or ""), "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)})
+                rule, command = self._judge(found)
+                if not rule and self.allow is not None and finish == "length":
+                    rule = "T1" if any(c["name"].lower() in _GUARDED_TOOLS for c in found) and "T1" not in self.allow else None
+                if rule:
+                    return self._stopped_body(obj, choice, message, rule, command, None)
+                if any(not isinstance((c.get("function") or {}).get("arguments", ""), str) for c in calls):
+                    for item, call in zip(calls, found):
+                        item["function"]["arguments"] = call["arguments"]
+                    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                return raw
+            content = message.get("content")
+            if not isinstance(content, str) or not content:
+                return raw
+            prose = self._scan(content)
+            if self._text is None:
+                return raw
+            text = "".join(self._text)
+            parsed = _parse_tool_blocks(text, self.tools)
+            cut = finish not in ("stop", "tool_calls", "function_call", None)
+            if parsed is None or cut:
+                self.result = {"left": 1, "rule": "T1"} if cut else {"left": 1}
+                return raw
+            blocks, trailing = parsed
+            found = [{"name": b["name"], "arguments": _decode_params(b, self.tools)} for b in blocks]
+            rule, command = self._judge(found)
+            if rule:
+                return self._stopped_body(obj, choice, message, rule, command, prose)
+            self.result = {"healed": len(found), "unknown": sum(1 for c in found if c["name"] not in self.tools)}
+            message["content"] = (prose + trailing) if (prose + trailing).strip() else None
+            message["tool_calls"] = [{"id": f"call_gw_{i + 1}", "type": "function",
+                                      "function": {"name": c["name"], "arguments": c["arguments"]}} for i, c in enumerate(found)]
+            choice["finish_reason"] = "tool_calls"
+            return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            self.result = {}
+            return raw
+
+    def _stopped_body(self, obj, choice, message, rule, command, prose) -> bytes:
+        self.result = {"stopped": 1, "rule": rule}
+        call = self._stopped_call(rule, command)
+        message["content"] = prose if prose and prose.strip() else None
+        message["tool_calls"] = [{"id": "call_gw_1", "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}]
+        choice["finish_reason"] = "tool_calls"
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+def _new_healer(ep: dict, command: str, path: str, data):
+    """A healer for this request, or None: most requests pass untouched."""
+    try:
+        cfg = ep.get("tool_heal")
+        if not isinstance(cfg, dict) or not cfg.get("enabled") or command != "POST" or not isinstance(data, dict):
+            return None
+        if not path.rstrip("/").endswith("/chat/completions") or data.get("tool_choice") == "none" or data.get("n") not in (None, 1):
+            return None
+        tools = data.get("tools")
+        return ToolHealer(cfg, data) if isinstance(tools, list) and tools else None
+    except Exception:
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3163,6 +4448,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         kv_ok = False
         client_gone = False
         stat = _stats.begin(target_endpoint, self.command, path, req_json, self.address_string(), self.headers)
+        healer = _new_healer(target_endpoint, self.command, path, req_json)
         try:
             # Before forwarding: put the right conversation in the engine's slot
             # (kv_sessions endpoints only; holds the engine until _kv_end).
@@ -3177,6 +4463,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             kv_ok = response.status < 400
             if stat:
                 stat.status = response.status
+            if response.status >= 400:
+                healer = None
+
+            # A reply that isn't streamed has to be whole before it can be judged.
+            whole_body = None
+            if healer and not streaming:
+                whole_body = bytearray()
+                while len(whole_body) <= _TAP_MAX_BODY:
+                    chunk = response.read1(65536)
+                    if not chunk:
+                        break
+                    whole_body.extend(chunk)
+                else:
+                    healer = None       # too big to judge: the rest follows below as it came
+            first_bytes = bytes(whole_body) if whole_body is not None else b""
+            if first_bytes and stat:
+                stat.tap.feed(first_bytes, False)
+            replaced = healer.rewrite_body(first_bytes) if healer and not streaming else None
 
             # Send status + CORS + upstream response headers
             self.send_response(response.status)
@@ -3185,25 +4489,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
             for header, value in response.getheaders():
                 if header.lower() in ("transfer-encoding", "connection"):
                     continue
+                if header.lower() == "content-length" and healer:
+                    continue            # the healer may change the length
                 self.send_header(header, value)
+            if replaced is not None:
+                self.send_header("Content-Length", str(len(replaced)))
             self.end_headers()
             headers_sent = True
 
             # Stream response body (SSE-safe): read1 hands over whatever has
             # arrived instead of waiting for a full buffer, so tokens reach
             # the client as the upstream sends them.
+            pending = replaced if replaced is not None else first_bytes
             while True:
-                chunk = response.read1(65536)
-                if not chunk:
+                if pending:
+                    chunk, pending = pending, b""
+                    outgoing = chunk
+                elif replaced is not None:
                     break
-                if stat:
-                    stat.tap.feed(chunk, streaming)
+                else:
+                    chunk = response.read1(65536)
+                    if not chunk:
+                        break
+                    if stat:
+                        stat.tap.feed(chunk, streaming)
+                    outgoing = healer.feed(chunk) if healer else chunk
                 try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    if outgoing:
+                        self.wfile.write(outgoing)
+                        self.wfile.flush()
                 except OSError:
                     client_gone = True
                     raise
+            if healer and streaming:
+                outgoing = healer.finish()
+                try:
+                    if outgoing:
+                        self.wfile.write(outgoing)
+                        self.wfile.flush()
+                except OSError:
+                    client_gone = True
+                    raise
+            if healer and stat:
+                stat.heal = healer.result
 
             if not stat:  # a counted request gets a fuller line when its numbers are in
                 self._log(f"→ {ep_name} [{response.status}]")
@@ -3868,6 +5196,8 @@ def render_live(snap: dict) -> RichText:
     if kv:
         rows.append(_line("Swaps", f"{kv.get('continued', 0)} kept · {kv.get('restores', 0)} restored · "
                                    f"{_plural(kv.get('sessions', 0), 'chat')}, {fmt_bytes(kv.get('bytes', 0))}"))
+        if kv.get("suspended"):
+            rows.append(_line("Swap", ("off until the model is reloaded: ", _YELLOW_BOLD), (kv["suspended"]["reason"], _YELLOW)))
     life = gw.get("all_time") or {}
     if life.get("saved_s"):
         rows.append(_line("Saved", (f"≈ {fmt_secs(life['saved_s'])}", _GREEN_BOLD), " of prompt reading"))
@@ -3877,6 +5207,9 @@ def render_live(snap: dict) -> RichText:
     errors = today.get("errors", 0)
     rows.append(_line("Today", f"{today.get('requests', 0)} req · {fmt_count(today.get('prompt', 0))} in · "
                                f"{fmt_count(today.get('out', 0))} out · ", (_plural(errors, "error"), _RED_BOLD if errors else "dim")))
+    if today.get("healed") or today.get("stopped"):
+        rows.append(_line("Tools", f"{_plural(today.get('healed', 0), 'call')} healed · ",
+                          (f"{today.get('stopped', 0)} stopped", _YELLOW_BOLD if today.get("stopped") else "dim")))
     recent = gw.get("recent") or []
     if recent:
         last = recent[0]
@@ -3919,6 +5252,14 @@ def panel_engine(snap: dict):
         rows.append(_line("Last swap", (kv["last_event"], "dim")))
     if kv.get("paused"):
         rows.append(_line("Swap", (f"paused for {kv['paused']} s (see the log)", _YELLOW)))
+    if kv.get("suspended"):
+        s = kv["suspended"]
+        left = fmt_secs(max(0, s["until"] - time.time()))
+        rows.append(_line("Swap", (f"off until the model is reloaded, or for {left}", _YELLOW_BOLD)))
+    error = kv.get("last_error")
+    if error:
+        rows.append(_line("Swap error", (f"{error['action']} failed {_ago(error['time'], time.time())}: "
+                                         f"{error['status'] or ''} {error['message']}".replace("  ", " "), _RED if kv.get("suspended") else "dim")))
     return _lines(rows)
 
 
@@ -4056,6 +5397,9 @@ def panel_totals(snap: dict):
     table.add_row("Time saved", *[RichText("≈ " + fmt_secs(g.get("saved_s", 0)) if g.get("saved_s") else "—", style=_GREEN) for g in groups])
     if any(g.get("cost") for g in groups):
         table.add_row("Cloud cost", *[f"${g.get('cost', 0):.2f}" for g in groups])
+    if any(g.get("healed") or g.get("stopped") for g in groups):
+        table.add_row("Calls healed", *[f"{g.get('healed', 0):,}" for g in groups])
+        table.add_row("Calls stopped", *[RichText(f"{g.get('stopped', 0):,}", style=_YELLOW_BOLD if g.get("stopped") else "dim") for g in groups])
     since = (gw.get("all_time") or {}).get("since")
     if since:
         return RichGroup(table, RichText(f"All time since {time.strftime('%d %b %Y', time.localtime(since))}", style="dim"))
@@ -4131,6 +5475,10 @@ def panel_recent(snap: dict):
     for r in recent[:12]:
         cached = _pct(r.get("cached"), r.get("prompt"))
         status = "stopped" if r.get("cancelled") else str(r.get("status") or "failed")
+        if r.get("stopped"):
+            status = f"guard {r.get('heal_rule')}"
+        elif r.get("healed"):
+            status += " healed"
         swap = r.get("swap") or ""
         swap_text = {"restored": f"restored {fmt_secs(r.get('swap_s'))}", "continued": "kept",
                      "new": f"new, saved {fmt_secs(r.get('swap_s'))}" if r.get("swap_s") else "new"}.get(swap, "—")

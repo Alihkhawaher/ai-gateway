@@ -99,6 +99,7 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - Live proxy log showing all requests
 - Endpoint status panel (online/offline with model counts) and a per-endpoint **load** column — in-flight requests and total requests served (e.g. `⚡ 2 active · 17 total`, `idle · 12 total`, `—` if never used)
 - [Live stats](#live-stats) beside the endpoint list, and a full dashboard on `d`: cache hits, speed, GPU, saved chats, and totals per app and model
+- [Tool calls healed and stopped](#tool-call-healing) are counted beside the other live stats
 - Settings with model selection, port, bind address, fetch top models toggle
 - Footer key bindings: `s` Settings, `d` Dashboard, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
 - Consistent scrollable layout across all screens
@@ -283,7 +284,9 @@ The gateway finds the engine's port and key in Strata's own run files on each re
 - The engine still runs one request at a time, so apps take turns.
 - A chat comes back in full only if the app resends the same history. If it trims or rewrites older messages, the part after the first change is read again.
 
-The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
+The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. The index also records which chat the engine holds, so restarting the gateway doesn't make it forget. The first request after a restart checks that record against the engine's own token count. If the engine holds a long chat (`min_tokens` or more) that the gateway can't identify, no saved chat is restored over it, because it may be the same chat, newer than its saved copy. If another app uses the engine directly, the next switch back to a saved chat therefore reads it again once. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
+
+If the engine answers a save or restore with an error 500, swapping turns off until the model is reloaded, or for 30 minutes. Strata 0.1.57 can get into a state where every snapshot fails with `conversation snapshot: invalid K/V extent`. The console then shows **Swap: off until the model is reloaded** with the engine's reason, and `GET /stats` has it under `kv_sessions` as `suspended` and `last_error`. Reloading the model in Strata brings saving back.
 
 ## Live Stats
 
@@ -311,6 +314,72 @@ Where the numbers come from:
 No chat text is kept. The gateway reads token counts and timings from responses and passes the bytes on unchanged, and engine data is copied field by field from a fixed list. `gateway-stats.json`, beside `config.json` and gitignored, holds the all-time totals: counts plus endpoint, model and app names, with daily rows for 30 days. It's written every 30 seconds and on exit. Delete it to start the totals over.
 
 `GET /stats` returns the same numbers as JSON. Like `/health` it needs no key, and it includes client addresses and app names, so anyone who can reach the gateway can read them.
+
+## Tool Call Healing
+
+Local models sometimes write a tool call out as plain text instead of making a real tool call. The client shows the text, nothing runs, and the turn ends. Damaged calls can also do harm: a client's own repair can turn `rm -rf C:\Users\me` into `rm -rf C:Usersme`.
+
+Turn healing on per endpoint:
+
+```json
+{ "name": "strata", "type": "strata", "host": "127.0.0.1:47831", "tool_heal": { "enabled": true } }
+```
+
+It's off by default, and then every reply passes byte for byte. When it's on, it only touches `/chat/completions` requests that offer tools. A reply with nothing to repair keeps every character, though text that could have started a call may arrive split differently.
+
+| The model replies with | What the client receives |
+|---|---|
+| A complete call written as text, with a real tool name | A proper tool call, which runs |
+| A complete call written as text, with a name the client doesn't have | A proper tool call under that same name. Nothing runs, and the client tells the model which tools exist, so it can correct itself |
+| A call in a code fence, or a tag mentioned in a sentence | The text, unchanged: that's a quotation |
+| A written call that is incomplete or was cut off | The text, unchanged. It never runs |
+| A proper tool call that is safe | The same bytes, held until the whole call has arrived |
+| A command the guard stops | A question to you, or a message to the model (below) |
+
+Tool names are never guessed, and parameter values are never edited.
+
+### The command guard
+
+Every call that would run is checked, healed or not, for accidents that come from errors. It splits commands the way bash, PowerShell or cmd would, using the shell the client's tool says it runs, so `grep -rn "rm -rf" src/` passes and `rm -rf ./dist` passes.
+
+| Rule | What it stops | Example |
+|---|---|---|
+| A1 | Broken arguments on a command or file tool, because a client's repair can change what they mean | `{"commands":["rm -rf ./x", ]}` |
+| T1 | A command or file call in a reply that was cut off | `finish_reason: length` |
+| S01 | Deleting a path that is only a variable | `rm -rf "$DIR/"` |
+| S02, S05 | Deleting a root, home, drive, system or top-level folder | `rm -rf ~`, `Remove-Item C:\ -Recurse` |
+| S03 | A path that lost its backslashes | `rm -rf c:demo` |
+| S04 | A PowerShell variable that was never set, so the path starts at the drive root | `Remove-Item "$dir\build" -Recurse` |
+| S06, S13 | Deleting an unfiltered list | `Get-ChildItem -Recurse \| Remove-Item`, `find . -delete` |
+| S09 | A redirect that empties a file | `sort data.txt > data.txt` |
+| S10 | A control character in a path, usually a damaged `\n` or `\t` | `C:\temp` decoded with a tab |
+| S11, S12 | Losing uncommitted work or history | `git reset --hard`, `git push --force origin main` |
+| S14, S15, S16 | Disks, root permissions, shutting down, registry deletes | `mkfs`, `chmod -R 777 /`, `reg delete` |
+| S17 | Commands that can't be read | `curl … \| sh`, `iex`, `powershell -enc` |
+| S18, S19, S20 | Paths that climb out, unquoted spaces, empty paths | `rm -rf ../..`, `rm -rf ""` |
+
+When a command is stopped, nothing of it reaches the client:
+
+- **If the client offers `ask_question`,** you're shown the command and the reason, and your answer goes back to the model. The guard has no override, so a command you really want is yours to run yourself.
+- **Otherwise, and for A1 and T1,** the model receives a call to a tool named like `gateway_stopped_S02_destructive_command_was_not_run`. The client answers that the tool doesn't exist, and the turn carries on with the rule in view.
+
+Options, inside `tool_heal`:
+
+| Option | Default | Effect |
+|---|---|---|
+| `guard` | `true` | `false` keeps the healing and turns off every check |
+| `allow_rules` | `[]` | Rule ids to let through, such as `["S11"]` |
+
+### What this can't do
+
+- **It catches accidents, not intent.** A command can always hide what it does, for example inside a script or `npm run clean`. Keep your client's approval settings on.
+- **It doesn't know the working folder,** so `rm -rf build` in the wrong folder passes.
+- **In bash, a line break can't be told from a damaged `\n`,** because multi-line scripts are normal there. PowerShell and cmd ask you when a delete's path runs straight into a line break, so a script with a delete like that gets a question. Put `-Recurse` last or use `;` to avoid it.
+- **A made-up tool name costs one retry,** and the model has to write the call again.
+- **Calls are held until they're complete,** so a long file edit appears all at once rather than streaming. Keep-alive chunks are sent while it waits.
+- **It only reads `/chat/completions` replies.** `/v1/messages` and `/v1/responses` pass untouched, and so does anything the engine serves directly.
+
+Nothing about a reply is kept. The log and stats get counts and rule ids only.
 
 ## Connecting Clients
 
