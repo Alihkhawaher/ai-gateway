@@ -152,7 +152,7 @@ The console's **Live** panel, its `d` dashboard (`StatsScreen`) and `GET /stats`
 Rules that must hold:
 
 1. **Stats never change or break a request.** The tap only reads, `begin`, `feed` and `end` swallow their own errors, and no request waits on an engine lookup. A byte-for-byte test covers this.
-2. **Chat text never leaves the request.** From a request body, the only things kept are the model name, the stream flag and whether tools were offered (yes or no). From a reply, it's counts, plus a finish reason taken from the allow-list. Snapshots, `/stats`, the log and `gateway-stats.json` hold counts and names only.
+2. **Chat text never leaves the request.** From a request body, the only things kept are the model name, the stream flag, whether tools were offered (yes or no) and the thinking choice as a fixed name (see Thinking Switch). From a reply, it's counts, plus a finish reason taken from the allow-list. Snapshots, `/stats`, the log and `gateway-stats.json` hold counts and names only.
 3. **Engine data is an allow-list.** `_engine_view` copies only the fields named in `_ENGINE_*_KEYS`. Add a field there on purpose, and never pass an engine's dict through whole.
 4. **Client names are never Rich markup.** App and model names come from clients. A plain `str` cell in a Rich table is parsed as markup, so `[/]` in a name would break the panel: wrap them in `RichText`.
 5. **A bad number can't take the console down.** Each panel render has its own `try`, so a failure shows in that panel and nowhere else.
@@ -162,7 +162,7 @@ Tests must not write real files: `testing/test_proxy.py` points `proxy.CONFIG_FI
 
 ## Tool Call Healing
 
-With `"tool_heal": {"enabled": true}` on an endpoint, `_new_healer()` gives a `/chat/completions` request that offers tools a `ToolHealer`, which reads the reply on its way to the client. `_parse_tool_blocks()` turns calls written as text into real ones, and `guard_tool_call()` / `_guard_command()` check every call that would run. Rule ids and reasons are in `_GUARD_REASONS`.
+With `"tool_heal": {"enabled": true}` on an endpoint, `_new_healer()` gives a `/chat/completions` request that offers tools a `ToolHealer`, which reads the reply on its way to the client. `_parse_tool_blocks()` turns calls written as text into real ones, and `guard_tool_call()` / `_guard_command()` check every call that would run. Rule ids and reasons are in `_GUARD_REASONS`. The Settings endpoint dialog (`EndpointEditScreen`) sets `enabled` and `guard`. `_heal_result()` keeps the endpoint's other `tool_heal` keys, and writes nothing for an endpoint that never had the setting and still doesn't. `_new_healer()` reads the config on every request, so a change applies to the next request.
 
 Rules that must hold:
 
@@ -178,6 +178,17 @@ Rules that must hold:
 10. **The guard is for accidents, not a security boundary.** False positives break real work, so any new rule needs near misses added to `MUST_PASS` in `CommandGuardTests`.
 
 Test with made-up text only, through `run_healer()`, `sse_text()` and `sse_native()`. Never send test traffic to a real engine: it would displace the chat it holds.
+
+## Thinking Switch
+
+The client decides whether a model thinks. `_thinking_asked()` reads that choice from any of the usual fields (`reasoning_effort`, `reasoning`, `chat_template_kwargs`, `thinking`, `think`). For an `lmstudio` endpoint's `/chat/completions`, `_lmstudio_thinking()` writes it as `reasoning_effort`, because that is the only field LM Studio honours there. This was tested live with a Gemma 4 model on 2026-11-11: `"none"` turned thinking off, while `chat_template_kwargs.enable_thinking` and `reasoning.effort` were ignored.
+
+Rules that must hold:
+
+1. **Never a setting the client didn't ask for.** There is no config value for thinking. When the client asks for nothing, or asks for "on" without a level, nothing is added, and LM Studio's load setting decides.
+2. **The client's own `reasoning_effort` always wins** and goes through untouched. The client's other fields stay in place.
+3. **Only LM Studio's `/chat/completions` is changed.** Every other endpoint type and path gets the body as sent. A failure while translating forwards the request unchanged.
+4. **Stats keep only the name of the choice** (`think`: a level from `_THINK_EFFORTS`, `on` or `other`), never a value the client invented.
 
 ## API Endpoints
 

@@ -817,6 +817,87 @@ class SettingsScreenTests(unittest.TestCase):
         self.assertEqual((ep["timeout"], ep["kv_sessions"]), (900, kv))
         proxy.set_endpoint_status("st", "disabled")
 
+    # ── tool call healing in the endpoint dialog ──────────────────────────
+    def _dialog(self, endpoint, change=None):
+        """Open the endpoint dialog headless, let `change(screen)` tick boxes, save,
+        and return (what the boxes showed when it opened, what it saved)."""
+        import asyncio
+        from textual.widgets import Checkbox
+
+        seen, saved = {}, []
+
+        async def run():
+            app = proxy.ProxyTUI()
+            async with app.run_test(size=(120, 50)) as pilot:
+                screen = proxy.EndpointEditScreen(dict(endpoint) if endpoint else None)
+                await app.push_screen(screen, saved.append)
+                await pilot.pause()
+                heal = screen.query_one("#ep-heal-checkbox", Checkbox)
+                guard = screen.query_one("#ep-guard-checkbox", Checkbox)
+                seen.update(heal=heal.value, guard=guard.value, guard_disabled=guard.disabled)
+                if change:
+                    change(heal, guard)
+                    await pilot.pause()
+                    seen["guard_disabled_after"] = guard.disabled
+                screen._save()
+                await pilot.pause()
+
+        asyncio.run(run())
+        return seen, saved[0]
+
+    LM = {"name": "lm", "type": "lmstudio", "host": "localhost:1234", "api_key": "", "enabled": True}
+
+    def test_the_dialog_shows_healing_and_saves_nothing_when_untouched(self):
+        seen, saved = self._dialog(self.LM)
+        self.assertEqual(seen, {"heal": False, "guard": True, "guard_disabled": True})
+        self.assertNotIn("tool_heal", saved)
+
+    def test_turning_healing_on_in_the_dialog(self):
+        def tick(heal, guard):
+            heal.value = True
+        seen, saved = self._dialog(self.LM, tick)
+        self.assertFalse(seen["guard_disabled_after"])  # the guard can be set once healing is on
+        self.assertEqual(saved["tool_heal"], {"enabled": True})
+
+    def test_turning_the_guard_off_keeps_the_other_heal_settings(self):
+        ep = {**self.LM, "tool_heal": {"enabled": True, "allow_rules": ["S05"]}}
+
+        def untick(heal, guard):
+            guard.value = False
+        seen, saved = self._dialog(ep, untick)
+        self.assertEqual(seen, {"heal": True, "guard": True, "guard_disabled": False, "guard_disabled_after": False})
+        self.assertEqual(saved["tool_heal"], {"enabled": True, "allow_rules": ["S05"], "guard": False})
+
+    def test_turning_healing_off_keeps_its_settings_for_next_time(self):
+        ep = {**self.LM, "tool_heal": {"enabled": True, "guard": False, "allow_rules": ["S05"]}}
+
+        def untick(heal, guard):
+            heal.value = False
+        seen, saved = self._dialog(ep, untick)
+        self.assertEqual((seen["guard"], seen["guard_disabled_after"]), (False, True))
+        self.assertEqual(saved["tool_heal"], {"enabled": False, "guard": False, "allow_rules": ["S05"]})
+
+    def test_a_saved_heal_setting_reaches_the_config(self):
+        import types
+
+        proxy.set_config("endpoints", [{**self.LM, "timeout": 900}])
+        screen = types.SimpleNamespace(notify=lambda *a, **k: None, _populate_endpoint_table=lambda: None,
+                                       _update_model_select=lambda: None)
+        proxy.SettingsScreen._on_endpoint_saved(screen, {**self.LM, "tool_heal": {"enabled": True},
+                                                         "_original_name": "lm"})
+        ep = proxy.get_config("endpoints")[0]
+        self.assertEqual((ep["tool_heal"], ep["timeout"]), ({"enabled": True}, 900))
+        self.assertIsNotNone(proxy._new_healer(ep, "POST", "/v1/chat/completions",
+                                               {"messages": [], "tools": [{"type": "function"}]}))
+        proxy.set_endpoint_status("lm", "disabled")
+
+    def test_the_table_says_which_endpoints_heal(self):
+        self.assertEqual(proxy._heal_label({}), "—")
+        self.assertEqual(proxy._heal_label({"tool_heal": {"enabled": False}}), "—")
+        self.assertEqual(proxy._heal_label({"tool_heal": "yes"}), "—")
+        self.assertEqual(proxy._heal_label({"tool_heal": {"enabled": True}}), "✓")
+        self.assertEqual(proxy._heal_label({"tool_heal": {"enabled": True, "guard": False}}), "✓ no guard")
+
 
 # ── Mock one-slot engine (Strata's server) ────────────────────────────────
 class MockEngine(BaseHTTPRequestHandler):
@@ -3358,6 +3439,135 @@ class ToolHealGatewayTests(unittest.TestCase):
     def test_the_stop_question_shows_the_command_to_the_client_only(self):
         _s, _h, body = self._post(sse_native("run_commands", json.dumps({"commands": [f"git reset --hard {self.SECRET}"]})))
         self.assertIn(self.SECRET, read_reply(body)["calls"][0]["arguments"])
+
+
+class ThinkingSwitchTests(unittest.TestCase):
+    """The client decides whether the model thinks; the gateway carries that
+    choice to LM Studio in the one field LM Studio honours (reasoning_effort)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockUpstream)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        proxy.set_config("force_default_model", False)
+        MockUpstream.requests.clear()
+
+    def tearDown(self):
+        proxy._stats.wait_idle()
+        for name in ("lm", "other"):
+            proxy.set_endpoint_status(name, "disabled")
+        proxy.CONFIG_FILE, proxy._config, proxy._stats = self._saved
+        self._tmp.cleanup()
+
+    def _use(self, ep_type):
+        proxy.set_config("endpoints", [{"name": "lm", "type": ep_type, "host": f"localhost:{self.up_port}",
+                                        "enabled": True, "api_key": ""}])
+        proxy.set_endpoint_status("lm", "online")
+
+    def _send(self, extra, ep_type="lmstudio", path="/v1/chat/completions"):
+        self._use(ep_type)
+        MockUpstream.requests.clear()
+        body = {"model": "lm:orion", "messages": [{"role": "user", "content": "made-up question"}], **extra}
+        counted = len(proxy._stats.snapshot()["recent"])
+        status, _, _ = request(self.gw_port, "POST", path, body=json.dumps(body),
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        deadline = time.time() + 5  # the gateway counts it just after the client has the reply
+        while len(proxy._stats.snapshot()["recent"]) == counted and time.time() < deadline:
+            time.sleep(0.01)
+        proxy._stats.wait_idle()
+        time.sleep(0.05)            # and writes the totals file right after that
+        return json.loads(MockUpstream.requests[-1]["body"])
+
+    # ── what the client asked for ─────────────────────────────────────────
+    def test_every_way_of_asking_is_understood(self):
+        asked = proxy._thinking_asked
+        cases = [
+            ({}, None),
+            ({"reasoning_effort": "none"}, "none"),
+            ({"reasoning_effort": "LOW"}, "low"),
+            ({"reasoning_effort": "turbo"}, "other"),
+            ({"reasoning_effort": None, "chat_template_kwargs": {"enable_thinking": False}}, "none"),
+            ({"reasoning": {"enabled": False}}, "none"),
+            ({"reasoning": {"effort": "high"}}, "high"),
+            ({"reasoning": {"enabled": True}}, "on"),
+            ({"reasoning": {"max_tokens": 2000}}, "on"),
+            ({"reasoning": {"exclude": True}}, None),           # hide it, not switch it off
+            ({"chat_template_kwargs": {"enable_thinking": False}}, "none"),
+            ({"chat_template_kwargs": {"thinking": True}}, "on"),
+            ({"chat_template_kwargs": {"enable_thinking": "no"}}, None),  # not a clear yes or no
+            ({"thinking": {"type": "disabled"}}, "none"),
+            ({"thinking": {"type": "enabled", "budget_tokens": 1024}}, "on"),
+            ({"think": False}, "none"),
+            ({"think": True}, "on"),
+            ({"think": "medium"}, "medium"),
+            ("not a dict", None),
+        ]
+        for data, want in cases:
+            self.assertEqual(asked(data), want, data)
+
+    def test_only_a_clear_level_is_written_and_never_over_the_clients_own(self):
+        for data, want in (({"chat_template_kwargs": {"enable_thinking": False}}, "none"),
+                           ({"reasoning": {"effort": "low"}}, "low"),
+                           ({"think": False}, "none")):
+            self.assertTrue(proxy._lmstudio_thinking(data))
+            self.assertEqual(data["reasoning_effort"], want)
+        for data in ({}, {"reasoning": {"enabled": True}}, {"reasoning_effort": "high", "think": False},
+                     {"reasoning": {"effort": "turbo"}}):
+            before = json.dumps(data, sort_keys=True)
+            self.assertFalse(proxy._lmstudio_thinking(data))
+            self.assertEqual(json.dumps(data, sort_keys=True), before)
+
+    # ── through the gateway ───────────────────────────────────────────────
+    def test_lm_studio_gets_the_clients_off_switch_as_reasoning_effort(self):
+        sent = self._send({"chat_template_kwargs": {"enable_thinking": False}, "stream": False})
+        self.assertEqual(sent["reasoning_effort"], "none")
+        self.assertEqual(sent["chat_template_kwargs"], {"enable_thinking": False})  # left in place
+        self.assertEqual(sent["model"], "orion")
+
+    def test_the_clients_own_reasoning_effort_goes_through_as_sent(self):
+        sent = self._send({"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": False}})
+        self.assertEqual(sent["reasoning_effort"], "low")
+
+    def test_nothing_asked_means_nothing_added(self):
+        sent = self._send({"temperature": 0.2})
+        self.assertNotIn("reasoning_effort", sent)
+        self.assertEqual(sent, {"model": "orion", "messages": [{"role": "user", "content": "made-up question"}],
+                                "temperature": 0.2})
+
+    def test_other_endpoints_get_the_request_as_sent(self):
+        for ep_type in ("custom", "llama-server", "strata"):
+            sent = self._send({"chat_template_kwargs": {"enable_thinking": False}}, ep_type=ep_type)
+            self.assertNotIn("reasoning_effort", sent, ep_type)
+
+    def test_other_lm_studio_paths_are_left_alone(self):
+        sent = self._send({"reasoning": {"effort": "none"}, "input": "made-up"}, path="/v1/responses")
+        self.assertNotIn("reasoning_effort", sent)  # the Responses API has its own reasoning field
+
+    def test_the_clients_choice_shows_in_the_log_and_stats(self):
+        while not proxy._log_queue.empty():
+            proxy._log_queue.get_nowait()
+        self._send({"thinking": {"type": "disabled"}})
+        rec = proxy._stats.snapshot()["recent"][0]
+        self.assertEqual(rec["think"], "none")
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(proxy._log_queue.get_nowait())
+        self.assertTrue(any("thinking off (asked)" in line for line in lines), lines)
+        self._send({})
+        self.assertIsNone(proxy._stats.snapshot()["recent"][0]["think"])
 
 
 if __name__ == "__main__":

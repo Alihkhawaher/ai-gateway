@@ -332,7 +332,7 @@ No chat text is kept. The gateway reads token counts and timings from responses,
 
 Local models sometimes write a tool call out as plain text instead of making a real tool call. The client shows the text, nothing runs, and the turn ends. Damaged calls can also do harm: a client's own repair can turn `rm -rf C:\Users\me` into `rm -rf C:Usersme`.
 
-Turn healing on per endpoint:
+Turn healing on per endpoint. In the console, open **Settings**, choose the endpoint, press **Edit** and tick **Heal tool calls**. **Check commands before they run (guard)** is ticked by default, and you can only change it while healing is on. The endpoint table's **Heal** column shows which endpoints have healing on. The change applies to the next request, with no restart. Or set it in `config.json`:
 
 ```json
 { "name": "strata", "type": "strata", "host": "127.0.0.1:47831", "tool_heal": { "enabled": true } }
@@ -393,6 +393,27 @@ Options, inside `tool_heal`:
 - **It only reads `/chat/completions` replies.** `/v1/messages` and `/v1/responses` pass untouched, and so does anything the engine serves directly.
 
 Nothing about a reply is kept. The log and stats get counts and rule ids only.
+
+## Thinking On or Off
+
+Your app decides whether the model thinks, and the gateway delivers that choice to the endpoint. Nothing is set in the gateway's config.
+
+Apps phrase this in different ways, and LM Studio's `/v1/chat/completions` only understands one of them, `reasoning_effort`. On LM Studio endpoints the gateway therefore copies your app's choice into `reasoning_effort`:
+
+| Your app sends | LM Studio gets |
+|----------------|----------------|
+| `reasoning_effort` | It, unchanged |
+| `chat_template_kwargs: {"enable_thinking": false}` (llama.cpp, vLLM) | `reasoning_effort: "none"` |
+| `reasoning: {"enabled": false}` or `reasoning: {"effort": "low"}` (OpenRouter) | `"none"`, or that level |
+| `thinking: {"type": "disabled"}` (Anthropic) | `"none"` |
+| `think: false` (Ollama) | `"none"` |
+| Thinking on with no level, or nothing at all | Nothing added: the model's **Enable Thinking** setting in LM Studio decides |
+
+Your app's own `reasoning_effort` is never changed, and its other fields are passed on too. Other endpoint types, and LM Studio's `/v1/responses`, get the request exactly as sent.
+
+This was tested with a Gemma 4 model. With `reasoning_effort: "none"`, LM Studio skipped thinking and still made the right tool call. It ignored `chat_template_kwargs` and `reasoning: {"effort"}`.
+
+Each log line shows what your app asked for, such as `thinking off (asked)`, and `GET /stats` has it as `think`. That shows whether your app sends a choice at all.
 
 ## Connecting Clients
 

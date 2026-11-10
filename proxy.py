@@ -2270,6 +2270,7 @@ class _RequestStats:
         self.app = app
         self.stream = stream
         self.tools = False          # did the request offer tools (yes or no)
+        self.think = None           # what the client asked of thinking (see _thinking_asked)
         self.started = time.time()
         self.tap = _ResponseTap()
         self.status = None
@@ -2358,6 +2359,7 @@ class GatewayStats:
             data = data if isinstance(data, dict) else {}
             req = _RequestStats(ep, path, data.get("model"), client, _app_name(headers), bool(data.get("stream")))
             req.tools = bool(data.get("tools") or data.get("functions"))  # offered at all: yes or no, nothing else
+            req.think = _thinking_asked(data)  # the client's thinking choice: a name from a fixed list
             with self.lock:
                 self._next_id += 1
                 req.id = self._next_id
@@ -2456,7 +2458,7 @@ class GatewayStats:
             "swap_s": round(req.swap_s, 2) if req.swap_s else None, "swap": req.kv_event,
             "expert_hit": row.get("hit_rate"), "drafts": row.get("drafts_offered"),
             "drafts_accepted": row.get("drafts_accepted"),
-            "finish": tap.finish_reason, "calls": tap.calls, "tools": req.tools,
+            "finish": tap.finish_reason, "calls": tap.calls, "tools": req.tools, "think": req.think,
             "text_chars": tap.text_chars, "reasoning_chars": tap.reasoning_chars,
         }
         with self.lock:
@@ -2548,6 +2550,8 @@ def _log_line(rec: dict) -> str:
         bits.append(f"first token {fmt_secs(rec['ttft_s'])}")
     if rec.get("tok_s"):
         bits.append(f"{rec['tok_s']:.1f} t/s")
+    if rec.get("think"):
+        bits.append("thinking " + {"none": "off (asked)", "on": "on (asked)"}.get(rec["think"], f"{rec['think']} (asked)"))
     end = _reply_end(rec)
     if end:
         bits.append(f"ended: {end[1]}")
@@ -3924,6 +3928,79 @@ def _new_healer(ep: dict, command: str, path: str, data):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  THINKING SWITCH — the client decides, the gateway carries it
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Clients turn a model's thinking on or off in different ways. LM Studio's
+#  /v1/chat/completions honours only `reasoning_effort`: tested 2026-11-11
+#  with a Gemma 4 model, "none" turned thinking off, while
+#  chat_template_kwargs.enable_thinking and reasoning.effort were ignored.
+#  So for LM Studio the gateway puts the client's own choice into
+#  reasoning_effort. It never sets one the client didn't ask for, never
+#  overrides a reasoning_effort the client sent, and leaves the client's
+#  other fields in place.
+
+_THINK_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+
+
+def _think_level(value):
+    if isinstance(value, str) and value.strip():
+        value = value.strip().lower()
+        return value if value in _THINK_EFFORTS else "other"
+    return None
+
+
+def _thinking_asked(data):
+    """What the client asked for: a level from _THINK_EFFORTS ("none" is off), "on"
+    (thinking wanted, no level), "other" (a value the gateway doesn't know), or None."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("reasoning_effort") is not None:                     # OpenAI
+        return _think_level(data["reasoning_effort"]) or "other"
+    reasoning = data.get("reasoning")                                # OpenRouter, Responses API
+    if isinstance(reasoning, dict):
+        if reasoning.get("enabled") is False:
+            return "none"
+        level = _think_level(reasoning.get("effort"))
+        if level:
+            return level
+        if reasoning.get("enabled") is True or reasoning.get("max_tokens"):
+            return "on"
+    kwargs = data.get("chat_template_kwargs")                        # llama.cpp, vLLM
+    if isinstance(kwargs, dict):
+        for key in ("enable_thinking", "thinking"):
+            if kwargs.get(key) is False:
+                return "none"
+            if kwargs.get(key) is True:
+                return "on"
+    thinking = data.get("thinking")                                  # Anthropic
+    if isinstance(thinking, dict):
+        kind = str(thinking.get("type") or "").lower()
+        if kind == "disabled":
+            return "none"
+        if kind in ("enabled", "adaptive"):
+            return "on"
+    think = data.get("think")                                        # Ollama
+    if think is False:
+        return "none"
+    if think is True:
+        return "on"
+    return _think_level(think)
+
+
+def _lmstudio_thinking(data) -> bool:
+    """Carry the client's thinking choice to LM Studio in the one field it honours.
+    True when the request was changed."""
+    if not isinstance(data, dict) or data.get("reasoning_effort") is not None:
+        return False                 # the client's own reasoning_effort goes through as sent
+    asked = _thinking_asked(data)
+    if asked in _THINK_EFFORTS:
+        data["reasoning_effort"] = asked
+        return True
+    return False                     # "on", "other" or nothing: LM Studio's load setting decides
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  PROXY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4556,6 +4633,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         ep_name = target_endpoint.get("name", "unknown")
         ep_type = target_endpoint.get("type", "")
 
+        # The client's thinking choice, in the form LM Studio honours (see THINKING SWITCH).
+        if (ep_type == "lmstudio" and isinstance(req_json, dict)
+                and urlparse(self.path).path.rstrip("/").endswith("/chat/completions")):
+            try:
+                if _lmstudio_thinking(req_json):
+                    body = json.dumps(req_json).encode("utf-8")
+            except Exception as e:  # the request goes as the client sent it
+                self._log(f"thinking switch skipped: {e}")
+
         # 4. Rewrite path (OpenRouter needs /api prefix, OrcaRouter and local endpoints use /v1)
         if ep_type == "openrouter":
             path = rewrite_path(self.path)
@@ -4763,6 +4849,14 @@ class ConfirmScreen(ModalScreen):
 #  TUI — ENDPOINT EDIT DIALOG (ModalScreen)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _heal_label(ep: dict) -> str:
+    """The Settings table's Heal cell: whether tool call healing (and its guard) is on."""
+    cfg = ep.get("tool_heal")
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return "—"
+    return "✓ no guard" if cfg.get("guard", True) is False else "✓"
+
+
 class EndpointEditScreen(ModalScreen):
     """Modal dialog for adding or editing an endpoint."""
 
@@ -4813,6 +4907,17 @@ class EndpointEditScreen(ModalScreen):
                 id="ep-enabled-checkbox",
             )
 
+            heal = self._heal_cfg()
+            heal_box = Checkbox("Heal tool calls", value=bool(heal.get("enabled")), id="ep-heal-checkbox")
+            heal_box.tooltip = ("Turn tool calls a model writes out as text into real calls, so the app runs them. "
+                                "For local models (tool_heal in config.json).")
+            yield heal_box
+            guard_box = Checkbox("Check commands before they run (guard)", value=heal.get("guard", True) is not False,
+                                 id="ep-guard-checkbox", disabled=not heal.get("enabled"))
+            guard_box.tooltip = ("Stop tool calls that would delete a root or home folder, run a damaged path, "
+                                 "or a cut-off command. Works only with healing on.")
+            yield guard_box
+
             with Horizontal(id="ep-edit-buttons"):
                 yield Button("💾 Save", id="ep-save-btn", variant="success", compact=True)
                 yield Button("✕ Cancel", id="ep-cancel-btn", variant="default", compact=True)
@@ -4830,6 +4935,10 @@ class EndpointEditScreen(ModalScreen):
                 if not host_input.value.strip():
                     host_input.value = defaults.get("host", "")
 
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "ep-heal-checkbox":
+            self.query_one("#ep-guard-checkbox", Checkbox).disabled = not event.value  # the guard runs inside the healer
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "ep-save-btn":
             self._save()
@@ -4839,12 +4948,31 @@ class EndpointEditScreen(ModalScreen):
     def action_cancel(self):
         self.dismiss(None)
 
+    def _heal_cfg(self) -> dict:
+        cfg = (self.endpoint or {}).get("tool_heal")
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _heal_result(self, heal_on: bool, guard_on: bool):
+        """The endpoint's tool_heal after the dialog: its other keys (allow_rules) kept,
+        and nothing written for an endpoint that never had it and still doesn't."""
+        heal = dict(self._heal_cfg())
+        if not heal_on and not heal:
+            return None
+        heal["enabled"] = heal_on
+        if guard_on:
+            heal.pop("guard", None)  # on is the default
+        else:
+            heal["guard"] = False
+        return heal
+
     def _save(self):
         ep_type = str(self.query_one("#ep-type-select", Select).value)
         name = self.query_one("#ep-name-input", Input).value.strip()
         host = self.query_one("#ep-host-input", Input).value.strip()
         api_key = self.query_one("#ep-key-input", Input).value.strip()
         enabled = self.query_one("#ep-enabled-checkbox", Checkbox).value
+        heal = self._heal_result(self.query_one("#ep-heal-checkbox", Checkbox).value,
+                                 self.query_one("#ep-guard-checkbox", Checkbox).value)
 
         if not name:
             self.query_one("#ep-name-input", Input).focus()
@@ -4860,6 +4988,8 @@ class EndpointEditScreen(ModalScreen):
             "api_key": api_key,
             "enabled": enabled,
         }
+        if heal is not None:
+            result["tool_heal"] = heal
         if self.original_name:
             result["_original_name"] = self.original_name
         self.dismiss(result)
@@ -5038,7 +5168,7 @@ class SettingsScreen(Screen):
         table = self.query_one("#endpoint-table", DataTable)
         table.clear(columns=True)
         table.cursor_type = "row"
-        table.add_columns("Name", "Type", "Host", "Status", "Load")
+        table.add_columns("Name", "Type", "Host", "Status", "Heal", "Load")
         endpoints = get_config("endpoints")
         for ep in endpoints:
             name = ep.get("name", "")
@@ -5049,6 +5179,7 @@ class SettingsScreen(Screen):
                 ep.get("type", ""),
                 ep.get("host", ""),
                 status_icon,
+                _heal_label(ep),
                 format_endpoint_load(name),
                 key=name,
             )
