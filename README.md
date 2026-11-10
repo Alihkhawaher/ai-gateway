@@ -301,7 +301,7 @@ The console shows what the gateway and its engine are doing, refreshed every sec
 | **Totals** | Requests, errors, tokens, cached share and time saved for this run, today and all time, plus cost when a cloud endpoint reports it |
 | **Saved chats** | Each chat on disk: app, tokens, size, restores, last used. A dot marks the one in the engine |
 | **Endpoints, Models, Apps** | Requests, tokens and cached share for each |
-| **Recent requests** | Time, app, model, tokens, cached share, first token, speed, expert hits, what the swap did and the status |
+| **Recent requests** | Time, app, model, tokens, cached share, first token, speed, expert hits, what the swap did, how the reply ended (**End**) and the status |
 
 Where the numbers come from:
 
@@ -310,8 +310,21 @@ Where the numbers come from:
 - **The app name** comes from the `X-Title` header. Without one, a browser on the gateway's own page shows as `Web UI`, then the referer's host is used, then the `User-Agent` product.
 - **Time saved is an estimate:** cached tokens divided by the reading speed measured on that endpoint.
 - **A client pressing stop** counts as stopped, not as an error.
+- **How a reply ended** comes from the model's own stream, before any tool call healing. This helps when an agent stops on its own, because the model's last reply says why:
 
-No chat text is kept. The gateway reads token counts and timings from responses and passes the bytes on unchanged, and engine data is copied field by field from a fixed list. `gateway-stats.json`, beside `config.json` and gitignored, holds the all-time totals: counts plus endpoint, model and app names, with daily rows for 30 days. It's written every 30 seconds and on exit. Delete it to start the totals over.
+  | End | Meaning |
+  |-----|---------|
+  | `2 calls` | The reply made tool calls, so the app runs them and asks again |
+  | `no call` | Tools were offered, but the reply was text only. An agent takes that as the end of its turn. If the text holds a tool call written out, `tool_heal` can turn it into a real one |
+  | `cut off` | The reply hit the token limit (`max_tokens`, or the server's own response limit) |
+  | `ctx full` | The context window filled up |
+  | `no end` | The stream ended without saying why, which usually means it was cut off |
+  | `empty` | No answer text, only reasoning, or nothing at all |
+  | `answer` | A plain answer, with no tools offered |
+
+  The log line spells it out, for example `ended: cut off at the token limit`.
+
+No chat text is kept. The gateway reads token counts and timings from responses, and how each one ended: the finish reason, the number of tool calls and how many characters of text and reasoning it had. It passes the bytes on unchanged, and engine data is copied field by field from a fixed list. `gateway-stats.json`, beside `config.json` and gitignored, holds the all-time totals: counts plus endpoint, model and app names, with daily rows for 30 days. It's written every 30 seconds and on exit. Delete it to start the totals over.
 
 `GET /stats` returns the same numbers as JSON. Like `/health` it needs no key, and it includes client addresses and app names, so anyone who can reach the gateway can read them.
 

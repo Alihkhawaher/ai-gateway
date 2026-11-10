@@ -145,14 +145,14 @@ For Strata, the engine's port and per-load API key are read from `~/.strata/data
 The console's **Live** panel, its `d` dashboard (`StatsScreen`) and `GET /stats` all draw from `stats_snapshot()`, which reads memory only:
 
 - `GatewayStats` (`_stats`) counts generation requests. `_proxy()` calls `_stats.begin()` before the upstream request, `stat.tap.feed()` on each chunk and `_stats.end()` in its `finally`. All-time totals persist to `gateway-stats.json`, next to `config.json`.
-- `_ResponseTap` reads usage and timings out of a response as it passes.
+- `_ResponseTap` reads usage and timings out of a response as it passes. It also reads how the reply ended: `finish_reason`, mapped through the `_FINISH_NAMES` allow-list (anything else is `other`), the number of tool calls, and the character counts of the text and the reasoning. `_reply_end()` turns those into the console's **End** column and the log's `ended:` phrase.
 - `EngineProbe` (`_engine_probe`) polls an engine's `/metrics` every 2 seconds, and stops after 30 seconds with no reader. For a Strata or `kv_sessions.engine` endpoint, `_stats.end()` also fetches that request's row from the engine, in a background thread.
 - The `panel_*` functions and `render_live` are pure: a snapshot goes in and Rich renderables come out. They fetch nothing.
 
 Rules that must hold:
 
 1. **Stats never change or break a request.** The tap only reads, `begin`, `feed` and `end` swallow their own errors, and no request waits on an engine lookup. A byte-for-byte test covers this.
-2. **Chat text never leaves the request.** From a request body only the model name and stream flag are kept. Snapshots, `/stats`, the log and `gateway-stats.json` hold counts and names only.
+2. **Chat text never leaves the request.** From a request body, the only things kept are the model name, the stream flag and whether tools were offered (yes or no). From a reply, it's counts, plus a finish reason taken from the allow-list. Snapshots, `/stats`, the log and `gateway-stats.json` hold counts and names only.
 3. **Engine data is an allow-list.** `_engine_view` copies only the fields named in `_ENGINE_*_KEYS`. Add a field there on purpose, and never pass an engine's dict through whole.
 4. **Client names are never Rich markup.** App and model names come from clients. A plain `str` cell in a Rich table is parsed as markup, so `[/]` in a name would break the panel: wrap them in `RichText`.
 5. **A bad number can't take the console down.** Each panel render has its own `try`, so a failure shows in that panel and nowhere else.

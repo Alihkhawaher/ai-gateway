@@ -2013,9 +2013,17 @@ class _ResponseTap:
         self.usage = {}
         self.timings = {}
         self.bytes = 0
+        self.finish_reason = None   # how the reply ended, as one of the names in _FINISH_NAMES
+        self.text_chars = 0         # lengths only: the text itself is never kept
+        self.reasoning_chars = 0
+        self._call_keys = set()     # one key per tool call the model made (deltas of one call share it)
         self._line = bytearray()
         self._body = bytearray()
         self._too_big = False
+
+    @property
+    def calls(self) -> int:
+        return len(self._call_keys)
 
     def feed(self, chunk: bytes, streaming: bool):
         try:
@@ -2067,6 +2075,98 @@ class _ResponseTap:
                 self.first_token = now
             self.last_token = now
             self.deltas += 1
+        try:
+            self._read_end(obj)
+        except Exception:  # an odd shape costs only these counts
+            pass
+
+    # ── how the reply ended: names and counts, never the text ───────────
+    def _read_end(self, obj: dict):
+        end = _finish_name(obj.get("done_reason"))  # Ollama's own API
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            end = _finish_name(choice.get("finish_reason")) or end
+            part = choice.get("delta") if isinstance(choice.get("delta"), dict) else choice.get("message")
+            if isinstance(part, dict):
+                self._count_part(part)
+            elif isinstance(choice.get("text"), str):
+                self.text_chars += len(choice["text"])
+        elif "type" not in obj and isinstance(obj.get("message"), dict):
+            self._count_part(obj["message"])  # Ollama: {"message": {...}, "done_reason": ...}
+        kind = obj.get("type")
+        if kind == "message" or (kind == "message_start" and isinstance(obj.get("message"), dict)):
+            msg = obj if kind == "message" else obj["message"]  # Anthropic: a whole reply, or its start
+            end = _finish_name(msg.get("stop_reason")) or end
+            for i, block in enumerate(msg.get("content") or []):
+                self._count_block(block, ("block", i))
+        elif kind == "message_delta" and isinstance(obj.get("delta"), dict):
+            end = _finish_name(obj["delta"].get("stop_reason")) or end
+        elif kind == "content_block_start":
+            self._count_block(obj.get("content_block"), ("block", obj.get("index")))
+        elif kind == "content_block_delta" and isinstance(obj.get("delta"), dict):
+            delta = obj["delta"]
+            if isinstance(delta.get("text"), str):
+                self.text_chars += len(delta["text"])
+            if isinstance(delta.get("thinking"), str):
+                self.reasoning_chars += len(delta["thinking"])
+        elif kind == "response.output_text.delta" and isinstance(obj.get("delta"), str):
+            self.text_chars += len(obj["delta"])
+        elif kind == "response.reasoning_text.delta" and isinstance(obj.get("delta"), str):
+            self.reasoning_chars += len(obj["delta"])
+        elif kind == "response.output_item.added" and isinstance(obj.get("item"), dict):
+            if obj["item"].get("type") == "function_call":
+                self._call_keys.add(("item", obj["item"].get("id") or obj.get("output_index")))
+        elif kind in ("response.completed", "response.incomplete") or obj.get("object") == "response":
+            resp = obj.get("response") if isinstance(obj.get("response"), dict) else obj
+            if obj.get("object") == "response":  # a whole reply: count what it holds
+                for item in resp.get("output") or []:
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        self._call_keys.add(("item", item.get("id")))
+            status = resp.get("status")
+            details = resp.get("incomplete_details") if isinstance(resp.get("incomplete_details"), dict) else {}
+            if status == "incomplete":
+                end = _finish_name(details.get("reason")) or "other"
+            elif status == "completed":
+                end = "tool_calls" if self._call_keys else "stop"
+        if end:
+            self.finish_reason = end
+
+    def _count_part(self, part: dict):
+        content = part.get("content")
+        if isinstance(content, str):
+            self.text_chars += len(content)
+        elif isinstance(content, list):
+            for p in content:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    self.text_chars += len(p["text"])
+        for key in ("reasoning_content", "reasoning"):
+            if isinstance(part.get(key), str):
+                self.reasoning_chars += len(part[key])
+        calls = part.get("tool_calls")
+        if isinstance(calls, list):
+            for i, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                index = call.get("index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    self._call_keys.add(("index", index))  # every delta of one streamed call
+                elif call.get("id"):
+                    self._call_keys.add(("id", str(call["id"])))
+                else:
+                    self._call_keys.add(("whole", len(self._call_keys), i))  # a whole call, no id (Ollama)
+        if isinstance(part.get("function_call"), dict) and part["function_call"].get("name"):
+            self._call_keys.add(("function_call", 0))
+
+    def _count_block(self, block, key):
+        if not isinstance(block, dict):
+            return
+        if block.get("type") in ("tool_use", "server_tool_use"):
+            self._call_keys.add(key)
+        elif block.get("type") == "text" and isinstance(block.get("text"), str):
+            self.text_chars += len(block["text"])
+        elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+            self.reasoning_chars += len(block["thinking"])
 
     @staticmethod
     def _is_token(obj: dict) -> bool:
@@ -2089,6 +2189,53 @@ class _ResponseTap:
             self.first_token = self.last_token = None  # one body: no token timing in it
             self.deltas = 0
             self._body = bytearray()
+
+
+# How a reply ended, in the words of each API, as the few names the console shows.
+# An allow-list: anything else is "other", so a server's own words are never shown.
+_FINISH_NAMES = {
+    "stop": "stop", "end_turn": "stop", "stop_sequence": "stop", "eos": "stop", "eos_token": "stop",
+    "length": "length", "max_tokens": "length", "max_output_tokens": "length",
+    "model_context_window_exceeded": "context", "context_length_exceeded": "context",
+    "tool_calls": "tool_calls", "function_call": "tool_calls", "tool_use": "tool_calls",
+    "content_filter": "filtered", "refusal": "filtered",
+}
+
+
+def _finish_name(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _FINISH_NAMES.get(value.strip().lower(), "other")
+
+
+def _reply_end(rec: dict):
+    """(short label, long phrase, warn) for how a generation ended, or None when
+    there was no reply to judge (an error, or a request that isn't a generation)."""
+    if rec.get("cancelled") or rec.get("error"):
+        return None
+    finish, calls = rec.get("finish"), rec.get("calls") or 0
+    said = (rec.get("text_chars") or 0) + (rec.get("reasoning_chars") or 0)
+    if finish is None:
+        if not (calls or said or rec.get("out")):
+            return None
+        return "no end", "the reply ended without saying why (cut off?)", True
+    if finish == "length":
+        return "cut off", "cut off at the token limit", True
+    if finish == "context":
+        return "ctx full", "the context is full", True
+    if finish == "filtered":
+        return "filtered", "stopped by a content filter", True
+    if calls:
+        return f"{calls} call{'s' if calls > 1 else ''}", f"{calls} tool call{'s' if calls > 1 else ''}", False
+    if finish == "tool_calls":
+        return "0 calls", "said tool_calls but sent none", True
+    if finish == "other":
+        return "other", "ended for another reason", True
+    if not rec.get("text_chars"):
+        return "empty", "no answer text" + (", only reasoning" if rec.get("reasoning_chars") else ""), True
+    if rec.get("tools"):
+        return "no call", "an answer with no tool call, which ends an agent's turn", False
+    return "answer", "an answer", False
 
 
 def _new_agg() -> dict:
@@ -2122,6 +2269,7 @@ class _RequestStats:
         self.client = client
         self.app = app
         self.stream = stream
+        self.tools = False          # did the request offer tools (yes or no)
         self.started = time.time()
         self.tap = _ResponseTap()
         self.status = None
@@ -2209,6 +2357,7 @@ class GatewayStats:
                 return None
             data = data if isinstance(data, dict) else {}
             req = _RequestStats(ep, path, data.get("model"), client, _app_name(headers), bool(data.get("stream")))
+            req.tools = bool(data.get("tools") or data.get("functions"))  # offered at all: yes or no, nothing else
             with self.lock:
                 self._next_id += 1
                 req.id = self._next_id
@@ -2307,6 +2456,8 @@ class GatewayStats:
             "swap_s": round(req.swap_s, 2) if req.swap_s else None, "swap": req.kv_event,
             "expert_hit": row.get("hit_rate"), "drafts": row.get("drafts_offered"),
             "drafts_accepted": row.get("drafts_accepted"),
+            "finish": tap.finish_reason, "calls": tap.calls, "tools": req.tools,
+            "text_chars": tap.text_chars, "reasoning_chars": tap.reasoning_chars,
         }
         with self.lock:
             self._ensure_loaded()
@@ -2397,6 +2548,9 @@ def _log_line(rec: dict) -> str:
         bits.append(f"first token {fmt_secs(rec['ttft_s'])}")
     if rec.get("tok_s"):
         bits.append(f"{rec['tok_s']:.1f} t/s")
+    end = _reply_end(rec)
+    if end:
+        bits.append(f"ended: {end[1]}")
     if rec.get("expert_hit") is not None:
         bits.append(f"experts {rec['expert_hit'] * 100:.0f}% hit")
     if rec.get("swap") == "restored":
@@ -5470,9 +5624,11 @@ def panel_apps(snap: dict):
 
 
 def panel_recent(snap: dict):
-    table = _table("Time", "App", "Model*", "In>", "Cached>", "Out>", "First tok>", "Speed>", "Experts>", "Swap", "Status>")
+    table = _table("Time", "App", "Model*", "In>", "Cached>", "Out>", "First tok>", "Speed>", "Experts>", "Swap", "End",
+                   "Status>")
     recent = (snap.get("gateway") or {}).get("recent") or []
     for r in recent[:12]:
+        end = _reply_end(r)
         cached = _pct(r.get("cached"), r.get("prompt"))
         status = "stopped" if r.get("cancelled") else str(r.get("status") or "failed")
         if r.get("stopped"):
@@ -5488,9 +5644,10 @@ def panel_recent(snap: dict):
                       ("~" if r.get("out_estimated") else "") + fmt_count(r.get("out")), fmt_secs(r.get("ttft_s")),
                       f"{r['tok_s']:.1f} t/s" if r.get("tok_s") else "—", RichText(_fmt_pct(hit, 0), style=_pct_style(hit)),
                       RichText(swap_text, style=_GREEN if swap == "restored" else "dim"),
+                      RichText(end[0], style=_YELLOW if end[2] else "dim") if end else RichText("—", style="dim"),
                       RichText(status, style=_RED_BOLD if r.get("error") else "dim" if r.get("cancelled") else _GREEN))
     if not recent:
-        table.add_row(RichText("no requests yet", style="dim"), *[""] * 10)
+        table.add_row(RichText("no requests yet", style="dim"), *[""] * 11)
     return table
 
 

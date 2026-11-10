@@ -1665,6 +1665,93 @@ class ResponseTapTests(unittest.TestCase):
         self.assertEqual(tap.usage, {"prompt": 50, "cached": 40, "out": 4})
         self.assertEqual(tap.deltas, 1)
 
+    # ── how a reply ended: names and counts, never the text ──────────────
+    def test_openai_stream_with_tool_calls(self):
+        tap = self._tapped(self._sse(
+            {"choices": [{"delta": {"reasoning_content": "think"}}]},
+            {"choices": [{"delta": {"content": "Let me look."}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "a", "arguments": ""}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 1, "id": "c1", "function": {"name": "b", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+        self.assertEqual((tap.finish_reason, tap.calls, tap.text_chars, tap.reasoning_chars), ("tool_calls", 2, 12, 5))
+
+    def test_a_whole_reply_with_tool_calls(self):
+        body = json.dumps({"choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "x", "function": {"name": "a", "arguments": "{}"}}, {"id": "y", "function": {"name": "b", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]}).encode()
+        tap = self._tapped(body, streaming=False)
+        self.assertEqual((tap.finish_reason, tap.calls), ("tool_calls", 2))
+
+    def test_anthropic_stream_ending(self):
+        tap = self._tapped(self._sse(
+            {"type": "message_start", "message": {"content": [], "usage": {"input_tokens": 3}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "ok"}},
+            {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "t", "name": "a"}},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}}))
+        self.assertEqual((tap.finish_reason, tap.calls, tap.text_chars, tap.reasoning_chars), ("tool_calls", 1, 2, 3))
+        whole = self._tapped(json.dumps({"type": "message", "stop_reason": "max_tokens",
+                                         "content": [{"type": "text", "text": "abc"}]}).encode(), streaming=False)
+        self.assertEqual((whole.finish_reason, whole.text_chars), ("length", 3))
+
+    def test_responses_api_ending(self):
+        tap = self._tapped(self._sse(
+            {"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "f"}},
+            {"type": "response.completed", "response": {"status": "completed"}}))
+        self.assertEqual((tap.finish_reason, tap.calls), ("tool_calls", 1))
+        cut = self._tapped(self._sse(
+            {"type": "response.output_text.delta", "delta": "abc"},
+            {"type": "response.incomplete", "response": {"status": "incomplete",
+                                                         "incomplete_details": {"reason": "max_output_tokens"}}}))
+        self.assertEqual((cut.finish_reason, cut.text_chars), ("length", 3))
+
+    def test_ollama_ending(self):
+        last = self._tapped(json.dumps({"message": {"content": "hi", "tool_calls": [{"function": {"name": "a"}}]},
+                                        "done": True, "done_reason": "length"}).encode(), streaming=False)
+        self.assertEqual((last.finish_reason, last.calls, last.text_chars), ("length", 1, 2))
+
+    def test_a_servers_own_words_are_never_shown(self):
+        tap = self._tapped(self._sse({"choices": [{"delta": {"content": "x"}, "finish_reason": "[red]eos_custom_thing"}]}))
+        self.assertEqual(tap.finish_reason, "other")
+        self.assertIsNone(proxy._finish_name(""))
+        self.assertIsNone(proxy._finish_name(7))
+        self.assertEqual(proxy._finish_name("END_TURN"), "stop")
+
+    def test_the_tap_keeps_no_text(self):
+        secret = "private-words-0815"
+        tap = self._tapped(self._sse(
+            {"choices": [{"delta": {"content": secret, "reasoning_content": secret}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": secret, "function": {"name": secret,
+                                                                                          "arguments": secret}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+        self.assertEqual(tap.calls, 1)
+        kept = {k: v for k, v in vars(tap).items() if k not in ("_line", "_body")}
+        self.assertNotIn(secret, repr(kept))
+
+    def test_odd_shapes_only_cost_the_ending(self):
+        for event in ({"choices": [{"delta": {"tool_calls": "x"}}]}, {"choices": ["x"]}, {"type": "message_delta", "delta": 3},
+                      {"type": "content_block_start", "content_block": None}, {"type": "response.completed", "response": 5},
+                      {"message": {"content": 5, "tool_calls": [None, 3]}}):
+            tap = self._tapped(self._sse(event, {"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 1}}))
+            self.assertEqual(tap.usage, {"prompt": 4, "out": 1}, event)
+
+    def test_how_a_reply_ended_reads_plainly(self):
+        end = proxy._reply_end
+        self.assertIsNone(end({"error": True, "finish": "stop"}))
+        self.assertIsNone(end({"cancelled": True, "finish": "length"}))
+        self.assertIsNone(end({"finish": None, "calls": 0, "text_chars": 0, "out": None}))  # not a generation
+        self.assertEqual(end({"finish": None, "out": 5})[0], "no end")
+        self.assertEqual(end({"finish": "context"})[0], "ctx full")
+        self.assertEqual(end({"finish": "filtered"})[0], "filtered")
+        self.assertEqual(end({"finish": "tool_calls", "calls": 0})[0], "0 calls")
+        self.assertEqual(end({"finish": "stop", "calls": 1})[:2], ("1 call", "1 tool call"))
+        self.assertEqual(end({"finish": "stop", "text_chars": 0, "reasoning_chars": 9})[1], "no answer text, only reasoning")
+        self.assertEqual(end({"finish": "stop", "text_chars": 4, "tools": True})[0], "no call")
+        self.assertEqual(end({"finish": "stop", "text_chars": 4})[:2], ("answer", "an answer"))
+        self.assertTrue(end({"finish": "other"})[2])
+
     def test_deepseek_cache_field(self):
         self.assertEqual(proxy._norm_usage({"prompt_tokens": 10, "prompt_cache_hit_tokens": 6})["cached"], 6)
 
@@ -1751,6 +1838,8 @@ class MockChat(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     status = 200
     reply_text = "hello"
+    end_reason = "stop"      # the finish_reason sent; None sends none (a cut-off stream)
+    tool_calls = None        # streamed as two deltas per call when set
 
     def do_GET(self):
         self._json(200, {"object": "list", "data": [{"id": "m", "object": "model"}]})
@@ -1767,15 +1856,22 @@ class MockChat(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
         else:
-            self._json(200, {"choices": [{"message": {"role": "assistant", "content": MockChat.reply_text}}],
+            self._json(200, {"choices": [{"message": {"role": "assistant", "content": MockChat.reply_text},
+                                          "finish_reason": MockChat.end_reason}],
                              "usage": {"prompt_tokens": 100, "completion_tokens": 20,
                                        "prompt_tokens_details": {"cached_tokens": 75}, "cost": 0.25}})
 
     @staticmethod
     def stream_body():
         events = [{"choices": [{"delta": {"content": MockChat.reply_text}}]},
-                  {"choices": [{"delta": {"content": "!"}}]},
-                  {"choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 2}}]
+                  {"choices": [{"delta": {"content": "!"}}]}]
+        for i, (name, args) in enumerate(MockChat.tool_calls or []):
+            events.append({"choices": [{"delta": {"tool_calls": [{"index": i, "id": f"call_{i}", "type": "function",
+                                                                  "function": {"name": name, "arguments": ""}}]}}]})
+            events.append({"choices": [{"delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}}]})
+        if MockChat.end_reason:
+            events.append({"choices": [{"delta": {}, "finish_reason": MockChat.end_reason}]})
+        events.append({"choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 2}})
         return b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events) + b"data: [DONE]\n\n"
 
     _json = MockUpstream._json
@@ -1807,6 +1903,8 @@ class LiveStatsTests(unittest.TestCase):
         proxy._stats = proxy.GatewayStats()
         MockChat.status = 200
         MockChat.reply_text = "hello"
+        MockChat.end_reason = "stop"
+        MockChat.tool_calls = None
         proxy.set_config("force_default_model", False)
         proxy.set_config("endpoints", [{"name": "up", "type": "custom", "host": f"localhost:{self.up_port}",
                                         "enabled": True, "api_key": ""}])
@@ -1818,10 +1916,10 @@ class LiveStatsTests(unittest.TestCase):
         proxy.CONFIG_FILE, proxy._config, proxy._stats = self._saved
         self._tmp.cleanup()
 
-    def _post(self, stream=False, model="up:m", text="hi", headers=None, path="/v1/chat/completions"):
+    def _post(self, stream=False, model="up:m", text="hi", headers=None, path="/v1/chat/completions", extra=None):
         status, _, body = request(self.gw_port, "POST", path,
                                   body=json.dumps({"model": model, "stream": stream,
-                                                   "messages": [{"role": "user", "content": text}]}),
+                                                   "messages": [{"role": "user", "content": text}], **(extra or {})}),
                                   headers={"Content-Type": "application/json", **(headers or {})})
         proxy._stats.wait_idle()
         time.sleep(0.05)  # the gateway counts it just after the client has the reply
@@ -1915,7 +2013,69 @@ class LiveStatsTests(unittest.TestCase):
         lines = []
         while not proxy._log_queue.empty():
             lines.append(proxy._log_queue.get_nowait())
-        self.assertEqual(lines, ["[127.0.0.1] → up [200]  100 in (75% cached) · 20 out"])
+        self.assertEqual(lines, ["[127.0.0.1] → up [200]  100 in (75% cached) · 20 out · ended: an answer"])
+
+    # ── how a reply ended ─────────────────────────────────────────────────
+    TOOLS = {"tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]}
+
+    def _ended(self):
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(proxy._log_queue.get_nowait())
+        return proxy._stats.snapshot()["recent"][0], [line for line in lines if "→ up" in line]
+
+    def _end_cell(self, rec):
+        snap = {"gateway": {"recent": [rec]}}
+        return _as_text(proxy.panel_recent(snap), 200)
+
+    def test_a_streamed_tool_call_is_counted(self):
+        MockChat.tool_calls = [("read_file", '{"path": "a.txt"}'), ("list_files", "{}")]
+        MockChat.end_reason = "tool_calls"
+        self._post(stream=True, extra=self.TOOLS)
+        rec, lines = self._ended()
+        self.assertEqual((rec["finish"], rec["calls"], rec["tools"]), ("tool_calls", 2, True))
+        self.assertIn("ended: 2 tool calls", lines[-1])
+        self.assertIn("2 calls", self._end_cell(rec))
+
+    def test_an_answer_with_no_tool_call_ends_an_agents_turn(self):
+        self._post(stream=True, extra=self.TOOLS)
+        rec, lines = self._ended()
+        self.assertEqual((rec["finish"], rec["calls"], rec["text_chars"]), ("stop", 0, len("hello!")))
+        self.assertIn("ended: an answer with no tool call", lines[-1])
+        self.assertIn("no call", self._end_cell(rec))
+
+    def test_a_reply_cut_off_at_the_token_limit(self):
+        for stream in (False, True):
+            MockChat.end_reason = "length"
+            self._post(stream=stream)
+            rec, lines = self._ended()
+            self.assertEqual(rec["finish"], "length")
+            self.assertIn("ended: cut off at the token limit", lines[-1])
+            self.assertIn("cut off", self._end_cell(rec))
+
+    def test_a_stream_that_ends_without_a_reason(self):
+        MockChat.end_reason = None
+        self._post(stream=True)
+        rec, lines = self._ended()
+        self.assertIsNone(rec["finish"])
+        self.assertIn("ended without saying why", lines[-1])
+        self.assertIn("no end", self._end_cell(rec))
+
+    def test_an_error_has_no_ending(self):
+        MockChat.status = 500
+        self._post()
+        rec, lines = self._ended()
+        self.assertNotIn("ended:", lines[-1])
+
+    def test_no_text_or_tool_arguments_are_kept(self):
+        MockChat.reply_text = self.SECRET
+        MockChat.tool_calls = [("run_" + self.SECRET, '{"command": "' + self.SECRET + '"}')]
+        MockChat.end_reason = "tool_calls"
+        self._post(stream=True, extra=self.TOOLS)
+        rec, lines = self._ended()
+        self.assertEqual(rec["calls"], 1)
+        self.assertNotIn(self.SECRET, json.dumps(proxy.stats_snapshot()))
+        self.assertNotIn(self.SECRET, "\n".join(lines))
 
     def test_totals_survive_a_restart_but_this_run_starts_over(self):
         self._post(headers={"X-Title": "Cline"})
