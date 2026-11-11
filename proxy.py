@@ -3489,6 +3489,105 @@ def _parse_tool_blocks(text: str, tools=None):
     return None if any(t in trailing for t in _TOOL_TRIGGERS) else (calls, trailing)
 
 
+_GEMMA_OPEN, _GEMMA_CLOSE, _GEMMA_QUOTE = "<|tool_call>", "<tool_call|>", '<|"|>'
+_THINK_END = "</think>"
+_GEMMA_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+_GEMMA_SCALAR_RE = re.compile(r"true|false|null|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def _parse_gemma_calls(text: str):
+    """Gemma 4's own call format, <|tool_call>call:name{key:value,...}<tool_call|>, one or more
+    and nothing else: [{name, arguments}] or None. Strings sit between <|"|> marks and are
+    taken as written; anything this can't read whole means None."""
+    n = len(text)
+
+    def skip(at):
+        while at < n and text[at].isspace():
+            at += 1
+        return at
+
+    def value(at):
+        at = skip(at)
+        if text.startswith(_GEMMA_QUOTE, at):
+            end = text.find(_GEMMA_QUOTE, at + len(_GEMMA_QUOTE))
+            if end < 0:
+                raise ValueError("open string")
+            return text[at + len(_GEMMA_QUOTE):end], end + len(_GEMMA_QUOTE)
+        if text.startswith("{", at):
+            out, at = {}, skip(at + 1)
+            if text.startswith("}", at):
+                return out, at + 1
+            while True:
+                at = skip(at)
+                if text.startswith(_GEMMA_QUOTE, at):
+                    key, at = value(at)
+                else:
+                    m = _GEMMA_KEY_RE.match(text, at)
+                    if not m:
+                        raise ValueError("no key")
+                    key, at = m.group(0), m.end()
+                at = skip(at)
+                if not text.startswith(":", at) or key in out:
+                    raise ValueError("no colon")
+                out[key], at = value(at + 1)
+                at = skip(at)
+                if text.startswith("}", at):
+                    return out, at + 1
+                if not text.startswith(",", at):
+                    raise ValueError("no comma")
+                at += 1
+        if text.startswith("[", at):
+            out, at = [], skip(at + 1)
+            if text.startswith("]", at):
+                return out, at + 1
+            while True:
+                item, at = value(at)
+                out.append(item)
+                at = skip(at)
+                if text.startswith("]", at):
+                    return out, at + 1
+                if not text.startswith(",", at):
+                    raise ValueError("no comma")
+                at += 1
+        m = _GEMMA_SCALAR_RE.match(text, at)
+        if not m:
+            raise ValueError("no value")
+        return json.loads(m.group(0)), m.end()
+
+    calls, pos = [], skip(0)
+    try:
+        while pos < n:
+            if not text.startswith(_GEMMA_OPEN, pos):
+                return None
+            pos = skip(pos + len(_GEMMA_OPEN))
+            if not text.startswith("call:", pos):
+                return None
+            brace = text.find("{", pos)
+            name = text[pos + len("call:"):brace].strip() if brace > 0 else ""
+            if not _TOOL_NAME_RE.match(name):
+                return None
+            args, pos = value(brace)
+            pos = skip(pos)
+            if not isinstance(args, dict) or not text.startswith(_GEMMA_CLOSE, pos):
+                return None
+            calls.append({"name": name, "arguments": json.dumps(args, ensure_ascii=False)})
+            pos = skip(pos + len(_GEMMA_CLOSE))
+    except (ValueError, RecursionError):
+        return None
+    return calls or None
+
+
+def _calls_after_thinking(reasoning: str):
+    """The calls a model wrote straight after closing its thinking with </think>, where the
+    server (LM Studio with a Gemma 4 finetune) didn't see thinking end and so left them in the
+    reasoning. Only when that closing tag is there and everything after it is whole calls:
+    a call the model merely thought about is never one."""
+    at = reasoning.rfind(_THINK_END)
+    if at < 0:
+        return None
+    return _parse_gemma_calls(reasoning[at + len(_THINK_END):])
+
+
 def _decode_params(call: dict, tools: dict) -> str:
     """The call's arguments as a JSON string, typed by the tool's schema where known. A
     value that doesn't fit stays as written, and the client tells the model what's wrong."""
@@ -3564,6 +3663,9 @@ class ToolHealer:
         self._done = False
         self._broken = False
         self._last_write = time.time()
+        self._reasoning = []        # the reasoning, in memory for this reply only: a call may hide after </think>
+        self._reasoning_size = 0
+        self._said = False          # any answer text at all
 
     # ── building replies ────────────────────────────────────────────────
     def _chunk(self, delta: dict, finish=None, extra=None) -> bytes:
@@ -3726,7 +3828,14 @@ class ToolHealer:
         out = []
         content = delta.get("content")
         pass_raw = True
+        for key in ("reasoning_content", "reasoning"):
+            thought = delta.get(key)
+            if isinstance(thought, str) and thought and self._reasoning_size <= _HEAL_MAX_HOLD:
+                self._reasoning.append(thought)
+                self._reasoning_size += len(thought)
+                break
         if isinstance(content, str) and content:
+            self._said = True
             if self._text is not None:
                 self._hold_text(content)
                 sent = ""
@@ -3759,9 +3868,28 @@ class ToolHealer:
                 if not finish_in_held:
                     self._held.append(self._finish_event(obj, choice))
                 return b"".join(out)
+            if finish == "stop" and not self._said and not self._resolved:
+                rescued = self._rescue_from_reasoning()
+                if rescued is not None:
+                    self._resolved = True
+                    return b"".join(out) + rescued
             if not pass_raw:
                 out.append(self._finish_event(obj, choice))
         return raw if pass_raw else b"".join(out)
+
+    def _rescue_from_reasoning(self):
+        """A reply that ended with no answer and no call, but whose reasoning closes with
+        </think> and whole calls: send those calls. None when there is nothing to rescue."""
+        if self._reasoning_size > _HEAL_MAX_HOLD:
+            return None
+        calls = _calls_after_thinking("".join(self._reasoning))
+        if not calls:
+            return None
+        rule, command = self._judge(calls)
+        if rule:
+            return self._stop(rule, command)
+        self.result = {"healed": len(calls), "unknown": sum(1 for c in calls if c["name"] not in self.tools)}
+        return self._tool_chunks(calls)
 
     @staticmethod
     def _finish_event(obj: dict, choice: dict) -> bytes:
@@ -3879,7 +4007,18 @@ class ToolHealer:
                 return raw
             content = message.get("content")
             if not isinstance(content, str) or not content:
-                return raw
+                thought = message.get("reasoning_content") or message.get("reasoning")
+                found = _calls_after_thinking(thought) if finish == "stop" and isinstance(thought, str) else None
+                if not found:
+                    return raw
+                rule, command = self._judge(found)
+                if rule:
+                    return self._stopped_body(obj, choice, message, rule, command, None)
+                self.result = {"healed": len(found), "unknown": sum(1 for c in found if c["name"] not in self.tools)}
+                message["tool_calls"] = [{"id": f"call_gw_{i + 1}", "type": "function",
+                                          "function": {"name": c["name"], "arguments": c["arguments"]}} for i, c in enumerate(found)]
+                choice["finish_reason"] = "tool_calls"
+                return json.dumps(obj, ensure_ascii=False).encode("utf-8")
             prose = self._scan(content)
             if self._text is None:
                 return raw

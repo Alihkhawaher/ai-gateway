@@ -344,6 +344,7 @@ It's off by default, and then every reply passes byte for byte. When it's on, it
 |---|---|
 | A complete call written as text, with a real tool name | A proper tool call, which runs |
 | A complete call written as text, with a name the client doesn't have | A proper tool call under that same name. Nothing runs, and the client tells the model which tools exist, so it can correct itself |
+| No answer and no call, but the reasoning ends with `</think>` followed by complete calls in Gemma 4's format (`<\|tool_call>call:name{…}<tool_call\|>`) | Proper tool calls. This happens with Gemma 4 finetunes on LM Studio: the model closes its thinking with the wrong tag, so the server leaves the call inside the reasoning and the agent stops |
 | A call in a code fence, or a tag mentioned in a sentence | The text, unchanged: that's a quotation |
 | A written call that is incomplete or was cut off | The text, unchanged. It never runs |
 | A proper tool call that is safe | The same bytes, held until the whole call has arrived |

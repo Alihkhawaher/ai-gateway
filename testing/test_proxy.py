@@ -3441,6 +3441,116 @@ class ToolHealGatewayTests(unittest.TestCase):
         self.assertIn(self.SECRET, read_reply(body)["calls"][0]["arguments"])
 
 
+def sse_reasoning(reasoning: str, content: str = "", finish="stop", pieces=3, key="reasoning_content") -> bytes:
+    """A reply whose text arrived as reasoning (what LM Studio sends while it thinks a model is still thinking)."""
+    size = max(1, len(reasoning) // pieces)
+    out = [_sse(_delta({"role": "assistant", "content": ""}))]
+    out += [_sse(_delta({key: reasoning[i:i + size]})) for i in range(0, len(reasoning), size)]
+    if content:
+        out.append(_sse(_delta({"content": content})))
+    out.append(_sse(_delta({}, finish)))
+    out.append(_sse({"id": "c1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}))
+    out.append(_sse(b"[DONE]"))
+    return b"".join(out)
+
+
+Q = '<|"|>'
+GEMMA_CALL = "<|tool_call>call:run_commands{commands:[" + Q + 'python -c "print(1)"' + Q + "]}<tool_call|>"
+
+
+class GemmaCallAfterThinkingTests(unittest.TestCase):
+    """A Gemma 4 finetune closes its thinking with </think>, LM Studio doesn't see thinking end,
+    and the call that follows stays in the reasoning: the reply has no answer and no call."""
+
+    THOUGHT = "I should fetch the page first.\n"
+
+    def _view(self, reasoning, **kw):
+        healer, out = run_healer(sse_reasoning(reasoning, **{k: v for k, v in kw.items() if k in ("content", "finish", "key")}),
+                                 **{k: v for k, v in kw.items() if k not in ("content", "finish", "key")})
+        return healer, read_reply(out), out
+
+    def test_the_format_is_read(self):
+        calls = proxy._parse_gemma_calls(GEMMA_CALL)
+        self.assertEqual(calls, [{"name": "run_commands", "arguments": json.dumps({"commands": ['python -c "print(1)"']})}])
+        rich = ("<|tool_call>call:editor{path:" + Q + W("C:/demo/a b.txt") + Q + ",insert_line:12,new_text:" + Q + "x, {y}: [z]\n" + Q
+                + ",flags:{deep:true,none:null,ratio:-1.5e3},list:[]}<tool_call|>\n" + GEMMA_CALL)
+        got = proxy._parse_gemma_calls(rich)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(json.loads(got[0]["arguments"]), {"path": W("C:/demo/a b.txt"), "insert_line": 12, "new_text": "x, {y}: [z]\n",
+                                                          "flags": {"deep": True, "none": None, "ratio": -1500.0}, "list": []})
+
+    def test_anything_not_whole_is_not_a_call(self):
+        for bad in ("", "plain text", GEMMA_CALL[:-12], GEMMA_CALL + " and then some words", "words " + GEMMA_CALL,
+                    "<|tool_call>call:run_commands{commands:[" + Q + "open string]}<tool_call|>",
+                    "<|tool_call>call:bad name{a:1}<tool_call|>", "<|tool_call>run_commands{a:1}<tool_call|>",
+                    "<|tool_call>call:x{a:1,a:2}<tool_call|>", "<|tool_call>call:x{a:word}<tool_call|>",
+                    "<|tool_call>call:x[1]<tool_call|>", "<|tool_call>call:x{a:1}"):
+            self.assertIsNone(proxy._parse_gemma_calls(bad), bad)
+
+    def test_a_call_after_the_closing_tag_becomes_a_tool_call(self):
+        healer, view, _ = self._view(self.THOUGHT + "</think>" + GEMMA_CALL)
+        self.assertEqual(view["calls"][0]["name"], "run_commands")
+        self.assertEqual(json.loads(view["calls"][0]["arguments"]), {"commands": ['python -c "print(1)"']})
+        self.assertEqual((view["finish"], view["done"], view["content"]), ("tool_calls", True, ""))
+        self.assertEqual(view["usage"]["prompt_tokens"], 10)
+        self.assertEqual(healer.result, {"healed": 1, "unknown": 0})
+
+    def test_it_works_however_the_stream_is_cut_and_for_the_other_field_name(self):
+        for step in (1, 7, 64):
+            healer, out = run_healer(sse_reasoning(self.THOUGHT + "</think>\n" + GEMMA_CALL + "\n", key="reasoning"), step=step)
+            self.assertEqual(read_reply(out)["calls"][0]["name"], "run_commands", step)
+
+    def test_a_call_the_model_only_thought_about_is_left_alone(self):
+        for reasoning in (self.THOUGHT + GEMMA_CALL,                               # no closing tag: still thinking
+                          self.THOUGHT + "</think>" + GEMMA_CALL + " then more words",  # not only calls after it
+                          GEMMA_CALL + "</think>",                                 # the call came before the tag
+                          self.THOUGHT + "</think>" + GEMMA_CALL[:-12]):           # cut off
+            stream = sse_reasoning(reasoning)
+            healer, out = run_healer(stream)
+            self.assertEqual(out, stream, reasoning)                               # byte for byte
+            self.assertEqual(healer.result, {})
+
+    def test_a_reply_that_has_an_answer_is_left_alone(self):
+        stream = sse_reasoning(self.THOUGHT + "</think>" + GEMMA_CALL, content="Here is the answer.")
+        _h, out = run_healer(stream)
+        self.assertEqual(out, stream)
+
+    def test_a_cut_off_reply_is_left_alone(self):
+        stream = sse_reasoning(self.THOUGHT + "</think>" + GEMMA_CALL, finish="length")
+        _h, out = run_healer(stream)
+        self.assertEqual(out, stream)
+
+    def test_the_guard_still_judges_it(self):
+        bad = "<|tool_call>call:run_commands{commands:[" + Q + "Remove-Item -Recurse -Force C:" + chr(92) + Q + "]}<tool_call|>"
+        healer, view, _ = self._view(self.THOUGHT + "</think>" + bad)
+        self.assertEqual(healer.result.get("stopped"), 1)
+        self.assertEqual(view["calls"][0]["name"], "ask_question")
+        self.assertEqual(view["finish"], "tool_calls")
+
+    def test_an_unknown_tool_name_goes_through_under_that_name(self):
+        healer, view, _ = self._view("</think><|tool_call>call:made_up_tool{a:1}<tool_call|>")
+        self.assertEqual(view["calls"][0]["name"], "made_up_tool")
+        self.assertEqual(healer.result, {"healed": 1, "unknown": 1})
+
+    def test_a_whole_reply_is_healed_the_same_way(self):
+        def body(reasoning, content=None, finish="stop"):
+            return json.dumps({"id": "c1", "choices": [{"index": 0, "finish_reason": finish, "message": {
+                "role": "assistant", "content": content, "reasoning_content": reasoning}}]}).encode()
+
+        healer = proxy.ToolHealer({"enabled": True}, {"tools": CLINE_TOOLS})
+        got = json.loads(healer.rewrite_body(body(self.THOUGHT + "</think>" + GEMMA_CALL)))
+        self.assertEqual(got["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(got["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "run_commands")
+        self.assertEqual(healer.result, {"healed": 1, "unknown": 0})
+        for raw in (body(self.THOUGHT + GEMMA_CALL), body(self.THOUGHT + "</think>" + GEMMA_CALL, finish="length"),
+                    body(self.THOUGHT + "</think>" + GEMMA_CALL, content="An answer.")):
+            self.assertEqual(proxy.ToolHealer({"enabled": True}, {"tools": CLINE_TOOLS}).rewrite_body(raw), raw)
+
+    def test_no_text_is_kept_after_the_reply(self):
+        healer, _view, _ = self._view(self.THOUGHT + "</think>" + GEMMA_CALL)
+        self.assertEqual(set(healer.result), {"healed", "unknown"})
+
+
 class ThinkingSwitchTests(unittest.TestCase):
     """The client decides whether the model thinks; the gateway carries that
     choice to LM Studio in the one field LM Studio honours (reasoning_effort)."""
