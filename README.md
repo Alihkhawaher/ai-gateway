@@ -403,6 +403,41 @@ The gateway doesn't shorten or summarize chats. It makes sure your app can do th
 - **A full context reaches the app as the standard error.** When an engine answers that the prompt doesn't fit, each says it its own way (llama.cpp: "exceeds the available context size"). The gateway answers `400` with the OpenAI code `context_length_exceeded`, a message with the token counts where the engine gave them, and the engine's own words. Apps with overflow recovery, such as Cline, then compact and retry instead of stopping. `/v1/messages` gets Anthropic's form of the same error. Any other error passes byte for byte.
 - **The console shows it coming.** From 90% of the window, the **In** column of Recent requests shows the share used, for example `241k 92%`, and the log line says `context 92% full`. A request that hit the limit shows `ctx full`.
 
+### Compacting early (`context_guard`)
+
+Some apps only compact after the engine refuses the prompt. By then the chat no longer fits, so nothing can read all of it, and what the app cuts is lost. Cline 4.1.26 does this: its emergency compaction drops messages, and its early compaction didn't run here even past the window it believed in.
+
+With the context guard on, the gateway says "full" while the whole chat still fits, then gives the app's next request what it cut:
+
+```json
+{ "name": "strata", "type": "strata", "host": "127.0.0.1:47831", "context_guard": { "enabled": true } }
+```
+
+Or tick **Compact early** in the endpoint's dialog in Settings.
+
+1. **At 90% of the window**, the gateway answers `context_length_exceeded` without asking the engine, and keeps that request's messages in memory.
+2. **The app's next request** is then one of two things:
+   - **A compact request:** a cut-down chat followed by a new instruction. The gateway puts the cut messages back, so the app's compaction reads the whole chat.
+   - **The same turn again, with messages cut out.** The gateway asks the engine to summarize the chat up to the last cut message. That prompt is the start of the chat the engine just held, so it comes mostly from its cache. The summary is added to that turn, and to the front of the reply, where the app keeps it in its own history.
+3. **Anything unclear goes through as the app sent it:** a different chat, a failed summary, or nothing really cut.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `enabled` | `false` | Turn the guard on for this endpoint |
+| `at` | `0.9` | The share of the context window where "full" is said (0.5 to 0.99) |
+| `summary_tokens` | `2000` | The most the summary may be |
+
+What to know:
+
+- **The token count is an estimate** until the engine has read the prompt: the request's size divided by bytes per token, learned from finished requests. Nothing is said before one request has finished.
+- **The request right after a "full" is never refused**, so an app can't be locked out.
+- **The chat is held in memory only**, for that one follow-up request or 15 minutes, and never written or logged. The log shows counts, such as `6 cut, 0 new at the end`.
+- **A summary costs one extra generation**, and the shortened chat is read again afterwards.
+
+## The Log File
+
+The console's log lines are also written to `gateway.log` beside `config.json` (gitignored), so they're still there after the console closes. They hold counts and names only, never chat text. The file is cut back to its newer half at 5 MB. `"log_file": false` in `config.json` turns it off.
+
 ## Thinking On or Off
 
 Your app decides whether the model thinks, and the gateway delivers that choice to the endpoint. Nothing is set in the gateway's config.

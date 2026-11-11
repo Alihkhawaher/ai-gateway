@@ -1921,6 +1921,8 @@ class MockChat(BaseHTTPRequestHandler):
     reply_text = "hello"
     end_reason = "stop"      # the finish_reason sent; None sends none (a cut-off stream)
     error_body = None        # the JSON sent with a status that isn't 200
+    seen = []                # every request body received, as dicts
+    statuses = []            # a status for each coming request, before `status` applies again
     tool_calls = None        # streamed as two deltas per call when set
 
     def do_GET(self):
@@ -1928,8 +1930,10 @@ class MockChat(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
-        if MockChat.status != 200:
-            self._json(MockChat.status, MockChat.error_body or {"error": {"message": "nope"}})
+        MockChat.seen.append(body)
+        status = MockChat.statuses.pop(0) if MockChat.statuses else MockChat.status
+        if status != 200:
+            self._json(status, MockChat.error_body or {"error": {"message": "nope"}})
         elif body.get("stream"):
             payload = MockChat.stream_body()
             self.send_response(200)
@@ -3610,6 +3614,300 @@ class ContextLimitTests(unittest.TestCase):
         self.assertIsNone(proxy._context_window("up", "never-heard-of-it"))
         self._post()
         self.assertIsNone(proxy._stats.snapshot()["recent"][0]["window"])
+
+
+class ContextGuardTests(unittest.TestCase):
+    """An app that only compacts after an overflow: the gateway says "full" while the chat still fits,
+    then gives the app's next request what it cut."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockChat)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats, proxy.get_models(), dict(proxy._model_meta))
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        MockChat.status, MockChat.error_body, MockChat.reply_text = 200, None, "hello"
+        MockChat.end_reason, MockChat.tool_calls, MockChat.seen, MockChat.statuses = "stop", None, [], []
+        proxy._ctx_ratio.clear(); proxy._ctx_pending.clear()
+        proxy.set_config("force_default_model", False)
+        self._use({"enabled": True})
+        proxy.set_models(["up:m"])
+        with proxy._model_meta_lock:
+            proxy._model_meta["up:m"] = {"context_length": 1000}
+        while not proxy._log_queue.empty():
+            proxy._log_queue.get_nowait()
+
+    def tearDown(self):
+        proxy._stats.wait_idle()
+        time.sleep(0.05)
+        MockChat.status, MockChat.statuses, MockChat.seen = 200, [], []
+        proxy._ctx_ratio.clear(); proxy._ctx_pending.clear()
+        proxy.set_endpoint_status("up", "disabled")
+        proxy.CONFIG_FILE, proxy._config, proxy._stats, models, meta = self._saved
+        proxy.set_models(models)
+        with proxy._model_meta_lock:
+            proxy._model_meta.clear()
+            proxy._model_meta.update(meta)
+        self._tmp.cleanup()
+
+    def _use(self, guard):
+        ep = {"name": "up", "type": "custom", "host": f"localhost:{self.up_port}", "enabled": True, "api_key": ""}
+        if guard is not None:
+            ep["context_guard"] = guard
+        proxy.set_config("endpoints", [ep])
+        proxy.set_endpoint_status("up", "online")
+
+    @staticmethod
+    def _chat(turns, last="now do the next step"):
+        msgs = [{"role": "system", "content": "You are an agent."}, {"role": "user", "content": "The task: tidy the made-up project."}]
+        for i in range(turns):
+            msgs.append({"role": "assistant", "content": f"step {i}: " + "made-up work " * 40})
+            msgs.append({"role": "user", "content": f"result {i}: " + "made-up output " * 40})
+        msgs.append({"role": "user", "content": last})
+        return msgs
+
+    def _post(self, messages, stream=False, tools=None):
+        body = {"model": "up:m", "stream": stream, "messages": messages}
+        if tools:
+            body["tools"] = tools
+        counted = len(proxy._stats.snapshot()["recent"])
+        status, headers, raw = request(self.gw_port, "POST", "/v1/chat/completions", body=json.dumps(body),
+                                       headers={"Content-Type": "application/json"})
+        deadline = time.time() + 5
+        while len(proxy._stats.snapshot()["recent"]) == counted and time.time() < deadline:
+            time.sleep(0.01)
+        proxy._stats.wait_idle()
+        time.sleep(0.05)
+        return status, raw
+
+    def _log(self):
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(proxy._log_queue.get_nowait())
+        return "\n".join(lines)
+
+    def _learn(self):
+        """One finished request teaches the gateway bytes per token: the mock says every prompt is 100 tokens,
+        so make this one count as 600 with a ratio the test sets itself."""
+        with proxy._ctx_lock:
+            proxy._ctx_ratio["up"] = 4.0            # 4 bytes a token: 1,000 tokens = 4,000 bytes
+
+    # ── saying "full" early ───────────────────────────────────────────────
+    def test_full_is_said_at_ninety_percent_before_the_engine_is_asked(self):
+        self._learn()
+        status, raw = self._post(self._chat(4))                     # about 4.6 kB: over 90% of 1,000 tokens
+        self.assertEqual(status, 400)
+        err = json.loads(raw)["error"]
+        self.assertEqual(err["code"], "context_length_exceeded")
+        self.assertEqual(err["n_ctx"], 1000)
+        self.assertEqual(MockChat.seen, [])                         # the engine never saw it
+        rec = proxy._stats.snapshot()["recent"][0]
+        self.assertEqual((rec["status"], rec["overflow"], rec["overflow_early"]), (400, True, True))
+        log = self._log()
+        self.assertIn("context guard", log)
+        self.assertIn("told to compact early", log)
+        self.assertIn("ctx early", _as_text(proxy.panel_recent({"gateway": proxy._stats.snapshot()}), 220))
+
+    def test_a_chat_with_room_left_is_forwarded(self):
+        self._learn()
+        self.assertEqual(self._post(self._chat(1))[0], 200)
+        self.assertEqual(len(MockChat.seen), 1)
+
+    def test_nothing_is_said_before_a_request_has_taught_the_size_of_a_token(self):
+        self.assertEqual(self._post(self._chat(4))[0], 200)         # no ratio yet: forwarded
+
+    def test_bytes_per_token_are_learned_from_finished_requests(self):
+        self.assertIsNone(proxy._ctx_estimate("up", 4000))
+        proxy._ctx_learn("up", 4000, 1000)
+        self.assertEqual(proxy._ctx_estimate("up", 4000), 1000)
+        proxy._ctx_learn("up", 10, 5)                               # too small to learn from
+        proxy._ctx_learn("up", 4000, 10)                            # an absurd ratio
+        self.assertEqual(proxy._ctx_estimate("up", 4000), 1000)
+        image = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 5000}}]}
+        body = json.dumps({"messages": [image]}).encode()
+        self.assertLess(proxy._ctx_size(body, {"messages": [image]}), 200)   # pictures are bytes, not tokens
+
+    def test_off_means_untouched(self):
+        self._use(None)
+        self._learn()
+        self.assertEqual(self._post(self._chat(4))[0], 200)
+        self._use({"enabled": False})
+        self.assertEqual(self._post(self._chat(4))[0], 200)
+
+    # ── the app's next request ────────────────────────────────────────────
+    def test_a_cut_retry_gets_a_summary_of_what_was_cut(self):
+        self._learn()
+        full = self._chat(4)
+        self.assertEqual(self._post(full)[0], 400)
+        MockChat.reply_text = "SUMMARY: steps 0 to 3 were done."
+        cut = full[:2] + full[-3:]                                  # the app kept the start and the tail
+        status, raw = self._post(cut)
+        self.assertEqual(status, 200)
+        summary_call, real_call = MockChat.seen
+        self.assertEqual(summary_call["messages"][:7], full[:7])    # the full chat, in its own order, up to the last cut message
+        self.assertEqual(len(summary_call["messages"]), 8)
+        self.assertTrue(summary_call["messages"][7]["content"].startswith(full[7]["content"]))
+        self.assertIn("Write a summary", summary_call["messages"][7]["content"])
+        self.assertFalse(summary_call["stream"])
+        self.assertEqual(real_call["messages"][:-1], cut[:-1])      # everything before the last message unchanged
+        self.assertTrue(real_call["messages"][-1]["content"].startswith(cut[-1]["content"]))
+        self.assertIn("SUMMARY: steps 0 to 3 were done.", real_call["messages"][-1]["content"])
+        answer = json.loads(raw)["choices"][0]["message"]["content"]
+        self.assertTrue(answer.startswith("[Context note from the gateway"))   # the app keeps it in its history
+        self.assertIn("SUMMARY: steps 0 to 3 were done.", answer)
+        log = self._log()
+        self.assertIn("6 cut, 0 new at the end", log)
+        self.assertIn("summarised 6 cut messages", log)
+        self.assertNotIn("made-up", log)                            # counts only
+
+    def test_a_streamed_retry_gets_the_summary_as_its_first_piece(self):
+        self._learn()
+        full = self._chat(4)
+        self._post(full, stream=True)
+        MockChat.reply_text = "SUMMARY of the cut part."
+        status, raw = self._post(full[:2] + full[-3:], stream=True)
+        self.assertEqual(status, 200)
+        view = read_reply(raw)
+        self.assertTrue(view["content"].startswith("[Context note from the gateway"))
+        self.assertIn("SUMMARY of the cut part.", view["content"])
+        self.assertTrue(view["done"])
+
+    def test_a_compact_request_gets_the_whole_chat_back(self):
+        self._learn()
+        full = self._chat(4)
+        self._post(full)
+        ask = {"role": "user", "content": "Summarize the conversation so far."}
+        status, _raw = self._post(full[:2] + full[-2:] + [ask])     # cut down, with a new instruction after it
+        self.assertEqual(status, 200)
+        self.assertEqual(len(MockChat.seen), 1)                     # no summary call of the gateway's own
+        self.assertEqual(MockChat.seen[0]["messages"], full + [ask])
+        log = self._log()
+        self.assertIn("1 new at the end", log)
+        self.assertIn("put the 7 cut messages back", log)
+
+    def test_a_compact_request_with_its_own_system_prompt_keeps_it(self):
+        self._learn()
+        full = self._chat(4)
+        self._post(full)
+        system = {"role": "system", "content": "You write summaries."}
+        ask = {"role": "user", "content": "Summarize the conversation so far."}
+        self._post([system] + full[-2:] + [ask])
+        self.assertEqual(MockChat.seen[0]["messages"], [system] + full[1:] + [ask])
+
+    def test_the_request_after_full_is_never_refused_again(self):
+        self._learn()
+        full = self._chat(4)
+        self.assertEqual(self._post(full)[0], 400)
+        self.assertEqual(self._post(full)[0], 200)                  # the same chat again: forwarded as sent
+        self.assertEqual(MockChat.seen[0]["messages"], full)
+        self.assertEqual(self._post(full)[0], 400)                  # and the one after that is judged afresh
+
+    def test_another_chat_after_full_is_left_alone(self):
+        self._learn()
+        self._post(self._chat(4))
+        other = [{"role": "user", "content": "a different made-up question"}]
+        self.assertEqual(self._post(other)[0], 200)
+        self.assertEqual(MockChat.seen[0]["messages"], other)
+        self.assertIn("none from the full chat", self._log())
+
+    def test_a_failed_summary_forwards_the_request_as_the_app_cut_it(self):
+        self._learn()
+        full = self._chat(4)
+        self._post(full)
+        MockChat.statuses = [500]                                   # the summary call fails, the real one works
+        cut = full[:2] + full[-3:]
+        status, raw = self._post(cut)
+        self.assertEqual(status, 200)
+        self.assertEqual(MockChat.seen[-1]["messages"], cut)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "hello")
+        self.assertIn("no summary could be made", self._log())
+
+    def test_tools_go_with_the_summary_call_and_are_dropped_if_refused(self):
+        self._learn()
+        full = self._chat(4)
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+        self._post(full, tools=tools)
+        MockChat.statuses = [400]                                   # an engine that refuses tool_choice none
+        MockChat.reply_text = "SUMMARY again."
+        self.assertEqual(self._post(full[:2] + full[-3:], tools=tools)[0], 200)
+        first, second, real = MockChat.seen
+        self.assertEqual((first.get("tools"), first.get("tool_choice")), (tools, "none"))
+        self.assertNotIn("tools", second)
+        self.assertIn("SUMMARY again.", real["messages"][-1]["content"])
+
+    def test_the_held_chat_is_dropped_after_its_one_use_and_after_a_while(self):
+        self._learn()
+        self._post(self._chat(4))
+        self.assertEqual(len(proxy._ctx_pending), 1)
+        self._post(self._chat(4)[:2] + self._chat(4)[-3:])
+        self.assertEqual(proxy._ctx_pending, {})
+        self._post(self._chat(4))
+        for held in proxy._ctx_pending.values():
+            held["time"] -= proxy._CTX_PENDING_TTL_S + 1
+        self._post([{"role": "user", "content": "short"}])
+        self.assertEqual(proxy._ctx_pending, {})
+
+    def test_settings_are_checked(self):
+        self.assertIsNone(proxy._ctx_guard_config({}))
+        self.assertIsNone(proxy._ctx_guard_config({"context_guard": {"enabled": False}}))
+        cfg = proxy._ctx_guard_config({"context_guard": {"enabled": True, "at": 5, "summary_tokens": "many", "x": 1}})
+        self.assertEqual((cfg["at"], cfg["summary_tokens"]), (0.9, 2000))
+        self.assertEqual(proxy._ctx_guard_config({"context_guard": {"enabled": True, "at": 0.8}})["at"], 0.8)
+
+
+class LogFileTests(unittest.TestCase):
+    """The console's log lines are kept on disk too."""
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+
+    def tearDown(self):
+        proxy.CONFIG_FILE, proxy._config = self._saved
+        self._tmp.cleanup()
+
+    def _text(self):
+        with open(proxy._log_file_path(), encoding="utf-8") as f:
+            return f.read()
+
+    def test_lines_are_written_with_the_time(self):
+        proxy._queue_log_line("first made-up line")
+        proxy._queue_log_line("second\nline")
+        lines = self._text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d first made-up line$")
+        self.assertTrue(lines[1].endswith("second line"))
+
+    def test_it_can_be_switched_off(self):
+        proxy._config["log_file"] = False
+        proxy._queue_log_line("not written")
+        self.assertFalse(os.path.exists(proxy._log_file_path()))
+
+    def test_a_big_file_is_cut_back_to_its_newer_half(self):
+        old = proxy._LOG_FILE_MAX
+        proxy._LOG_FILE_MAX = 2000
+        try:
+            for i in range(200):
+                proxy._queue_log_line(f"line {i:04d}")
+            text = self._text()
+        finally:
+            proxy._LOG_FILE_MAX = old
+        self.assertLess(len(text), 3200)
+        self.assertIn("line 0199", text)
+        self.assertNotIn("line 0000", text)
+        self.assertTrue(all(line[:4].isdigit() for line in text.splitlines()))   # no half line at the cut
 
 
 def sse_reasoning(reasoning: str, content: str = "", finish="stop", pieces=3, key="reasoning_content") -> bytes:

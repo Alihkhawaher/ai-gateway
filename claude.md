@@ -187,11 +187,18 @@ The gateway never compacts a chat: the client does, and the gateway gives it wha
 - `/v1/models` and `/props` report `loaded_context_length` when the endpoint gives one (LM Studio), with the model's maximum in `max_context_length`.
 - `_context_window()` and `window_used` put the share of the window a chat uses into the stats; `_WINDOW_WARN` (90%) is where the console and the log start showing it.
 
+**Context guard** (`"context_guard": {"enabled": true}`, `_ctx_guard()`): a client that compacts only after an overflow loses what it cuts, because the chat no longer fits anything that could read it. Cline 4.1.26's overflow recovery drops messages (`basic` strategy), and its auto-compact didn't fire here even at 140k of the 128k it assumed. At `at` (90%) of the window the gateway answers `context_length_exceeded` before forwarding and keeps the request's messages in `_ctx_pending` for the client's next request. `_ctx_compare()` then tells what that request is: new messages after a cut-down chat is a compact request, and the full chat is put back (`restore`); the same turn with messages cut gets a summary made by the engine from the chat up to the last cut message (`_ctx_summarise()`), appended to the request's last message and sent as the first piece of the reply, so the client stores it. Token counts before forwarding are estimates: request bytes over `_ctx_ratio`, learned in `_record()`.
+
+`gateway.log` (`_write_log_file()`): every `_queue_log_line()` line also goes to a file beside the config, cut back at `_LOG_FILE_MAX`.
+
 Rules that must hold:
 
 1. **Only an error reply is rewritten, and only its body and status.** A reply that isn't an overflow error passes byte for byte, and so does one already in the standard form. A failure while reading it sends the engine's error as it came.
 2. **No guessing a limit into existence.** Token counts come from the engine's fields or its message; when it gives none, the message says so without numbers.
 3. **Stats keep counts only:** `overflow` (yes or no), `window` and `window_used`.
+4. **The guard never locks a client out and never breaks a request.** The request after a "full" is never refused; an unrecognised follow-up, a failed summary or any exception forwards the request as sent.
+5. **Held chat text stays in memory:** one follow-up request or `_CTX_PENDING_TTL_S`, never on disk, in the log or in stats. The log gets counts only.
+6. **The summary is appended to the last message, never inserted earlier,** so the prompt before it is unchanged, and it reaches the client inside the reply because the gateway keeps no chat state between turns.
 
 ## Thinking Switch
 

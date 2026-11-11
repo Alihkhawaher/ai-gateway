@@ -150,12 +150,42 @@ CATALOG_CACHE_TTL = 300   # seconds
 _log_queue = queue.Queue()
 
 
+_LOG_FILE_MAX = 5 * 1024 * 1024     # gateway.log is cut back to its newer half past this
+_log_file_lock = threading.Lock()
+
+
+def _log_file_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), "gateway.log")
+
+
+def _write_log_file(line: str):
+    """The console's log lines, kept on disk too: the console forgets them when it closes. They hold
+    counts and names only, never chat text. Off with "log_file": false in config.json."""
+    try:
+        if _config.get("log_file", True) is False:
+            return
+        path = _log_file_path()
+        with _log_file_lock:
+            if os.path.exists(path) and os.path.getsize(path) > _LOG_FILE_MAX:
+                with open(path, "rb") as f:
+                    f.seek(-_LOG_FILE_MAX // 2, os.SEEK_END)
+                    f.readline()
+                    keep = f.read()
+                with open(path, "wb") as f:
+                    f.write(keep)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line.replace("\n", " ") + "\n")
+    except Exception:  # noqa: BLE001 -- a log must never break what it reports on
+        pass
+
+
 def _queue_log_line(line: str):
-    """Thread-safely enqueue a line for the TUI log widget."""
+    """Thread-safely enqueue a line for the TUI log widget (and the log file)."""
     try:
         _log_queue.put(line)
     except Exception:
         pass
+    _write_log_file(str(line))
 
 
 def load_config():
@@ -2272,6 +2302,7 @@ class _RequestStats:
         self.tools = False          # did the request offer tools (yes or no)
         self.think = None           # what the client asked of thinking (see _thinking_asked)
         self.overflow = None        # the engine said the prompt doesn't fit: {"prompt", "limit"} token counts
+        self.body_size = 0          # the request's size in bytes, for the context guard's bytes-per-token
         self.started = time.time()
         self.tap = _ResponseTap()
         self.status = None
@@ -2460,9 +2491,12 @@ class GatewayStats:
             "expert_hit": row.get("hit_rate"), "drafts": row.get("drafts_offered"),
             "drafts_accepted": row.get("drafts_accepted"),
             "finish": tap.finish_reason, "calls": tap.calls, "tools": req.tools, "think": req.think,
-            "overflow": bool(req.overflow), "window": None, "window_used": None,
+            "overflow": bool(req.overflow), "overflow_early": bool((req.overflow or {}).get("early")),
+            "window": None, "window_used": None,
             "text_chars": tap.text_chars, "reasoning_chars": tap.reasoning_chars,
         }
+        if req.body_size and req.status == 200:
+            _ctx_learn(req.ep_name, req.body_size, prompt)
         over = req.overflow or {}
         window = over.get("limit") or _context_window(req.ep_name, req.model)
         held = over.get("prompt") or ((prompt or 0) + (out or 0))
@@ -2560,7 +2594,9 @@ def _log_line(rec: dict) -> str:
         bits.append(f"first token {fmt_secs(rec['ttft_s'])}")
     if rec.get("tok_s"):
         bits.append(f"{rec['tok_s']:.1f} t/s")
-    if rec.get("overflow"):
+    if rec.get("overflow_early"):
+        bits.append(f"context {(rec.get('window_used') or 0) * 100:.0f}% full: the client was told to compact early")
+    elif rec.get("overflow"):
         bits.append("context full: the client was told to compact")
     elif (rec.get("window_used") or 0) >= _WINDOW_WARN:
         bits.append(f"context {rec['window_used'] * 100:.0f}% full of {fmt_count(rec.get('window'))}")
@@ -4177,6 +4213,161 @@ def _context_window(ep_name: str, model: str):
     return None
 
 
+# ── Context guard: say "full" while the whole chat still fits ────────────────
+#
+#  A client that only compacts after the engine refuses the prompt compacts too
+#  late: by then the chat no longer fits, so nothing can read all of it, and what
+#  the client cuts is lost (Cline 4.1.26, seen 2026-11-12 at 260k of 262k).
+#  With "context_guard": {"enabled": true} on an endpoint the gateway answers
+#  context_length_exceeded at `at` (90%) of the window, before forwarding, and
+#  keeps that request's messages in memory for the client's next request:
+#    - a compact request (new messages after a cut-down history): the full
+#      history is put back, so the client's compaction reads all of it;
+#    - the same turn again with messages cut out: the engine summarises what was
+#      cut (it still fits, and mostly from its cache), and the summary goes into
+#      that turn and into the reply, where the client keeps it in its own history.
+#  Anything unclear passes as the client sent it. Chat text is held in memory
+#  only, for one follow-up request or _CTX_PENDING_TTL_S, never written or logged.
+
+CTX_GUARD_DEFAULTS = {"enabled": False, "at": 0.9, "summary_tokens": 2000}
+_CTX_PENDING_TTL_S = 900
+_CTX_MIN_DROPPED_CHARS = 2000       # less than this was cut: not worth a summary
+_CTX_MIN_LEARN_TOKENS = 500
+_CTX_SUMMARY_MAX_CHARS = 24000
+_CTX_SUMMARY_PROMPT = (
+    "Stop here and do not continue the task. Part of the conversation above is about to be removed to free up "
+    "context. Write a summary that lets the work continue without it: the user's goal and constraints, decisions "
+    "made and why, what has been done (files, commands, results), exact names, paths and values that will be needed "
+    "again, what failed, and what remains to be done. Be specific and concise. Reply with the summary only.")
+_ctx_lock = threading.Lock()
+_ctx_ratio = {}          # endpoint name -> request bytes per prompt token, learned from finished requests
+_ctx_pending = {}        # (client address, endpoint name) -> the request that was answered "full"
+
+
+def _ctx_guard_config(ep: dict):
+    raw = ep.get("context_guard")
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    cfg = dict(CTX_GUARD_DEFAULTS, enabled=True)
+    at = raw.get("at")
+    if isinstance(at, (int, float)) and not isinstance(at, bool) and 0.5 <= at <= 0.99:
+        cfg["at"] = float(at)
+    size = raw.get("summary_tokens")
+    if isinstance(size, int) and not isinstance(size, bool) and 200 <= size <= 8000:
+        cfg["summary_tokens"] = size
+    return cfg
+
+
+def _ctx_size(body: bytes, data) -> int:
+    """The request's size in bytes without inline images, which are large but cost few tokens."""
+    size = len(body)
+    try:
+        for message in data.get("messages") or []:
+            content = message.get("content") if isinstance(message, dict) else None
+            for part in content if isinstance(content, list) else []:
+                url = (part.get("image_url") or {}).get("url") if isinstance(part, dict) and isinstance(part.get("image_url"), dict) else None
+                if isinstance(url, str) and url.startswith("data:"):
+                    size -= len(url)
+    except Exception:  # noqa: BLE001
+        pass
+    return max(size, 0)
+
+
+def _ctx_learn(ep_name: str, size: int, prompt_tokens):
+    if not size or not isinstance(prompt_tokens, (int, float)) or prompt_tokens < _CTX_MIN_LEARN_TOKENS:
+        return
+    ratio = size / prompt_tokens
+    if not 1.0 <= ratio <= 40.0:
+        return
+    with _ctx_lock:
+        old = _ctx_ratio.get(ep_name)
+        _ctx_ratio[ep_name] = ratio if old is None else old * 0.7 + ratio * 0.3
+
+
+def _ctx_estimate(ep_name: str, size: int):
+    """About how many tokens a request of this size is, or None before one request has finished."""
+    with _ctx_lock:
+        ratio = _ctx_ratio.get(ep_name)
+    return int(size / ratio) if ratio else None
+
+
+def _msg_key(message) -> str:
+    return hashlib.sha1(json.dumps(message, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _ctx_compare(full: list, new: list):
+    """How the client's next request relates to the one answered "full": which of the full chat's
+    messages it kept, which it cut, and what it added after them. None when it isn't that chat."""
+    full_keys = [_msg_key(m) for m in full]
+    known = set(full_keys)
+    matched = [_msg_key(m) in known for m in new]
+    if not any(matched):
+        return None
+    last = max(i for i, hit in enumerate(matched) if hit)
+    kept = {_msg_key(m) for m, hit in zip(new, matched) if hit}
+    dropped = [i for i, key in enumerate(full_keys) if key not in kept]
+    first = new[0] if new and isinstance(new[0], dict) else {}
+    return {"kept": len(kept), "trailing": new[last + 1:], "dropped": dropped,
+            "dropped_chars": sum(len(json.dumps(full[i], ensure_ascii=False)) for i in dropped),
+            "new_system": first if first.get("role") == "system" and not matched[0] else None}
+
+
+def _ctx_guard(cfg: dict, ep_name: str, client: str, data: dict, body: bytes):
+    """What to do with this request: None (forward it), or {"action": "full" | "restore" | "summarise", ...}."""
+    key, now, messages = (client, ep_name), time.time(), data["messages"]
+    with _ctx_lock:
+        pending = _ctx_pending.pop(key, None)
+        for stale in [k for k, v in _ctx_pending.items() if now - v["time"] > _CTX_PENDING_TTL_S]:
+            del _ctx_pending[stale]
+    if pending and now - pending["time"] <= _CTX_PENDING_TTL_S:
+        # The request right after a "full" is never answered "full" again, whatever it is.
+        cmp = _ctx_compare(pending["messages"], messages)
+        shape = (f"{len(messages)} messages, {cmp['kept']} from the full chat of {len(pending['messages'])}, "
+                 f"{len(cmp['dropped'])} cut, {len(cmp['trailing'])} new at the end, tools {'offered' if data.get('tools') else 'not offered'}"
+                 if cmp else f"{len(messages)} messages, none from the full chat")
+        if not cmp or cmp["dropped_chars"] < _CTX_MIN_DROPPED_CHARS:
+            return {"action": "pass", "shape": shape}
+        if cmp["trailing"]:
+            full = pending["messages"]
+            if cmp["new_system"]:
+                full = [cmp["new_system"]] + (full[1:] if full and isinstance(full[0], dict) and full[0].get("role") == "system" else full)
+            return {"action": "restore", "shape": shape, "messages": list(full) + list(cmp["trailing"]), "cut": len(cmp["dropped"])}
+        return {"action": "summarise", "shape": shape, "prefix": pending["messages"][:cmp["dropped"][-1] + 1],
+                "tools": pending.get("tools"), "cut": len(cmp["dropped"])}
+    window = _context_window(ep_name, str(data.get("model") or ""))
+    tokens = _ctx_estimate(ep_name, _ctx_size(body, data))
+    if window and tokens and tokens >= cfg["at"] * window:
+        with _ctx_lock:
+            _ctx_pending[key] = {"messages": messages, "tools": data.get("tools"), "time": now}
+        return {"action": "full", "tokens": tokens, "window": window}
+    return None
+
+
+def _ctx_summary_messages(prefix: list) -> list:
+    messages = list(prefix)
+    last = messages[-1] if messages else None
+    if isinstance(last, dict) and last.get("role") == "user" and isinstance(last.get("content"), str):
+        messages[-1] = {**last, "content": last["content"] + "\n\n" + _CTX_SUMMARY_PROMPT}   # roles keep alternating
+    else:
+        messages.append({"role": "user", "content": _CTX_SUMMARY_PROMPT})
+    return messages
+
+
+def _ctx_note(summary: str) -> str:
+    return ("[Context note from the gateway: earlier messages of this conversation were removed to make room. "
+            "Summary of what was removed:]\n" + summary.strip() + "\n[End of context note]")
+
+
+def _ctx_append(data: dict, note: str):
+    """Put the note at the end of the request's last message, so everything before it is unchanged."""
+    last = data["messages"][-1]
+    content = last.get("content")
+    if isinstance(content, list):
+        last["content"] = content + [{"type": "text", "text": note}]
+    else:
+        last["content"] = (content + "\n\n" if isinstance(content, str) and content else "") + note
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  THINKING SWITCH — the client decides, the gateway carries it
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4794,6 +4985,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _ctx_summarise(self, host, use_ssl, path, headers, model, verdict, cfg, timeout):
+        """Ask the engine for a summary of the chat up to the last message the client cut. The prompt is the
+        start of the chat the engine just held, so it mostly comes from its cache. None when it can't be made."""
+        base = {"model": model, "messages": _ctx_summary_messages(verdict["prefix"]), "max_tokens": cfg["summary_tokens"],
+                "temperature": 0.2, "stream": False}
+        tools = verdict.get("tools")
+        attempts = [{**base, "tools": tools, "tool_choice": "none"}, base] if tools else [base]   # same tools: same cached prompt
+        for body in attempts:
+            raw = json.dumps(body).encode("utf-8")
+            if use_ssl:
+                conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(_dial_host(host), timeout=timeout)
+            try:
+                conn.request("POST", path, body=raw, headers={**headers, "Content-Length": str(len(raw))})
+                response = conn.getresponse()
+                data = response.read(_TAP_MAX_BODY)
+                if response.status != 200:
+                    continue
+                message = json.loads(data)["choices"][0]["message"]
+                text = message.get("content") if isinstance(message.get("content"), str) else ""
+                text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+                if text:
+                    return text[:_CTX_SUMMARY_MAX_CHARS]
+            except Exception:  # noqa: BLE001 -- try the plainer request, then give up
+                continue
+            finally:
+                conn.close()
+        return None
+
     # ── JSON response helper ───────────────────────────────────────────────
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
@@ -4929,6 +5150,60 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # get longer (an endpoint's "timeout" in config overrides both).
         use_ssl = not _is_local_host(host)
         read_timeout = target_endpoint.get("timeout") or (180 if use_ssl else 600)
+
+        # Context guard (see CONTEXT LIMIT): say "full" while the whole chat still fits, and give
+        # the client's next request what it cut. Any doubt or failure forwards the request as sent.
+        ctx_note = None
+        guard = None
+        if (self.command == "POST" and isinstance(req_json, dict) and isinstance(req_json.get("messages"), list)
+                and req_json["messages"] and path.rstrip("/").endswith("/chat/completions")):
+            guard = _ctx_guard_config(target_endpoint)
+        if guard:
+            try:
+                verdict = _ctx_guard(guard, ep_name, self.address_string(), req_json, body)
+            except Exception as e:  # noqa: BLE001
+                verdict = None
+                self._log(f"context guard skipped: {type(e).__name__}")
+            action = (verdict or {}).get("action")
+            if action == "full":
+                tokens, window = verdict["tokens"], verdict["window"]
+                stat = _stats.begin(target_endpoint, self.command, path, req_json, self.address_string(), self.headers)
+                if stat:
+                    stat.status = 400
+                    stat.overflow = {"prompt": tokens, "limit": window, "early": True}
+                self._log(f"{ep_name}: context guard: about {tokens:,} of {window:,} tokens ({tokens * 100 // window}%), "
+                          f"answered context_length_exceeded so the client compacts while the chat still fits")
+                self._send_json({"error": {
+                    "message": (f"This model's maximum context length is {window} tokens. Your messages resulted in about "
+                                f"{tokens} tokens, past the {guard['at'] * 100:.0f}% mark where the gateway asks for compaction "
+                                f"while the whole conversation still fits. Please reduce the length of the messages."),
+                    "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded",
+                    "n_prompt_tokens": tokens, "n_ctx": window}}, 400)
+                _stats.end(stat)
+                return
+            if action:
+                self._log(f"{ep_name}: context guard: the request after 'full' has {verdict['shape']}")
+            try:
+                if action == "restore":
+                    req_json["messages"] = verdict["messages"]
+                    body = json.dumps(req_json).encode("utf-8")
+                    self._log(f"{ep_name}: context guard: put the {verdict['cut']} cut messages back, so the client's "
+                              f"compaction reads the whole chat")
+                elif action == "summarise":
+                    summary = self._ctx_summarise(host, use_ssl, path, fwd_headers, req_json.get("model"), verdict, guard, read_timeout)
+                    if summary:
+                        ctx_note = _ctx_note(summary)
+                        _ctx_append(req_json, ctx_note)
+                        body = json.dumps(req_json).encode("utf-8")
+                        self._log(f"{ep_name}: context guard: summarised {verdict['cut']} cut messages into "
+                                  f"{len(summary):,} characters and added them to this turn")
+                    else:
+                        self._log(f"{ep_name}: context guard: no summary could be made; the request goes as the client cut it")
+            except Exception as e:  # noqa: BLE001
+                ctx_note = None
+                self._log(f"context guard failed, request forwarded as sent: {type(e).__name__}")
+            if body:
+                fwd_headers["Content-Length"] = str(len(body))
         if use_ssl:
             conn = http.client.HTTPSConnection(host, context=_upstream_ssl_ctx, timeout=read_timeout)
         else:
@@ -4941,6 +5216,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         kv_ok = False
         client_gone = False
         stat = _stats.begin(target_endpoint, self.command, path, req_json, self.address_string(), self.headers)
+        if stat and guard:
+            stat.body_size = _ctx_size(body, req_json)      # with the reply's token count: bytes per token
         healer = _new_healer(target_endpoint, self.command, path, req_json)
         try:
             # Before forwarding: put the right conversation in the engine's slot
@@ -4963,7 +5240,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             whole_body = None
             if response.status in _OVERFLOW_STATUSES and not streaming:
                 whole_body = bytearray(response.read(_OVERFLOW_MAX_BODY))    # an error body: small, read to see why
-            elif healer and not streaming:
+            elif (healer or ctx_note) and not streaming:
                 whole_body = bytearray()
                 while len(whole_body) <= _TAP_MAX_BODY:
                     chunk = response.read1(65536)
@@ -4977,6 +5254,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 stat.tap.feed(first_bytes, False)
             replaced = healer.rewrite_body(first_bytes) if healer and not streaming else None
             send_status = response.status
+            if ctx_note and not streaming and response.status == 200 and first_bytes:
+                try:                                         # the summary in front of the answer, where the client keeps it
+                    whole = json.loads(replaced if replaced is not None else first_bytes)
+                    message = whole["choices"][0]["message"]
+                    message["content"] = ctx_note + "\n\n" + (message.get("content") or "")
+                    replaced = json.dumps(whole, ensure_ascii=False).encode("utf-8")
+                except Exception:  # noqa: BLE001
+                    pass
             if response.status in _OVERFLOW_STATUSES and first_bytes:
                 try:
                     overflow = _context_overflow(first_bytes, response.status, path)
@@ -4999,13 +5284,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             for header, value in response.getheaders():
                 if header.lower() in ("transfer-encoding", "connection"):
                     continue
-                if header.lower() == "content-length" and (healer or replaced is not None):
+                if header.lower() == "content-length" and (healer or replaced is not None or ctx_note):
                     continue            # the healer may change the length
                 self.send_header(header, value)
             if replaced is not None:
                 self.send_header("Content-Length", str(len(replaced)))
             self.end_headers()
             headers_sent = True
+            if ctx_note and streaming and response.status == 200:
+                first = {"id": "chatcmpl-gateway-context", "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": str(req_json.get("model") or ""),
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ctx_note + "\n\n"}, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(first, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
 
             # Stream response body (SSE-safe): read1 hands over whatever has
             # arrived instead of waiting for a full buffer, so tokens reach
@@ -5187,6 +5478,13 @@ class EndpointEditScreen(ModalScreen):
             guard_box.tooltip = ("Stop tool calls that would delete a root or home folder, run a damaged path, "
                                  "or a cut-off command. Works only with healing on.")
             yield guard_box
+            ctx = (self.endpoint or {}).get("context_guard")
+            ctx_box = Checkbox("Compact early: say 'full' at 90% and keep what the app cuts",
+                               value=bool(isinstance(ctx, dict) and ctx.get("enabled")), id="ep-ctx-checkbox")
+            ctx_box.tooltip = ("For apps that only compact after the context overflows. The gateway answers 'context full' "
+                               "while the whole chat still fits, then gives the app's next request what it cut "
+                               "(context_guard in config.json).")
+            yield ctx_box
 
             with Horizontal(id="ep-edit-buttons"):
                 yield Button("💾 Save", id="ep-save-btn", variant="success", compact=True)
@@ -5260,6 +5558,10 @@ class EndpointEditScreen(ModalScreen):
         }
         if heal is not None:
             result["tool_heal"] = heal
+        ctx_on = self.query_one("#ep-ctx-checkbox", Checkbox).value
+        ctx = (self.endpoint or {}).get("context_guard")
+        if ctx_on or isinstance(ctx, dict):         # its other keys (at, summary_tokens) are kept
+            result["context_guard"] = {**(ctx if isinstance(ctx, dict) else {}), "enabled": ctx_on}
         if self.original_name:
             result["_original_name"] = self.original_name
         self.dismiss(result)
@@ -6037,7 +6339,7 @@ def panel_recent(snap: dict):
         elif r.get("healed"):
             status += " healed"
         if r.get("overflow"):
-            status, end = "ctx full", ("compact", "", True)   # the client was told to compact
+            status, end = ("ctx early" if r.get("overflow_early") else "ctx full"), ("compact", "", True)
         used = r.get("window_used") or 0
         prompt_cell = fmt_count(r.get("prompt")) + (f" {used * 100:.0f}%" if used >= _WINDOW_WARN else "")
         swap = r.get("swap") or ""
