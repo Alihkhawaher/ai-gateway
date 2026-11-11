@@ -179,6 +179,20 @@ Rules that must hold:
 
 Test with made-up text only, through `run_healer()`, `sse_text()` and `sse_native()`. Never send test traffic to a real engine: it would displace the chat it holds.
 
+## Context Limit
+
+The gateway never compacts a chat: the client does, and the gateway gives it what it needs to do so.
+
+- `_context_overflow()` recognises an engine's "the prompt doesn't fit" error (status in `_OVERFLOW_STATUSES`, by type, code or the words in `_OVERFLOW_RE`) and `_proxy()` answers `400` with the OpenAI code `context_length_exceeded` (Anthropic's shape on `/messages`), keeping the engine's message and its token counts. Cline 4.1.26 compacts and retries on that code or on "context length / window / limit" and "maximum context"; llama.cpp's "context size" matches none of those, which is why an overflow used to end the run.
+- `/v1/models` and `/props` report `loaded_context_length` when the endpoint gives one (LM Studio), with the model's maximum in `max_context_length`.
+- `_context_window()` and `window_used` put the share of the window a chat uses into the stats; `_WINDOW_WARN` (90%) is where the console and the log start showing it.
+
+Rules that must hold:
+
+1. **Only an error reply is rewritten, and only its body and status.** A reply that isn't an overflow error passes byte for byte, and so does one already in the standard form. A failure while reading it sends the engine's error as it came.
+2. **No guessing a limit into existence.** Token counts come from the engine's fields or its message; when it gives none, the message says so without numbers.
+3. **Stats keep counts only:** `overflow` (yes or no), `window` and `window_used`.
+
 ## Thinking Switch
 
 The client decides whether a model thinks. `_thinking_asked()` reads that choice from any of the usual fields (`reasoning_effort`, `reasoning`, `chat_template_kwargs`, `thinking`, `think`). For an `lmstudio` endpoint's `/chat/completions`, `_lmstudio_thinking()` writes it as `reasoning_effort`, because that is the only field LM Studio honours there. This was tested live with a Gemma 4 model on 2026-11-11: `"none"` turned thinking off, while `chat_template_kwargs.enable_thinking` and `reasoning.effort` were ignored.

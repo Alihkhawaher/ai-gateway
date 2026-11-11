@@ -395,6 +395,14 @@ Options, inside `tool_heal`:
 
 Nothing about a reply is kept. The log and stats get counts and rule ids only.
 
+## When a Chat Reaches the Context Limit
+
+The gateway doesn't shorten or summarize chats. It makes sure your app can do that itself, at the right time:
+
+- **Apps are told the context window that is loaded.** `/v1/models` (`context_length`, `context_window`, `max_model_len`) and `/props` (`n_ctx`) report what the model is loaded with, such as 32,000, and `max_context_length` holds the model's maximum. Agent apps use this number to decide when to compact, so a wrong one means they compact too late.
+- **A full context reaches the app as the standard error.** When an engine answers that the prompt doesn't fit, each says it its own way (llama.cpp: "exceeds the available context size"). The gateway answers `400` with the OpenAI code `context_length_exceeded`, a message with the token counts where the engine gave them, and the engine's own words. Apps with overflow recovery, such as Cline, then compact and retry instead of stopping. `/v1/messages` gets Anthropic's form of the same error. Any other error passes byte for byte.
+- **The console shows it coming.** From 90% of the window, the **In** column of Recent requests shows the share used, for example `241k 92%`, and the log line says `context 92% full`. A request that hit the limit shows `ctx full`.
+
 ## Thinking On or Off
 
 Your app decides whether the model thinks, and the gateway delivers that choice to the endpoint. Nothing is set in the gateway's config.

@@ -1920,6 +1920,7 @@ class MockChat(BaseHTTPRequestHandler):
     status = 200
     reply_text = "hello"
     end_reason = "stop"      # the finish_reason sent; None sends none (a cut-off stream)
+    error_body = None        # the JSON sent with a status that isn't 200
     tool_calls = None        # streamed as two deltas per call when set
 
     def do_GET(self):
@@ -1928,7 +1929,7 @@ class MockChat(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}")
         if MockChat.status != 200:
-            self._json(MockChat.status, {"error": {"message": "nope"}})
+            self._json(MockChat.status, MockChat.error_body or {"error": {"message": "nope"}})
         elif body.get("stream"):
             payload = MockChat.stream_body()
             self.send_response(200)
@@ -3439,6 +3440,176 @@ class ToolHealGatewayTests(unittest.TestCase):
     def test_the_stop_question_shows_the_command_to_the_client_only(self):
         _s, _h, body = self._post(sse_native("run_commands", json.dumps({"commands": [f"git reset --hard {self.SECRET}"]})))
         self.assertIn(self.SECRET, read_reply(body)["calls"][0]["arguments"])
+
+
+LLAMA_OVERFLOW = {"error": {"code": 400, "message": "the request exceeds the available context size, try increasing it",
+                            "type": "exceed_context_size_error", "n_prompt_tokens": 261871, "n_ctx": 262144}}
+
+
+class ContextLimitTests(unittest.TestCase):
+    """A prompt that no longer fits: the client gets the standard error it knows how to recover from,
+    and the context window it is told is the one that is loaded."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockChat)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats, proxy.get_models(), dict(proxy._model_meta))
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        MockChat.status, MockChat.error_body, MockChat.reply_text = 200, None, "hello"
+        MockChat.end_reason, MockChat.tool_calls = "stop", None
+        proxy.set_config("force_default_model", False)
+        proxy.set_config("endpoints", [{"name": "up", "type": "custom", "host": f"localhost:{self.up_port}",
+                                        "enabled": True, "api_key": ""}])
+        proxy.set_endpoint_status("up", "online")
+        while not proxy._log_queue.empty():
+            proxy._log_queue.get_nowait()
+
+    def tearDown(self):
+        proxy._stats.wait_idle()
+        time.sleep(0.05)
+        MockChat.status, MockChat.error_body = 200, None
+        proxy.set_endpoint_status("up", "disabled")
+        proxy.CONFIG_FILE, proxy._config, proxy._stats, models, meta = self._saved
+        proxy.set_models(models)
+        with proxy._model_meta_lock:
+            proxy._model_meta.clear()
+            proxy._model_meta.update(meta)
+        self._tmp.cleanup()
+
+    def _post(self, stream=False, path="/v1/chat/completions"):
+        counted = len(proxy._stats.snapshot()["recent"])
+        status, headers, body = request(self.gw_port, "POST", path,
+                                        body=json.dumps({"model": "up:m", "stream": stream,
+                                                         "messages": [{"role": "user", "content": "made-up"}]}),
+                                        headers={"Content-Type": "application/json"})
+        deadline = time.time() + 5
+        while len(proxy._stats.snapshot()["recent"]) == counted and time.time() < deadline:
+            time.sleep(0.01)
+        proxy._stats.wait_idle()
+        time.sleep(0.05)
+        return status, headers, body
+
+    def _log(self):
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(proxy._log_queue.get_nowait())
+        return "\\n".join(lines)
+
+    # ── recognising it ────────────────────────────────────────────────────
+    def test_engines_ways_of_saying_it_are_recognised(self):
+        said = [
+            (400, LLAMA_OVERFLOW, (261871, 262144)),
+            (500, {"error": {"message": "the request exceeds the available context size (8192 tokens)"}}, (None, 8192)),
+            (400, {"error": "Trying to keep the first 9001 tokens when context the overflows. However, the model is loaded "
+                            "with context length of only 8192 tokens, which is not enough."}, (9001, 8192)),
+            (400, {"error": {"message": "prompt is too long"}}, (None, None)),
+            (413, {"message": "input is too long for this model"}, (None, None)),
+            (400, {"error": {"message": "This model's maximum context length is 4096 tokens. However, your messages resulted in "
+                                        "5000 tokens.", "type": "invalid_request_error"}}, (5000, 4096)),
+        ]
+        for status, body, (prompt, limit) in said:
+            got = proxy._context_overflow(json.dumps(body).encode(), status)
+            self.assertIsNotNone(got, body)
+            new, info = got
+            self.assertEqual((info["prompt"], info["limit"]), (prompt, limit), body)
+            err = json.loads(new)["error"]
+            self.assertEqual((err["code"], err["type"], err["param"]), ("context_length_exceeded", "invalid_request_error", "messages"))
+            self.assertIn("maximum context length", err["message"])      # words clients also look for
+
+    def test_other_errors_are_not_touched(self):
+        for status, raw in ((400, {"error": {"message": "nope"}}), (400, {"error": {"message": "unknown model m"}}),
+                            (401, LLAMA_OVERFLOW), (429, {"error": {"message": "too many requests"}}),
+                            (400, ["context length"]), (500, {"error": {"message": "internal error"}})):
+            self.assertIsNone(proxy._context_overflow(json.dumps(raw).encode(), status), raw)
+        self.assertIsNone(proxy._context_overflow(b"context length exceeded, not json", 400))
+        self.assertIsNone(proxy._context_overflow(b"", 400))
+
+    def test_an_error_already_in_the_standard_form_goes_as_it_came(self):
+        body = {"error": {"message": "This model's maximum context length is 4096 tokens.", "type": "invalid_request_error",
+                          "code": "context_length_exceeded"}}
+        new, info = proxy._context_overflow(json.dumps(body).encode(), 400)
+        self.assertIsNone(new)
+        self.assertEqual(info["limit"], 4096)
+
+    def test_the_messages_api_gets_its_own_shape(self):
+        new, _info = proxy._context_overflow(json.dumps(LLAMA_OVERFLOW).encode(), 400, "/v1/messages")
+        got = json.loads(new)
+        self.assertEqual((got["type"], got["error"]["type"]), ("error", "invalid_request_error"))
+        self.assertIn("prompt is too long: 261871 tokens > 262144 maximum", got["error"]["message"])
+
+    # ── through the gateway ───────────────────────────────────────────────
+    def test_the_client_gets_the_standard_error(self):
+        for upstream_status, stream in ((400, False), (500, True)):
+            MockChat.status, MockChat.error_body = upstream_status, LLAMA_OVERFLOW
+            status, headers, body = self._post(stream=stream)
+            self.assertEqual(status, 400)
+            err = json.loads(body)["error"]
+            self.assertEqual(err["code"], "context_length_exceeded")
+            self.assertEqual((err["n_prompt_tokens"], err["n_ctx"]), (261871, 262144))
+            self.assertIn("exceeds the available context size", err["message"])  # the engine's own words are kept
+            self.assertEqual(int(headers.get("content-length")), len(body))
+            rec = proxy._stats.snapshot()["recent"][0]
+            self.assertEqual((rec["status"], rec["overflow"], rec["error"]), (400, True, True))
+            self.assertEqual((rec["window"], rec["window_used"]), (262144, 0.999))
+        log = self._log()
+        self.assertIn("context full: the client was told to compact", log)
+        self.assertIn("261,871 of 262,144 tokens", log)
+        text = _as_text(proxy.panel_recent({"gateway": proxy._stats.snapshot()}), 220)
+        self.assertIn("ctx full", text)
+        self.assertIn("compact", text)
+
+    def test_an_ordinary_error_passes_byte_for_byte(self):
+        MockChat.status = 400
+        status, _h, body = self._post()
+        self.assertEqual((status, body), (400, json.dumps({"error": {"message": "nope"}}).encode()))
+        MockChat.status = 429
+        status, _h, body = self._post()
+        self.assertEqual((status, body), (429, json.dumps({"error": {"message": "nope"}}).encode()))
+        self.assertFalse(proxy._stats.snapshot()["recent"][0]["overflow"])
+
+    # ── the window clients are told ───────────────────────────────────────
+    def _models(self, **meta):
+        proxy.set_models(["up:m"])
+        with proxy._model_meta_lock:
+            proxy._model_meta["up:m"] = dict(meta)
+
+    def test_models_report_the_window_that_is_loaded(self):
+        self._models(context_length=262144, loaded_context_length=32000)
+        entry = json.loads(request(self.gw_port, "GET", "/v1/models")[2])["data"][0]
+        self.assertEqual((entry["context_length"], entry["context_window"], entry["max_model_len"]), (32000, 32000, 32000))
+        self.assertEqual(entry["max_context_length"], 262144)
+        props = json.loads(request(self.gw_port, "GET", "/props")[2])
+        self.assertEqual(props["default_generation_settings"]["n_ctx"], 32000)
+        self._models(context_length=8192)                    # an endpoint that only knows one number
+        entry = json.loads(request(self.gw_port, "GET", "/v1/models")[2])["data"][0]
+        self.assertEqual((entry["context_length"], entry["max_context_length"]), (8192, 8192))
+
+    def test_a_chat_close_to_the_limit_is_flagged(self):
+        self._models(context_length=262144, loaded_context_length=125)   # the mock reply uses 100 in + 20 out
+        self._post()
+        rec = proxy._stats.snapshot()["recent"][0]
+        self.assertEqual((rec["window"], rec["window_used"]), (125, 0.96))
+        self.assertIn("context 96% full of 125", self._log())
+        self.assertIn("96%", _as_text(proxy.panel_recent({"gateway": proxy._stats.snapshot()}), 220))
+        self._models(context_length=4000)
+        self._post()
+        self.assertNotIn("full", self._log())                # 3%: nothing to say
+
+    def test_an_unknown_model_just_has_no_window(self):
+        self.assertIsNone(proxy._context_window("up", "never-heard-of-it"))
+        self._post()
+        self.assertIsNone(proxy._stats.snapshot()["recent"][0]["window"])
 
 
 def sse_reasoning(reasoning: str, content: str = "", finish="stop", pieces=3, key="reasoning_content") -> bytes:

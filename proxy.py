@@ -2271,6 +2271,7 @@ class _RequestStats:
         self.stream = stream
         self.tools = False          # did the request offer tools (yes or no)
         self.think = None           # what the client asked of thinking (see _thinking_asked)
+        self.overflow = None        # the engine said the prompt doesn't fit: {"prompt", "limit"} token counts
         self.started = time.time()
         self.tap = _ResponseTap()
         self.status = None
@@ -2459,8 +2460,14 @@ class GatewayStats:
             "expert_hit": row.get("hit_rate"), "drafts": row.get("drafts_offered"),
             "drafts_accepted": row.get("drafts_accepted"),
             "finish": tap.finish_reason, "calls": tap.calls, "tools": req.tools, "think": req.think,
+            "overflow": bool(req.overflow), "window": None, "window_used": None,
             "text_chars": tap.text_chars, "reasoning_chars": tap.reasoning_chars,
         }
+        over = req.overflow or {}
+        window = over.get("limit") or _context_window(req.ep_name, req.model)
+        held = over.get("prompt") or ((prompt or 0) + (out or 0))
+        if window and held:
+            rec["window"], rec["window_used"] = window, round(held / window, 3)
         with self.lock:
             self._ensure_loaded()
             self.active.pop(req.id, None)
@@ -2536,6 +2543,9 @@ class GatewayStats:
             }
 
 
+_WINDOW_WARN = 0.9          # from here a chat is close to the model's context limit
+
+
 def _log_line(rec: dict) -> str:
     """One finished request for the proxy log."""
     head = f"→ {rec['endpoint']} [{rec['status']}]"
@@ -2550,6 +2560,10 @@ def _log_line(rec: dict) -> str:
         bits.append(f"first token {fmt_secs(rec['ttft_s'])}")
     if rec.get("tok_s"):
         bits.append(f"{rec['tok_s']:.1f} t/s")
+    if rec.get("overflow"):
+        bits.append("context full: the client was told to compact")
+    elif (rec.get("window_used") or 0) >= _WINDOW_WARN:
+        bits.append(f"context {rec['window_used'] * 100:.0f}% full of {fmt_count(rec.get('window'))}")
     if rec.get("think"):
         bits.append("thinking " + {"none": "off (asked)", "on": "on (asked)"}.get(rec["think"], f"{rec['think']} (asked)"))
     end = _reply_end(rec)
@@ -4067,6 +4081,103 @@ def _new_healer(ep: dict, command: str, path: str, data):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  CONTEXT LIMIT — a full context reaches the client in the words it knows
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  When a prompt no longer fits, OpenAI answers 400 with the code
+#  "context_length_exceeded", and clients are written against that: Cline
+#  4.1.26 compacts and retries on that code, or on words like "context
+#  length / window / limit" or "maximum context". Local engines say it their
+#  own way (llama.cpp: "exceeds the available context size", type
+#  exceed_context_size_error), which such a client reads as a plain failure
+#  and stops. The gateway rewrites only the error body of a reply that is
+#  already an error; nothing else about the request or the reply changes.
+
+_OVERFLOW_STATUSES = (400, 413, 422, 500)
+_OVERFLOW_MAX_BODY = 256 * 1024
+_OVERFLOW_TYPES = ("exceed_context_size_error", "context_length_exceeded", "context_window_exceeded")
+_OVERFLOW_RE = re.compile(
+    r"context[\s_]*(?:size|length|window|limit)|maximum\s+context|context\s+overflow|"
+    r"too\s+many\s+tokens|prompt\s+is\s+too\s+long|input\s+is\s+too\s+long|"
+    r"tokens?\s+exceeds?|exceeds?\s+the\s+(?:available\s+|maximum\s+|model'?s?\s+)?context|\bn_ctx\b", re.I)
+_OVERFLOW_LIMIT_RE = re.compile(r"(?:context(?:\s+(?:size|length|window|limit))?|n_ctx|maximum)\D{0,40}?(\d[\d,]{2,})", re.I)
+_OVERFLOW_PROMPT_RE = re.compile(r"(?:prompt|request|messages?|input|resulted\s+in|n_prompt_tokens|keep)\D{0,60}?(\d[\d,]{2,})", re.I)
+
+
+def _whole_number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"\d[\d,]*", value.strip()):
+        return int(value.replace(",", ""))
+    return None
+
+
+def _context_overflow(raw: bytes, status: int, path: str = ""):
+    """Is this error reply an engine saying the prompt doesn't fit? Then (body, info): the body to
+    send (None when the reply is already in the standard form and goes as it came) and
+    {"prompt", "limit"} token counts where the engine gave them. Otherwise None."""
+    if status not in _OVERFLOW_STATUSES or not raw or len(raw) >= _OVERFLOW_MAX_BODY:
+        return None
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    err = obj.get("error")
+    detail = err if isinstance(err, dict) else {}
+    message = next((m for m in (detail.get("message"), err, obj.get("message"), obj.get("detail")) if isinstance(m, str) and m), "")
+    kind, code = str(detail.get("type") or obj.get("type") or ""), str(detail.get("code") or "")
+    if not (code == "context_length_exceeded" or kind in _OVERFLOW_TYPES or _OVERFLOW_RE.search(message)):
+        return None
+    limit = _whole_number(detail.get("n_ctx"))
+    prompt = _whole_number(detail.get("n_prompt_tokens"))
+    if limit is None:
+        found = _OVERFLOW_LIMIT_RE.search(message)
+        limit = _whole_number(found.group(1)) if found else None
+    if prompt is None:
+        found = _OVERFLOW_PROMPT_RE.search(message)
+        prompt = _whole_number(found.group(1)) if found else None
+    if prompt is not None and prompt == limit:
+        prompt = None                       # one number read twice says nothing about the prompt
+    info = {"prompt": prompt, "limit": limit}
+    anthropic = path.rstrip("/").endswith("/messages")
+    if code == "context_length_exceeded" and not anthropic:
+        return None, info                   # already what clients expect
+    said = re.sub(r"\s+", " ", message).strip()[:300]
+    if anthropic:
+        size = f"{prompt} tokens > {limit} maximum" if prompt and limit else "it does not fit the model's context window"
+        body = {"type": "error", "error": {"type": "invalid_request_error", "message": f"prompt is too long: {size} (engine: {said})"}}
+    else:
+        if prompt and limit:
+            text = (f"This model's maximum context length is {limit} tokens. However, your messages resulted in "
+                    f"{prompt} tokens. Please reduce the length of the messages.")
+        elif limit:
+            text = f"This model's maximum context length is {limit} tokens, and your messages do not fit. Please reduce the length of the messages."
+        else:
+            text = "This model's maximum context length was exceeded. Please reduce the length of the messages."
+        body = {"error": {"message": f"{text} (engine: {said})", "type": "invalid_request_error", "param": "messages",
+                          "code": "context_length_exceeded",
+                          **({"n_prompt_tokens": prompt} if prompt is not None else {}), **({"n_ctx": limit} if limit is not None else {})}}
+    return json.dumps(body, ensure_ascii=False).encode("utf-8"), info
+
+
+def _context_window(ep_name: str, model: str):
+    """How many tokens the model at this endpoint can hold as loaded now, or None when unknown."""
+    try:
+        for gateway_id in get_models():
+            source, original = parse_model_id(gateway_id)
+            if source == ep_name and original == model:
+                meta = get_model_meta(gateway_id)
+                return _whole_number(meta.get("loaded_context_length")) or _whole_number(meta.get("context_length"))
+    except Exception:  # noqa: BLE001 -- a number for the console, never worth a failed request
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  THINKING SWITCH — the client decides, the gateway carries it
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -4277,7 +4388,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         entries = []
         for m in get_models():
             meta = get_model_meta(m)
-            context_length = meta.get("context_length", 128000)
+            # What fits now: a model loaded with less than its maximum must say so, or clients compact too late.
+            max_context = meta.get("context_length", 128000)
+            context_length = meta.get("loaded_context_length") or max_context
 
             input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
             output_mods = meta.get("architecture", {}).get("output_modalities", ["text"])
@@ -4322,6 +4435,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "context_length": context_length,
                 "context_window": context_length,
                 "max_model_len": context_length,
+                "max_context_length": max_context,
                 "status": {"value": "loaded"},
                 "tags": tags,
                 # llama.cpp web UI reads this field directly to detect
@@ -4413,7 +4527,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         model = unquote(model_id) if model_id else get_current_model()
         meta = get_model_meta(model)
 
-        n_ctx = meta.get("context_length", 128000)
+        n_ctx = meta.get("loaded_context_length") or meta.get("context_length", 128000)   # as loaded now
         max_completion = meta.get("top_provider", {}).get("max_completion_tokens", -1)
 
         input_mods = meta.get("architecture", {}).get("input_modalities", ["text"])
@@ -4847,7 +4961,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # A reply that isn't streamed has to be whole before it can be judged.
             whole_body = None
-            if healer and not streaming:
+            if response.status in _OVERFLOW_STATUSES and not streaming:
+                whole_body = bytearray(response.read(_OVERFLOW_MAX_BODY))    # an error body: small, read to see why
+            elif healer and not streaming:
                 whole_body = bytearray()
                 while len(whole_body) <= _TAP_MAX_BODY:
                     chunk = response.read1(65536)
@@ -4860,15 +4976,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if first_bytes and stat:
                 stat.tap.feed(first_bytes, False)
             replaced = healer.rewrite_body(first_bytes) if healer and not streaming else None
+            send_status = response.status
+            if response.status in _OVERFLOW_STATUSES and first_bytes:
+                try:
+                    overflow = _context_overflow(first_bytes, response.status, path)
+                except Exception:  # noqa: BLE001 -- the engine's error then goes as it came
+                    overflow = None
+                if overflow:
+                    if overflow[0] is not None:
+                        replaced, send_status = overflow[0], 400
+                    if stat:
+                        stat.overflow = overflow[1]
+                        stat.status = send_status
+                    self._log(f"{ep_name}: the prompt doesn't fit the model's context"
+                              + (f" ({overflow[1]['prompt']:,} of {overflow[1]['limit']:,} tokens)" if overflow[1]["prompt"] and overflow[1]["limit"] else "")
+                              + ": answered with context_length_exceeded so the client can compact")
 
             # Send status + CORS + upstream response headers
-            self.send_response(response.status)
+            self.send_response(send_status)
             for k, v in CORS_HEADERS.items():
                 self.send_header(k, v)
             for header, value in response.getheaders():
                 if header.lower() in ("transfer-encoding", "connection"):
                     continue
-                if header.lower() == "content-length" and healer:
+                if header.lower() == "content-length" and (healer or replaced is not None):
                     continue            # the healer may change the length
                 self.send_header(header, value)
             if replaced is not None:
@@ -5905,12 +6036,17 @@ def panel_recent(snap: dict):
             status = f"guard {r.get('heal_rule')}"
         elif r.get("healed"):
             status += " healed"
+        if r.get("overflow"):
+            status, end = "ctx full", ("compact", "", True)   # the client was told to compact
+        used = r.get("window_used") or 0
+        prompt_cell = fmt_count(r.get("prompt")) + (f" {used * 100:.0f}%" if used >= _WINDOW_WARN else "")
         swap = r.get("swap") or ""
         swap_text = {"restored": f"restored {fmt_secs(r.get('swap_s'))}", "continued": "kept",
                      "new": f"new, saved {fmt_secs(r.get('swap_s'))}" if r.get("swap_s") else "new"}.get(swap, "—")
         hit = r["expert_hit"] * 100 if isinstance(r.get("expert_hit"), (int, float)) else None
         table.add_row(time.strftime("%H:%M:%S", time.localtime(r["time"])), RichText(r["app"][:14]), RichText(_model_short(r["model"])),
-                      fmt_count(r.get("prompt")), RichText(_fmt_pct(cached, 0), style=_pct_style(cached)),
+                      RichText(prompt_cell, style=_YELLOW_BOLD if used >= _WINDOW_WARN else ""),
+                      RichText(_fmt_pct(cached, 0), style=_pct_style(cached)),
                       ("~" if r.get("out_estimated") else "") + fmt_count(r.get("out")), fmt_secs(r.get("ttft_s")),
                       f"{r['tok_s']:.1f} t/s" if r.get("tok_s") else "—", RichText(_fmt_pct(hit, 0), style=_pct_style(hit)),
                       RichText(swap_text, style=_GREEN if swap == "restored" else "dim"),
