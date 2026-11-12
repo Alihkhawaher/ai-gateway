@@ -2892,8 +2892,48 @@ _GUARD_REASONS = {
     "S18": "its path climbs out of the working folder",
     "S19": "an unquoted space seems to have split its path",
     "S20": "it deletes an empty path",
+    "R1": "the same call was already made several times in a row",
+    "R2": "the reply made the same call many times over",
 }
-_STOP_NAMES = {"A1": "broken_arguments_send_valid_json", "T1": "reply_was_cut_off_send_a_shorter_call"}
+_STOP_NAMES = {"A1": "broken_arguments_send_valid_json", "T1": "reply_was_cut_off_send_a_shorter_call",
+               "R1": "same_call_repeated_in_a_row_use_its_result_or_change_the_call",
+               "R2": "same_call_many_times_in_one_reply_send_it_once"}
+_REPEAT_LIMIT = 3           # identical calls in a row that may run; Cline 4.1.26 ends the task at 5
+
+
+def _call_key(name, arguments) -> str:
+    """A call as a hash, for comparing only: the name and its arguments, with JSON spacing and key
+    order left out. Nothing of the call is kept."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            arguments = arguments.strip()
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha1(f"{name}\0{arguments}".encode("utf-8", "replace")).hexdigest()
+
+
+def _repeat_run(messages):
+    """(the calls of the chat's last assistant turn as hashes, how many turns in a row made exactly
+    those calls). Tool results are stepped over; anything else between two turns (the user spoke, the
+    model answered in words) ends the run."""
+    run, count = None, 0
+    for msg in reversed(messages if isinstance(messages, list) else []):
+        role = msg.get("role") if isinstance(msg, dict) else None
+        if role == "tool":
+            continue
+        calls = msg.get("tool_calls") if role == "assistant" else None
+        if not isinstance(calls, list) or not calls:
+            break
+        keys = tuple(_call_key(str((c.get("function") or {}).get("name") or ""), (c.get("function") or {}).get("arguments", ""))
+                     for c in calls if isinstance(c, dict))
+        if run is None:
+            run = keys
+        elif keys != run:
+            break
+        count += 1
+    return run, count
 
 _SHELL_WRAPPERS = {"sudo", "command", "builtin", "exec", "time", "nohup", "nice", "env", "&", "call", "start", "timeout", "npx", "bunx",
                    "do", "then", "else", "elif", "if", "while", "until", "!"}
@@ -3714,6 +3754,14 @@ class ToolHealer:
             if isinstance(function, dict) and isinstance(function.get("name"), str):
                 self.tools[function["name"]] = function
         self.shell = _tools_shell(self.tools)
+        self.repeat_limit, self._run, self._run_count = 0, None, 0
+        try:
+            if cfg.get("stop_repeats"):
+                limit = cfg.get("repeat_limit")
+                self.repeat_limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and 2 <= limit <= 20 else _REPEAT_LIMIT
+                self._run, self._run_count = _repeat_run(data.get("messages"))
+        except Exception:  # noqa: BLE001 - a chat this can't read is a chat it leaves alone
+            self.repeat_limit = 0
         self.result = {}            # counts and a rule id, for stats and the log
         self._line = bytearray()
         self._event_lines = []
@@ -3765,13 +3813,28 @@ class ToolHealer:
 
     # ── the verdict ─────────────────────────────────────────────────────
     def _judge(self, calls: list):
-        if self.allow is None:
-            return None, None
-        for call in calls:
-            rule, command = guard_tool_call(call["name"], call["arguments"], self.shell, self.allow)
-            if rule:
-                return rule, command
-        return None, None
+        if self.allow is not None:
+            for call in calls:
+                rule, command = guard_tool_call(call["name"], call["arguments"], self.shell, self.allow)
+                if rule:
+                    return rule, command
+        return self._repeated(calls), None
+
+    def _repeated(self, calls: list):
+        """R1: these exact calls were the chat's last `repeat_limit` turns already. R2: one reply makes
+        the same call more often than that. The model is told instead, before the client's own loop
+        detection ends the task. Compared by hash; a different argument is a different call."""
+        if not self.repeat_limit or not calls:
+            return None
+        try:
+            keys = tuple(_call_key(call["name"], call["arguments"]) for call in calls)
+            if keys == self._run and self._run_count >= self.repeat_limit:
+                return "R1"
+            if max(keys.count(key) for key in set(keys)) > self.repeat_limit:
+                return "R2"
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     def _stop(self, rule: str, command=None) -> bytes:
         self.result = {"stopped": 1, "rule": rule}
@@ -5552,7 +5615,8 @@ def _heal_label(ep: dict) -> str:
     cfg = ep.get("tool_heal")
     if not isinstance(cfg, dict) or not cfg.get("enabled"):
         return "—"
-    return "✓ no guard" if cfg.get("guard", True) is False else "✓"
+    label = "✓ no guard" if cfg.get("guard", True) is False else "✓"
+    return label + " ↻" if cfg.get("stop_repeats") else label
 
 
 class EndpointEditScreen(ModalScreen):
@@ -5615,6 +5679,12 @@ class EndpointEditScreen(ModalScreen):
             guard_box.tooltip = ("Stop tool calls that would delete a root or home folder, run a damaged path, "
                                  "or a cut-off command. Works only with healing on.")
             yield guard_box
+            repeat_box = Checkbox("Stop a call the model keeps repeating", value=bool(heal.get("stop_repeats")),
+                                  id="ep-repeat-checkbox", disabled=not heal.get("enabled"))
+            repeat_box.tooltip = (f"After the same call {_REPEAT_LIMIT} times in a row, the next one isn't run: the model is told "
+                                  "to use the result it has or change the call. Works only with healing on "
+                                  "(stop_repeats and repeat_limit in config.json).")
+            yield repeat_box
             ctx = (self.endpoint or {}).get("context_guard")
             ctx_box = Checkbox("Compact early: say 'full' at 90% and keep what the app cuts",
                                value=bool(isinstance(ctx, dict) and ctx.get("enabled")), id="ep-ctx-checkbox")
@@ -5643,6 +5713,7 @@ class EndpointEditScreen(ModalScreen):
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "ep-heal-checkbox":
             self.query_one("#ep-guard-checkbox", Checkbox).disabled = not event.value  # the guard runs inside the healer
+            self.query_one("#ep-repeat-checkbox", Checkbox).disabled = not event.value
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "ep-save-btn":
@@ -5657,13 +5728,17 @@ class EndpointEditScreen(ModalScreen):
         cfg = (self.endpoint or {}).get("tool_heal")
         return cfg if isinstance(cfg, dict) else {}
 
-    def _heal_result(self, heal_on: bool, guard_on: bool):
-        """The endpoint's tool_heal after the dialog: its other keys (allow_rules) kept,
+    def _heal_result(self, heal_on: bool, guard_on: bool, repeats_on=None):
+        """The endpoint's tool_heal after the dialog: its other keys (allow_rules, repeat_limit) kept,
         and nothing written for an endpoint that never had it and still doesn't."""
         heal = dict(self._heal_cfg())
         if not heal_on and not heal:
             return None
         heal["enabled"] = heal_on
+        if repeats_on:
+            heal["stop_repeats"] = True
+        elif repeats_on is not None:
+            heal.pop("stop_repeats", None)  # off is the default
         if guard_on:
             heal.pop("guard", None)  # on is the default
         else:
@@ -5677,7 +5752,8 @@ class EndpointEditScreen(ModalScreen):
         api_key = self.query_one("#ep-key-input", Input).value.strip()
         enabled = self.query_one("#ep-enabled-checkbox", Checkbox).value
         heal = self._heal_result(self.query_one("#ep-heal-checkbox", Checkbox).value,
-                                 self.query_one("#ep-guard-checkbox", Checkbox).value)
+                                 self.query_one("#ep-guard-checkbox", Checkbox).value,
+                                 self.query_one("#ep-repeat-checkbox", Checkbox).value)
 
         if not name:
             self.query_one("#ep-name-input", Input).focus()

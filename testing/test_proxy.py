@@ -3310,6 +3310,133 @@ class MockScript(BaseHTTPRequestHandler):
         pass
 
 
+NPM_ARGS = '{"commands":["npm test"]}'
+
+
+def past_calls(*calls, between=None):
+    """A chat whose assistant turns made these calls, each followed by its result."""
+    messages = [{"role": "user", "content": "go"}]
+    for i, (name, arguments) in enumerate(calls):
+        if between and i:
+            messages.append(between)
+        messages.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": arguments}}]})
+        messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": f"made-up result {i}"})
+    return messages
+
+
+class RepeatedCallTests(unittest.TestCase):
+    """A model that makes the same call again and again is told so, before the client's own loop
+    detection ends the task (Cline 4.1.26: "Detected 5 consecutive identical calls")."""
+
+    def _run(self, stream, messages, **cfg):
+        healer = proxy.ToolHealer({"enabled": True, "stop_repeats": True, **cfg}, {"tools": CLINE_TOOLS, "messages": messages})
+        return healer, healer.feed(stream) + healer.finish()
+
+    def test_the_call_after_three_in_a_row_is_stopped(self):
+        healer, out = self._run(sse_native("run_commands", NPM_ARGS), past_calls(*[("run_commands", NPM_ARGS)] * 3))
+        view = read_reply(out)
+        self.assertEqual(len(view["calls"]), 1)
+        self.assertRegex(view["calls"][0]["name"], r"^gateway_stopped_R1_same_call_repeated")
+        self.assertEqual(view["finish"], "tool_calls")
+        self.assertTrue(view["done"])
+        self.assertNotIn(b"npm test", out)
+        self.assertEqual(healer.result, {"stopped": 1, "rule": "R1"})
+
+    def test_it_never_asks_the_user(self):
+        _h, out = self._run(sse_native("run_commands", NPM_ARGS), past_calls(*[("run_commands", NPM_ARGS)] * 5))
+        self.assertNotEqual(read_reply(out)["calls"][0]["name"], "ask_question")     # an unattended run must go on
+
+    def test_off_by_default(self):
+        stream = sse_native("run_commands", NPM_ARGS)
+        healer = proxy.ToolHealer({"enabled": True}, {"tools": CLINE_TOOLS, "messages": past_calls(*[("run_commands", NPM_ARGS)] * 9)})
+        self.assertEqual(healer.feed(stream) + healer.finish(), stream)
+
+    def test_what_is_not_a_loop_passes_byte_for_byte(self):
+        stream = sse_native("run_commands", NPM_ARGS)
+        same = ("run_commands", NPM_ARGS)
+        cases = {
+            "only twice before": past_calls(same, same),
+            "no history": [{"role": "user", "content": "go"}],
+            "other arguments": past_calls(*[("run_commands", '{"commands":["npm run build"]}')] * 4),
+            "other tool": past_calls(*[("read_files", NPM_ARGS)] * 4),
+            "another call between": past_calls(same, same, ("read_files", "{}"), same, same),
+            "the user spoke": past_calls(same, same, same)[:-2] + [{"role": "user", "content": "again"}] + past_calls(same)[1:],
+            "words between": past_calls(same, same, same, between={"role": "assistant", "content": "Once more."})[:-4]
+                             + [{"role": "assistant", "content": "Once more."}] + past_calls(same)[1:],
+            "already told once": past_calls(same, same, same, ("gateway_stopped_R1_same_call_repeated_in_a_row_use_its_result_or_change_the_call", "{}")),
+            "messages unreadable": "not a list",
+            "odd entries": [None, 5, {"role": "assistant", "tool_calls": "x"}, {"role": "assistant", "tool_calls": [7]}],
+        }
+        for label, messages in cases.items():
+            with self.subTest(label):
+                healer, out = self._run(stream, messages)
+                self.assertEqual(out, stream)
+                self.assertEqual(healer.result, {})
+
+    def test_spacing_and_key_order_do_not_hide_a_repeat(self):
+        past = past_calls(("read_files", '{"files": [{"start_line": 10, "path": "a.txt"}]}'), ("read_files", '{"files":[{"path":"a.txt","start_line":10}]}'),
+                          ("read_files", ' {"files":[{"path":"a.txt", "start_line":10}]} '))
+        healer, _out = self._run(sse_native("read_files", '{"files":[{"path":"a.txt","start_line":10}]}'), past)
+        self.assertEqual(healer.result.get("rule"), "R1")
+
+    def test_a_call_written_as_text_counts_too(self):
+        past = past_calls(*[("read_files", json.dumps(READ_ARGS))] * 3)
+        healer, out = self._run(sse_text(READ_BLOCK), past)
+        self.assertEqual(healer.result, {"stopped": 1, "rule": "R1"})
+        self.assertRegex(read_reply(out)["calls"][0]["name"], r"^gateway_stopped_R1_")
+
+    def test_the_limit_can_be_set(self):
+        past = past_calls(*[("run_commands", NPM_ARGS)] * 2)
+        self.assertEqual(self._run(sse_native("run_commands", NPM_ARGS), past, repeat_limit=2)[0].result.get("rule"), "R1")
+        for bad in (0, 1, 99, "2", True, None):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._run(sse_native("run_commands", NPM_ARGS), past, repeat_limit=bad)[0].result, {})   # the default, 3
+
+    def test_it_works_with_the_command_guard_off(self):
+        healer, _out = self._run(sse_native("run_commands", NPM_ARGS), past_calls(*[("run_commands", NPM_ARGS)] * 3), guard=False)
+        self.assertEqual(healer.result.get("rule"), "R1")
+
+    def test_a_dangerous_repeat_is_reported_by_its_guard_rule(self):
+        args = '{"commands":["rm -rf /"]}'
+        healer, _out = self._run(sse_native("run_commands", args), past_calls(*[("run_commands", args)] * 3))
+        self.assertEqual(healer.result.get("rule"), "S02")
+
+    def _whole(self, calls, messages):
+        body = json.dumps({"id": "c1", "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "tool_calls": [
+            {"id": f"a{i}", "type": "function", "function": {"name": n, "arguments": a}} for i, (n, a) in enumerate(calls)]}}]}).encode()
+        healer = proxy.ToolHealer({"enabled": True, "stop_repeats": True}, {"tools": CLINE_TOOLS, "messages": messages})
+        return healer, body, healer.rewrite_body(body)
+
+    def test_a_whole_reply_is_stopped_too(self):
+        healer, _body, out = self._whole([("run_commands", NPM_ARGS)], past_calls(*[("run_commands", NPM_ARGS)] * 3))
+        calls = json.loads(out)["choices"][0]["message"]["tool_calls"]
+        self.assertRegex(calls[0]["function"]["name"], r"^gateway_stopped_R1_")
+        self.assertNotIn(b"npm test", out)
+        self.assertEqual(healer.result["rule"], "R1")
+
+    def test_one_reply_with_the_same_call_many_times_is_stopped(self):
+        healer, _body, out = self._whole([("run_commands", NPM_ARGS)] * 4, [{"role": "user", "content": "go"}])
+        calls = json.loads(out)["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertRegex(calls[0]["function"]["name"], r"^gateway_stopped_R2_")
+        self.assertEqual(healer.result["rule"], "R2")
+
+    def test_one_reply_with_a_few_of_the_same_call_passes(self):
+        healer, body, out = self._whole([("run_commands", NPM_ARGS)] * 3 + [("read_files", "{}")], [{"role": "user", "content": "go"}])
+        self.assertEqual(out, body)             # pressing a key three times is a real thing to ask for
+
+    def test_the_settings_dialog_keeps_the_choice(self):
+        ep = {"name": "lm", "type": "lmstudio", "host": "localhost:1234", "tool_heal": {"enabled": True, "repeat_limit": 4}}
+        screen = proxy.EndpointEditScreen(dict(ep))
+        self.assertEqual(screen._heal_result(True, True, True), {"enabled": True, "repeat_limit": 4, "stop_repeats": True})
+        on = proxy.EndpointEditScreen({**ep, "tool_heal": {"enabled": True, "stop_repeats": True}})
+        self.assertEqual(on._heal_result(True, True, False), {"enabled": True})
+        self.assertEqual(on._heal_result(True, True), {"enabled": True, "stop_repeats": True})      # not asked: left as it was
+        self.assertEqual(proxy._heal_label({"tool_heal": {"enabled": True, "stop_repeats": True}}), "✓ ↻")
+        self.assertEqual(proxy._heal_label({"tool_heal": {"enabled": True}}), "✓")
+
+
 class ToolHealGatewayTests(unittest.TestCase):
     """The whole path, over real HTTP."""
 
@@ -3436,6 +3563,18 @@ class ToolHealGatewayTests(unittest.TestCase):
         rec = proxy._stats.snapshot()["recent"][0]
         self.assertEqual((rec["stopped"], rec["heal_rule"]), (1, "S11"))
         self.assertIn("stopped a tool call: rule S11", proxy._log_line(rec))
+
+    def test_a_repeated_call_is_stopped_end_to_end(self):
+        self._use({"enabled": True, "stop_repeats": True})
+        past = past_calls(*[("run_commands", NPM_ARGS)] * 3)
+        _s, _h, body = self._post(sse_native("run_commands", NPM_ARGS), messages=past)
+        self.assertRegex(read_reply(body)["calls"][0]["name"], r"^gateway_stopped_R1_")
+        self.assertNotIn(b"npm test", body)
+        self.assertEqual(MockScript.last["messages"], past)         # the request went as sent
+        rec = proxy._stats.snapshot()["recent"][0]
+        self.assertEqual((rec["stopped"], rec["heal_rule"]), (1, "R1"))
+        self.assertIn("stopped a tool call: rule R1", proxy._log_line(rec))
+        self.assertNotIn("npm test", json.dumps(proxy._stats.snapshot()))
 
     def test_a_call_left_as_text_is_counted(self):
         self._post(sse_text(READ_BLOCK, finish="length"))

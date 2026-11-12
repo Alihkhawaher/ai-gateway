@@ -63,7 +63,7 @@ All are off unless set, and `_new_healer()` / `_ctx_guard_config()` read the con
 | Option | Section | Settings checkbox |
 |--------|---------|-------------------|
 | `"kv_sessions": {"enabled": true}` | KV Session Swap | — |
-| `"tool_heal": {"enabled": true, "guard": true}` | Tool Call Healing | **Heal tool calls**, **Check commands before they run (guard)** |
+| `"tool_heal": {"enabled": true, "guard": true, "stop_repeats": false, "repeat_limit": 3}` | Tool Call Healing | **Heal tool calls**, **Check commands before they run (guard)**, **Stop a call the model keeps repeating** |
 | `"context_guard": {"enabled": true, "at": 0.9, "summary_tokens": 2000}` | Context Limit | **Compact early** |
 
 Top level: `"log_file": false` turns off `gateway.log`.
@@ -190,6 +190,7 @@ Rules that must hold:
 8. **A failure inside the healer hands over what it holds** and passes the rest as it came (`_give_up`). Healing must never break a reply.
 9. **No text is kept.** The log and stats get counts and rule ids only. The command appears only in the question sent to the client.
 10. **The guard is for accidents, not a security boundary.** False positives break real work, so any new rule needs near misses added to `MUST_PASS` in `CommandGuardTests`.
+11. **A repeated call is stopped once, by exact match, and the user is never asked** (`"stop_repeats": true`, `_repeated()`, rules R1 and R2). `_repeat_run()` counts the chat's last assistant turns that made exactly the same calls, from the request's own messages: tool results are stepped over, anything else ends the run. When `repeat_limit` (3) turns already made the calls of this reply, the reply becomes a call to `gateway_stopped_R1_…`, never `ask_question`, because an unattended run must go on. That call ends the run, so the same call made again goes through: a call that must repeat is never locked out. Calls are compared as hashes (`_call_key()`: name and arguments, JSON spacing and key order left out), and near matches are not guessed at. The limit has to stay below the client's own: Cline 4.1.26 ends the task at 5 identical calls in a row (seen 2026-11-12).
 
 Test with made-up text only, through `run_healer()`, `sse_text()` and `sse_native()`. Never send test traffic to a real engine: it would displace the chat it holds.
 

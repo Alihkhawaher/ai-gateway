@@ -98,7 +98,7 @@ The rest is the model ID as the upstream endpoint knows it, and may itself conta
 - CORS headers for cross-origin access
 - Auto-discovery of local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
 - Answers model questions in OpenAI, LM Studio, llama.cpp and Ollama form, for the list and for one model, so apps learn the context window that is really loaded
-- [Tool call healing](#tool-call-healing) and a command guard, per endpoint
+- [Tool call healing](#tool-call-healing), a command guard and a [stop for repeated calls](#a-call-the-model-keeps-repeating-stop_repeats), per endpoint
 - [Context limit handling](#when-a-chat-reaches-the-context-limit): the standard `context_length_exceeded` error, and an optional [context guard](#compacting-early-context_guard) that keeps what an app cuts when it compacts
 - [Thinking on or off](#thinking-on-or-off) passed to LM Studio in the one form it honours
 - [KV session swap](#long-chats-on-a-local-engine-kv-session-swap): several long chats on an engine that holds one
@@ -244,7 +244,7 @@ Each endpoint can also carry these. All are off unless you turn them on, and the
 | Endpoint option | What it does |
 |-----------------|--------------|
 | `"kv_sessions": {"enabled": true}` | [Saves and restores chats](#long-chats-on-a-local-engine-kv-session-swap) on an engine that holds one at a time |
-| `"tool_heal": {"enabled": true}` | [Turns tool calls written as text into real ones](#tool-call-healing) and checks commands before they run (**Heal tool calls**, **Check commands before they run**) |
+| `"tool_heal": {"enabled": true}` | [Turns tool calls written as text into real ones](#tool-call-healing) and checks commands before they run (**Heal tool calls**, **Check commands before they run**). With `"stop_repeats": true` it also [stops a call the model keeps repeating](#a-call-the-model-keeps-repeating-stop_repeats) |
 | `"context_guard": {"enabled": true}` | [Says "context full" early](#compacting-early-context_guard) and keeps what the app cuts (**Compact early**) |
 
 A change made in Settings applies to the next request. No restart is needed.
@@ -403,6 +403,27 @@ Options, inside `tool_heal`:
 |---|---|---|
 | `guard` | `true` | `false` keeps the healing and turns off every check |
 | `allow_rules` | `[]` | Rule ids to let through, such as `["S11"]` |
+| `stop_repeats` | `false` | Stop a call the model keeps repeating (below) |
+| `repeat_limit` | `3` | How many identical calls in a row may run (2 to 20) |
+
+### A call the model keeps repeating (`stop_repeats`)
+
+A model that is stuck makes the same call again and again. Some apps end the whole task when they see that: Cline 4.1.26 stops with "Detected 5 consecutive identical calls". With `stop_repeats` on, the gateway steps in first:
+
+```json
+{ "name": "lmstudio", "type": "lmstudio", "host": "localhost:1234", "tool_heal": { "enabled": true, "stop_repeats": true } }
+```
+
+Or tick **Stop a call the model keeps repeating** in the endpoint's dialog in Settings.
+
+- **After the same call three times in a row, the fourth isn't sent.** The model gets a call to a tool named `gateway_stopped_R1_same_call_repeated_in_a_row_use_its_result_or_change_the_call` instead. The app answers that the tool doesn't exist, the model reads the name, and the task carries on. Because that call is a different one, the app's own count starts again.
+- **The same call means the same tool and the same arguments.** JSON spacing and key order don't matter. One changed character in an argument is a different call.
+- **The count is read from the request itself,** which carries the chat's earlier calls, so the gateway keeps nothing between turns. Tool results are stepped over. A message from you, an answer in words, or any other call between two turns starts the count again.
+- **The model is told once.** If it makes the call again after that, it runs, and the count starts from one. A call that really must repeat, such as checking on a build, costs one extra turn in four.
+- **One reply that makes the same call more than three times** is stopped as a whole (rule R2). Up to three passes, since pressing a key three times is a real thing to ask for.
+- **You are never asked.** Unlike the command guard, this never uses `ask_question`, so an unattended run goes on.
+
+The console shows `guard R1` for that request and the log says `stopped a tool call: rule R1`.
 
 ### What this can't do
 
