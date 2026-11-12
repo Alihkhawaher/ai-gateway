@@ -1,6 +1,8 @@
 # AI Gateway — Multi-Endpoint OpenAI-Compatible Proxy with Web Chat UI
 
-A multi-endpoint proxy that connects to several AI backends simultaneously — OpenRouter, OrcaRouter, LM Studio, llama.cpp server, and any custom OpenAI-compatible endpoint. It checks their health, aggregates their models into a unified catalog, and routes requests based on model ID prefixes. Works as a single API server for your entire local network.
+A multi-endpoint proxy that connects to several AI backends simultaneously — OpenRouter, OrcaRouter, LM Studio, llama.cpp server, Ollama, Strata, and any custom OpenAI-compatible endpoint. It checks their health, aggregates their models into a unified catalog, and routes requests based on model ID prefixes. Works as a single API server for your entire local network.
+
+For coding agents on local models it also fixes what usually ends a long run: [tool calls a model wrote as text](#tool-call-healing), [a chat that reaches the context limit](#when-a-chat-reaches-the-context-limit), [an app that compacts too late and loses its history](#compacting-early-context_guard), and [a thinking switch the server ignores](#thinking-on-or-off).
 
 **Use cases:**
 - **Homes** — Share a single paid OpenRouter account with all family devices, while also running local models
@@ -69,24 +71,25 @@ python gateway_tui.py
 
 ## Model ID Format
 
-Model IDs use a `source/vendor/model` prefix to route requests to the correct endpoint:
+Model IDs are `source:model`. The part before the first `:` is the endpoint's name, and it routes the request to that endpoint:
 
 ```
-openrouter/openai/gpt-5.6-luna        → OpenRouter → openai/gpt-5.6-luna
-openrouter/deepseek/deepseek-v4-flash  → OpenRouter → deepseek/deepseek-v4-flash
-orcarouter/openai/gpt-4o-mini          → OrcaRouter → openai/gpt-4o-mini
-orcarouter/anthropic/claude-sonnet-4.6 → OrcaRouter → anthropic/claude-sonnet-4.6
-llama.cpp/qwen3-8b                     → llama.cpp server → qwen3-8b
-lmstudio/mistral-7b                    → LM Studio → mistral-7b
-ollama/llama3                          → Ollama → llama3
+openrouter:openai/gpt-5.6-luna        → OpenRouter → openai/gpt-5.6-luna
+openrouter:deepseek/deepseek-v4-flash  → OpenRouter → deepseek/deepseek-v4-flash
+orcarouter:openai/gpt-4o-mini          → OrcaRouter → openai/gpt-4o-mini
+orcarouter:anthropic/claude-sonnet-4.6 → OrcaRouter → anthropic/claude-sonnet-4.6
+llama.cpp:qwen3-8b                     → llama.cpp server → qwen3-8b
+lmstudio:mistral-7b                    → LM Studio → mistral-7b
+ollama:llama3                          → Ollama → llama3
+strata:my-model                        → Strata → my-model
 ```
 
-The `source` prefix is the endpoint name. The rest is the original model ID as known by the upstream endpoint.
+The rest is the model ID as the upstream endpoint knows it, and may itself contain `/` or `:`.
 
 ## Features
 
 ### Proxy Server
-- Multi-endpoint support (OpenRouter, OrcaRouter, LM Studio, llama.cpp, Ollama, custom)
+- Multi-endpoint support (OpenRouter, OrcaRouter, LM Studio, llama.cpp, Ollama, Strata, custom)
 - Health checking every 30 seconds with status display
 - Automatic model aggregation from all online endpoints
 - Smart routing: model ID prefix → correct endpoint
@@ -94,6 +97,12 @@ The `source` prefix is the endpoint name. The rest is the original model ID as k
 - Automatic model injection when client doesn't specify one
 - CORS headers for cross-origin access
 - Auto-discovery of local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
+- Answers model questions in OpenAI, LM Studio, llama.cpp and Ollama form, for the list and for one model, so apps learn the context window that is really loaded
+- [Tool call healing](#tool-call-healing) and a command guard, per endpoint
+- [Context limit handling](#when-a-chat-reaches-the-context-limit): the standard `context_length_exceeded` error, and an optional [context guard](#compacting-early-context_guard) that keeps what an app cuts when it compacts
+- [Thinking on or off](#thinking-on-or-off) passed to LM Studio in the one form it honours
+- [KV session swap](#long-chats-on-a-local-engine-kv-session-swap): several long chats on an engine that holds one
+- [Live stats](#live-stats) and a [log file](#the-log-file) with counts only, never chat text
 
 ### Terminal Dashboard (TUI)
 - Live proxy log showing all requests
@@ -134,12 +143,12 @@ By default, the model selector shows parsed, human-friendly model names with bad
 When enabled, model names are shown in their complete form, e.g.:
 
 ```
-openrouter/ggml-org/GLM-4.7-Flash-GGUF:Q8_0
-llama.cpp/mistral-7b-instruct-v0.3
-lmstudio/llama-3.2-8b-instruct
+openrouter:ggml-org/GLM-4.7-Flash-GGUF:Q8_0
+llama.cpp:mistral-7b-instruct-v0.3
+lmstudio:llama-3.2-8b-instruct
 ```
 
-This is especially useful with the AI Gateway's multi-endpoint setup, since the `source/vendor/model` prefix makes it clear which endpoint serves each model. The setting is saved in the browser's localStorage and applies immediately.
+This is especially useful with the AI Gateway's multi-endpoint setup, since the `source:` prefix makes it clear which endpoint serves each model. The setting is saved in the browser's localStorage and applies immediately.
 
 ## MCP Servers (Tools & Resources)
 
@@ -205,11 +214,11 @@ Edit `config.json`:
     }
   ],
   "models": [
-    "openrouter/openai/gpt-5.6-luna",
-    "openrouter/deepseek/deepseek-v4-flash-0731",
-    "openrouter/deepseek/deepseek-v4-flash-vision-exp",
-    "openrouter/z-ai/glm-5.3-flash",
-    "openrouter/google/gemini-3.5-flash"
+    "openrouter:openai/gpt-5.6-luna",
+    "openrouter:deepseek/deepseek-v4-flash-0731",
+    "openrouter:deepseek/deepseek-v4-flash-vision-exp",
+    "openrouter:z-ai/glm-5.3-flash",
+    "openrouter:google/gemini-3.5-flash"
   ],
   "default_model": "",
   "force_default_model": false,
@@ -222,12 +231,23 @@ Edit `config.json`:
 | Field | Description |
 |-------|-------------|
 | `endpoints` | List of AI backends (name, type, host, api_key, enabled; optional `timeout` in seconds per upstream read — default 180 for cloud, 600 for local) |
-| `models` | Your curated model list with `source/model` prefix format |
+| `models` | Your curated model list, each as `source:model` |
 | `default_model` | Model ID used when a request names none (empty, or not currently available → the first available model) |
 | `force_default_model` | When `true` (the **Force** checkbox next to Default Model in Settings), every chat request (`…/completions`, `/responses`, `/messages`) uses the default model, whatever model the client asks for; other requests such as embeddings are left alone |
 | `port` | HTTP port (default: 8090) |
 | `addr` | Bind address (`0.0.0.0` = all interfaces) |
 | `fetch_top_models` | When `true`, fetches top 20 intelligent models from OpenRouter and merges with your models |
+| `log_file` | `false` turns off [`gateway.log`](#the-log-file). On by default |
+
+Each endpoint can also carry these. All are off unless you turn them on, and the last two have a checkbox in the endpoint's dialog in Settings:
+
+| Endpoint option | What it does |
+|-----------------|--------------|
+| `"kv_sessions": {"enabled": true}` | [Saves and restores chats](#long-chats-on-a-local-engine-kv-session-swap) on an engine that holds one at a time |
+| `"tool_heal": {"enabled": true}` | [Turns tool calls written as text into real ones](#tool-call-healing) and checks commands before they run (**Heal tool calls**, **Check commands before they run**) |
+| `"context_guard": {"enabled": true}` | [Says "context full" early](#compacting-early-context_guard) and keeps what the app cuts (**Compact early**) |
+
+A change made in Settings applies to the next request. No restart is needed.
 
 ### Endpoint Types
 
@@ -401,6 +421,7 @@ The gateway doesn't shorten or summarize chats. It makes sure your app can do th
 
 - **Apps are told the context window that is loaded.** `/v1/models` (`context_length`, `context_window`, `max_model_len`) and `/props` (`n_ctx`) report what the model is loaded with, such as 32,000, and `max_context_length` holds the model's maximum. Agent apps use this number to decide when to compact, so a wrong one means they compact too late.
 - **A lookup of one model is answered too:** `/v1/models/<id>`, `/api/v0/models/<id>` and Ollama's `/api/show`, `/api/tags` and `/api/ps`, by the gateway's id (`strata:model`) or the engine's own. An app that asks about its model this way and gets no answer falls back to a default of its own, often 128,000. The log shows which lookups each app makes (`model lookup: GET /v1/models/<model>`), so you can tell where an app gets its number from.
+- **The window doesn't change while an engine is busy.** When an endpoint can't be asked for a moment (Strata while it generates, for example), each model keeps the window it last reported. Only a model whose window was never reported gets a default of 128,000, and the gateway never acts on that guess: no "full" from the context guard and no share in the stats.
 - **A full context reaches the app as the standard error.** When an engine answers that the prompt doesn't fit, each says it its own way (llama.cpp: "exceeds the available context size"). The gateway answers `400` with the OpenAI code `context_length_exceeded`, a message with the token counts where the engine gave them, and the engine's own words. Apps with overflow recovery, such as Cline, then compact and retry instead of stopping. `/v1/messages` gets Anthropic's form of the same error. Any other error passes byte for byte.
 - **The console shows it coming.** From 90% of the window, the **In** column of Recent requests shows the share used, for example `241k 92%`, and the log line says `context 92% full`. A request that hit the limit shows `ctx full`.
 
@@ -433,7 +454,16 @@ What to know:
 - **The token count is an estimate** until the engine has read the prompt: the request's size divided by bytes per token, learned from finished requests. Nothing is said before one request has finished.
 - **The request right after a "full" is never refused**, so an app can't be locked out.
 - **The chat is held in memory only**, for that one follow-up request or 15 minutes, and never written or logged. The log shows counts, such as `6 cut, 0 new at the end`.
-- **A summary costs one extra generation**, and the shortened chat is read again afterwards.
+- **A summary costs one extra generation**, and the shortened chat is read again afterwards. The summary request is the app's own request again, with the same tools and settings, so the engine can read the chat from its cache instead of from the start.
+- **The summary keeps decisions, file names and what is left to do**, not the contents of files the model had read. Expect some re-reading after a compaction.
+
+The log shows each step, with counts only:
+
+```
+context guard: about 236,410 of 262,144 tokens (90%), answered context_length_exceeded so the client compacts while the chat still fits
+context guard: the request after 'full' has 103 messages, 69 from the full chat of 149, 80 cut, 0 new at the end
+context guard: summarised 80 cut messages into 3,961 characters and added them to this turn
+```
 
 ## The Log File
 
@@ -469,6 +499,8 @@ Use the **LM Studio** provider in Cline for automatic model discovery:
 3. **API Key**: Leave empty — the proxy handles it
 
 The model dropdown will populate automatically with all models from the gateway.
+
+For long agent runs on a local model, turn on **Heal tool calls** and **Compact early** for that endpoint in Settings. Cline 4.1.26 can show a 128k window in the chat header while its settings page shows the real one, and then compacts only after the engine refuses the prompt, by dropping messages. With [Compact early](#compacting-early-context_guard) the gateway summarizes what Cline drops, so the run continues from where it was instead of starting over.
 
 ### Cline (Alternative)
 Use the **OpenAI Compatible** provider:
@@ -507,10 +539,13 @@ build-webui.cmd
 ├── config.json           # Your settings (endpoints, models, port) — gitignored
 ├── mcp.json              # MCP servers aggregated by 1MCP — gitignored
 ├── gateway-stats.json    # All-time stats, counts only — written at run time, gitignored
+├── gateway.log           # The console's log lines, counts only — written at run time, gitignored
+├── kv-sessions-*.json    # KV session swap index, hashes and counts only — gitignored
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files
 ├── webui-src/            # llama.cpp source (gitignored, see "Building the Web UI")
+├── changelogs/           # Release notes, one file per version (vX.Y.Z.md)
 ├── testing/              # Automated test suite (python testing/test_proxy.py)
 ├── .gitignore
 └── README.md
@@ -518,13 +553,13 @@ build-webui.cmd
 
 ## Testing
 
-The project ships an automated test suite for the proxy's MCP support, using Python's built-in `unittest` (no third-party test runner required):
+The project ships an automated test suite (over 300 tests), using Python's built-in `unittest` (no third-party test runner required):
 
 ```bash
 python testing/test_proxy.py
 ```
 
-The tests spin up an in-process mock MCP server and an ephemeral gateway, then assert on `/props`, `/cors-proxy` forwarding, header precedence, the MCP session handshake, and error handling — no running gateway, online model, or API key needed.
+The tests spin up in-process mock upstreams and an ephemeral gateway, then make real HTTP requests. They cover model lists and lookups, routing, `/cors-proxy` and the MCP session handshake, KV session swap, live stats, tool call healing and the command guard, the context limit and context guard, the thinking switch and the log file. No running gateway, online model or API key is needed, and all chat text in them is made up.
 
 `testing/live_kv_check.py` checks the KV session swap against a real engine. It needs a loaded model, takes a few minutes, and uses only made-up text.
 
@@ -549,7 +584,8 @@ On startup, the proxy:
 |---------|--------|-------|
 | OpenRouter | ✅ Tested | Full support — streaming, model switching, metadata |
 | OrcaRouter | ✅ Tested | OpenAI-compatible gateway — streaming, tools, vision, multi-provider routing |
-| LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint |
+| LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint. Loaded context window reported, thinking switch, tool call healing (Gemma 4 calls after `</think>`), context guard |
+| Strata | ✅ Tested | Vision and context follow the loaded model. KV session swap, engine stats, tool call healing, context guard |
 | llama.cpp server | ✅ Tested | Health check via `/health`, model info via `/props` |
 | Ollama | ✅ Tested | Health check via `/api/tags`, model discovery, OpenAI-compatible chat API |
 | vLLM | ⏳ Pending | Expected to work (OpenAI-compatible API) |
@@ -569,8 +605,13 @@ This proxy exposes LM Studio-compatible endpoints (`/api/v0/models`, `/api/v1/mo
 | `GET /v1/models` | OpenAI standard | Standard clients, OpenAI Compatible provider |
 | `GET /api/v0/models` | LM Studio | Cline LM Studio provider, LM Studio clients |
 | `GET /api/v1/models` | LM Studio | Alias for `/api/v0/models` |
+| `GET /v1/models/<id>`, `GET /api/v0/models/<id>` | OpenAI / LM Studio | One model's entry, by the gateway's id or the engine's own. Apps ask this to learn a model's context window |
+| `GET /api/tags`, `GET /api/ps`, `POST /api/show` | Ollama | Model list and one model's info (`num_ctx`, `<arch>.context_length`), for apps that ask an Ollama-style server |
+| `GET /props` | llama.cpp | Server properties: modalities, loaded context (`n_ctx`), parameters |
 | `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
+| `GET /health` | JSON | Endpoint statuses |
 | `GET /stats` | JSON | [Live stats](#live-stats): the gateway's counts, engine numbers and saved chats |
+| `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the web UI's MCP servers, served to the gateway's own page only |
 
 ## License
 

@@ -18,6 +18,8 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 ├── config.json           # Your settings (endpoints, models, port) — GITIGNORED
 ├── mcp.json              # MCP servers aggregated by 1MCP — GITIGNORED
 ├── gateway-stats.json    # All-time stats, counts only — written at run time, GITIGNORED
+├── gateway.log           # The console's log lines, counts only — written at run time, GITIGNORED
+├── kv-sessions-*.json    # KV session swap index, hashes and counts only — GITIGNORED
 ├── build-webui.cmd       # One-click web UI build script
 ├── run.cmd               # Quick-start batch file
 ├── webui/                # Built web UI static files (llama.cpp llama-ui)
@@ -47,12 +49,24 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 
 ### Model ID Format
 
-Model IDs use a `source/vendor/model` prefix. The first segment is the endpoint `name`; the rest is the original upstream model ID.
+Model IDs are `source:model` (`parse_model_id()`). The part before the first `:` is the endpoint `name`; the rest is the original upstream model ID, which may itself contain `/` or `:`.
 
 ```
-openrouter/openai/gpt-5.6-luna   → OpenRouter → openai/gpt-5.6-luna
-llamastash/Qwen3.8-27B-DFlash2-Q8_0 → llamastash (custom) → Qwen3.8-27B-DFlash2-Q8_0
+openrouter:openai/gpt-5.6-luna   → OpenRouter → openai/gpt-5.6-luna
+llamastash:Qwen3.8-27B-DFlash2-Q8_0 → llamastash (custom) → Qwen3.8-27B-DFlash2-Q8_0
 ```
+
+### Per-endpoint options
+
+All are off unless set, and `_new_healer()` / `_ctx_guard_config()` read the config on every request, so a change in Settings applies to the next request.
+
+| Option | Section | Settings checkbox |
+|--------|---------|-------------------|
+| `"kv_sessions": {"enabled": true}` | KV Session Swap | — |
+| `"tool_heal": {"enabled": true, "guard": true}` | Tool Call Healing | **Heal tool calls**, **Check commands before they run (guard)** |
+| `"context_guard": {"enabled": true, "at": 0.9, "summary_tokens": 2000}` | Context Limit | **Compact early** |
+
+Top level: `"log_file": false` turns off `gateway.log`.
 
 ## Key Invariants — DO NOT REGRESS
 
@@ -200,8 +214,8 @@ Rules that must hold:
 3. **Stats keep counts only:** `overflow` (yes or no), `window` and `window_used`.
 4. **The guard never locks a client out and never breaks a request.** The request after a "full" is never refused; an unrecognised follow-up, a failed summary or any exception forwards the request as sent.
 5. **Held chat text stays in memory:** one follow-up request or `_CTX_PENDING_TTL_S`, never on disk, in the log or in stats. The log gets counts only.
-7. **The summary request is the client's own request again** (`_CTX_NOT_CARRIED` lists the few fields left out): same tools, no `tool_choice`, so the engine renders the same prompt start and reads it from its cache. Adding `tool_choice: none` first made Strata re-read 149k tokens (2026-11-12); it is now only the second attempt.
-6. **The summary is appended to the last message, never inserted earlier,** so the prompt before it is unchanged, and it reaches the client inside the reply because the gateway keeps no chat state between turns.
+6. **The summary request is the client's own request again** (`_CTX_NOT_CARRIED` lists the few fields left out): same tools, no `tool_choice`, so the engine renders the same prompt start and reads it from its cache. Adding `tool_choice: none` first made Strata re-read 149k tokens (2026-11-12); it is now only the second attempt.
+7. **The summary is appended to the last message, never inserted earlier,** so the prompt before it is unchanged, and it reaches the client inside the reply because the gateway keeps no chat state between turns.
 
 ## Thinking Switch
 

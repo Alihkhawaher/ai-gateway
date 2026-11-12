@@ -50,6 +50,12 @@
       "api_key": "",
       "kv_sessions": {
         "enabled": false
+      },
+      "tool_heal": {
+        "enabled": false
+      },
+      "context_guard": {
+        "enabled": false
       }
     }
   ],
