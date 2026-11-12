@@ -109,7 +109,7 @@ class MockStrata(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            ready = [i for i in MockStrata.instances if i["status"] == "ready"]
+            ready = [i for i in MockStrata.instances if i["status"] in ("ready", "busy")]
             self._json(200, {"object": "list", "data": [
                 {"id": i["apiModelId"], "object": "model", "owned_by": "strata",
                  "meta": {"label": i["label"], "aliases": i["aliases"]}}
@@ -441,6 +441,7 @@ class StrataEndpointTests(unittest.TestCase):
         cls.st_srv.shutdown(); cls.st_srv.server_close()
 
     def setUp(self):
+        proxy._known_context.clear()
         MockStrata.native_status = 200
         MockStrata.instances = [
             strata_instance("iq3_s", vision=True, context=131072),
@@ -472,6 +473,42 @@ class StrataEndpointTests(unittest.TestCase):
         models = self._by_id()
         self.assertEqual(set(models), {"iq3_s", "q8_0"})
         self.assertEqual(models["iq3_s"]["architecture"]["input_modalities"], ["text"])
+
+    # ── the context window is never swapped for a default mid-session ────
+    def test_a_busy_model_keeps_its_context(self):
+        MockStrata.instances = [strata_instance("iq3_s", vision=True, context=262144, status="busy")]
+        entry = self._by_id()["iq3_s"]
+        self.assertEqual((entry["context_length"], entry["context_guessed"]), (262144, False))
+
+    def test_a_failed_read_keeps_the_last_window_reported(self):
+        MockStrata.instances = [strata_instance("iq3_s", vision=True, context=262144)]
+        self.assertEqual(self._by_id()["iq3_s"]["context_length"], 262144)
+        MockStrata.native_status = 403                       # Strata can't be asked right now
+        entry = self._by_id()["iq3_s"]
+        self.assertEqual((entry["context_length"], entry["context_guessed"]), (262144, False))
+
+    def test_a_window_never_reported_is_marked_as_a_guess(self):
+        MockStrata.native_status = 403
+        entry = self._by_id()["iq3_s"]
+        self.assertEqual((entry["context_length"], entry["context_guessed"]), (128000, True))
+
+    def test_a_guessed_window_is_never_acted_on(self):
+        saved = (proxy.get_models(), dict(proxy._model_meta), proxy.get_config("endpoints"))
+        proxy.set_config("endpoints", [{"name": "st", "type": "strata", "host": self.host, "enabled": True, "api_key": ""}])
+        proxy.set_models(["st:iq3_s"])
+        try:
+            with proxy._model_meta_lock:
+                proxy._model_meta["st:iq3_s"] = {"context_length": 128000, "context_guessed": True}
+            self.assertIsNone(proxy._context_window("st", "iq3_s"))     # the guard and the stats get nothing
+            with proxy._model_meta_lock:
+                proxy._model_meta["st:iq3_s"] = {"context_length": 262144, "context_guessed": False}
+            self.assertEqual(proxy._context_window("st", "iq3_s"), 262144)
+        finally:
+            proxy.set_models(saved[0])
+            with proxy._model_meta_lock:
+                proxy._model_meta.clear()
+                proxy._model_meta.update(saved[1])
+            proxy.set_config("endpoints", saved[2])
 
     def test_gateway_models_report_vision_for_strata(self):
         """End to end: the gateway's /v1/models sets modalities.vision, the
@@ -3933,8 +3970,8 @@ class ContextGuardTests(unittest.TestCase):
         MockChat.reply_text = "SUMMARY again."
         self.assertEqual(self._post(full[:2] + full[-3:], tools=tools)[0], 200)
         first, second, real = MockChat.seen
-        self.assertEqual((first.get("tools"), first.get("tool_choice")), (tools, "none"))
-        self.assertNotIn("tools", second)
+        self.assertEqual((first.get("tools"), first.get("tool_choice")), (tools, None))   # as the client sent it: cache hit
+        self.assertEqual((second.get("tools"), second.get("tool_choice")), (tools, "none"))
         self.assertIn("SUMMARY again.", real["messages"][-1]["content"])
 
     def test_the_held_chat_is_dropped_after_its_one_use_and_after_a_while(self):

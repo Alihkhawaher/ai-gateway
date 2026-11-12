@@ -787,9 +787,7 @@ def fetch_lmstudio_models(host: str) -> list:
         model_id = m.get("id", "")
         if not model_id:
             continue
-        max_ctx = m.get("max_context_length") or m.get("context_length")
-        if max_ctx is None:
-            max_ctx = 128000
+        max_ctx, guessed = _sticky_context(host, model_id, m.get("max_context_length") or m.get("context_length"))
         loaded_ctx = m.get("loaded_context_length") or max_ctx
         caps = m.get("capabilities", []) or []
         input_mods = ["text"]
@@ -799,6 +797,7 @@ def fetch_lmstudio_models(host: str) -> list:
             "id": model_id,
             "name": m.get("name", model_id),
             "context_length": max_ctx,
+            "context_guessed": guessed,
             "loaded_context_length": loaded_ctx,
             "owned_by": m.get("publisher", ""),
             "arch": m.get("arch", ""),
@@ -837,7 +836,8 @@ def fetch_llama_server_models(host: str) -> list:
         entry = {
             "id": model_name,
             "name": model_name,
-            "context_length": gen_settings.get("n_ctx", 128000),
+            "context_length": gen_settings.get("n_ctx") or _DEFAULT_CONTEXT,
+            "context_guessed": not gen_settings.get("n_ctx"),
             "architecture": {
                 "input_modalities": _modalities_to_input(modalities),
                 "output_modalities": ["text"],
@@ -880,7 +880,8 @@ def fetch_ollama_models(host: str) -> list:
             models.append({
                 "id": model_name,
                 "name": model_name,
-                "context_length": 128000,
+                "context_length": _DEFAULT_CONTEXT,       # /api/tags doesn't say
+                "context_guessed": True,
                 "capabilities": caps,
                 "architecture": {
                     "input_modalities": ["text"],
@@ -928,6 +929,25 @@ def fetch_custom_models(host: str, api_key: str) -> list:
         return []
 
 
+_DEFAULT_CONTEXT = 128000      # reported only when an endpoint has never said what a model holds
+_known_context = {}             # (host, model id) -> the last context window the endpoint reported
+_known_context_lock = threading.Lock()
+
+
+def _sticky_context(host: str, model_id: str, reported):
+    """(context window, guessed). An endpoint that can't be asked right now (busy, restarting) keeps the
+    window it last reported: swapping in a default mid-session told clients 128,000 for a 262,144 model
+    (2026-11-12). Only a model whose window was never reported gets the default, marked as a guess."""
+    key = (host, model_id)
+    with _known_context_lock:
+        if isinstance(reported, (int, float)) and not isinstance(reported, bool) and reported > 0:
+            _known_context[key] = int(reported)
+            return int(reported), False
+        if key in _known_context:
+            return _known_context[key], False
+    return _DEFAULT_CONTEXT, True
+
+
 def fetch_strata_models(host: str, api_key: str) -> list:
     """Fetch the models a Strata gateway is serving right now.
 
@@ -956,9 +976,7 @@ def fetch_strata_models(host: str, api_key: str) -> list:
         print(f"[proxy] Could not read Strata model details from {host}: {e}")
 
     by_id = {}
-    for inst in instances:
-        if inst.get("status") != "ready":
-            continue
+    for inst in sorted(instances, key=lambda i: i.get("status") == "ready"):     # a ready one wins a shared name
         for key in [inst.get("apiModelId")] + list(inst.get("aliases") or []):
             if key:
                 by_id[key] = inst
@@ -973,11 +991,13 @@ def fetch_strata_models(host: str, api_key: str) -> list:
         input_mods = ["text"]
         if inst.get("vision"):
             input_mods.append("image")
+        context, guessed = _sticky_context(host, model_id, inst.get("context") or meta.get("context"))
         entries.append({
             "id": model_id,
             "name": inst.get("label") or meta.get("label") or model_id,
             "owned_by": "strata",
-            "context_length": inst.get("context") or meta.get("context") or 128000,
+            "context_length": context,
+            "context_guessed": guessed,
             "architecture": {
                 "input_modalities": input_mods,
                 "output_modalities": ["text"],
@@ -4245,6 +4265,8 @@ def _context_window(ep_name: str, model: str):
             source, original = parse_model_id(gateway_id)
             if source == ep_name and original == model:
                 meta = get_model_meta(gateway_id)
+                if meta.get("context_guessed"):
+                    return None             # a default, not something the endpoint said
                 return _whole_number(meta.get("loaded_context_length")) or _whole_number(meta.get("context_length"))
     except Exception:  # noqa: BLE001 -- a number for the console, never worth a failed request
         pass
@@ -4277,6 +4299,10 @@ _CTX_SUMMARY_PROMPT = (
     "context. Write a summary that lets the work continue without it: the user's goal and constraints, decisions "
     "made and why, what has been done (files, commands, results), exact names, paths and values that will be needed "
     "again, what failed, and what remains to be done. Be specific and concise. Reply with the summary only.")
+# Not copied from the request answered "full" into the summary request; everything else is, so the engine
+# renders the same prompt start and reads it from its cache instead of from scratch.
+_CTX_NOT_CARRIED = ("messages", "stream", "stream_options", "max_tokens", "max_completion_tokens", "n", "tool_choice",
+                    "temperature", "response_format")
 _ctx_lock = threading.Lock()
 _ctx_ratio = {}          # endpoint name -> request bytes per prompt token, learned from finished requests
 _ctx_pending = {}        # (client address, endpoint name) -> the request that was answered "full"
@@ -4371,12 +4397,13 @@ def _ctx_guard(cfg: dict, ep_name: str, client: str, data: dict, body: bytes):
                 full = [cmp["new_system"]] + (full[1:] if full and isinstance(full[0], dict) and full[0].get("role") == "system" else full)
             return {"action": "restore", "shape": shape, "messages": list(full) + list(cmp["trailing"]), "cut": len(cmp["dropped"])}
         return {"action": "summarise", "shape": shape, "prefix": pending["messages"][:cmp["dropped"][-1] + 1],
-                "tools": pending.get("tools"), "cut": len(cmp["dropped"])}
+                "tools": pending.get("tools"), "params": pending.get("params") or {}, "cut": len(cmp["dropped"])}
     window = _context_window(ep_name, str(data.get("model") or ""))
     tokens = _ctx_estimate(ep_name, _ctx_size(body, data))
     if window and tokens and tokens >= cfg["at"] * window:
         with _ctx_lock:
-            _ctx_pending[key] = {"messages": messages, "tools": data.get("tools"), "time": now}
+            _ctx_pending[key] = {"messages": messages, "tools": data.get("tools"), "time": now,
+                                 "params": {k: v for k, v in data.items() if k not in _CTX_NOT_CARRIED}}
         return {"action": "full", "tokens": tokens, "window": window}
     return None
 
@@ -5095,10 +5122,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _ctx_summarise(self, host, use_ssl, path, headers, model, verdict, cfg, timeout):
         """Ask the engine for a summary of the chat up to the last message the client cut. The prompt is the
         start of the chat the engine just held, so it mostly comes from its cache. None when it can't be made."""
-        base = {"model": model, "messages": _ctx_summary_messages(verdict["prefix"]), "max_tokens": cfg["summary_tokens"],
-                "temperature": 0.2, "stream": False}
+        base = {**(verdict.get("params") or {}), "model": model, "messages": _ctx_summary_messages(verdict["prefix"]),
+                "max_tokens": cfg["summary_tokens"], "temperature": 0.2, "stream": False}
         tools = verdict.get("tools")
-        attempts = [{**base, "tools": tools, "tool_choice": "none"}, base] if tools else [base]   # same tools: same cached prompt
+        plain = {k: v for k, v in base.items() if k != "tools"}
+        # First exactly as the client asked (same tools, no tool_choice): the same prompt start, so it comes
+        # from the engine's cache. Only if that gives no text: forbid tools, then drop them.
+        attempts = [base, {**base, "tool_choice": "none"}, plain] if tools else [base]
         for body in attempts:
             raw = json.dumps(body).encode("utf-8")
             if use_ssl:
