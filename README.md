@@ -1,316 +1,156 @@
-# AI Gateway — Multi-Endpoint OpenAI-Compatible Proxy with Web Chat UI
+# AI Gateway
 
-A multi-endpoint proxy that connects to several AI backends simultaneously — OpenRouter, OrcaRouter, LM Studio, llama.cpp server, Ollama, Strata, and any custom OpenAI-compatible endpoint. It checks their health, aggregates their models into a unified catalog, and routes requests based on model ID prefixes. Works as a single API server for your entire local network.
+**One address for all your AI models, cloud and local, for every app and device on your network.**
 
-For coding agents on local models it also fixes what usually ends a long run: [tool calls a model wrote as text](#tool-call-healing), [a chat that reaches the context limit](#when-a-chat-reaches-the-context-limit), [an app that compacts too late and loses its history](#compacting-early-context_guard), and [a thinking switch the server ignores](#thinking-on-or-off).
+AI Gateway is a small proxy you run on one PC. It connects to OpenRouter, OrcaRouter, LM Studio, llama.cpp, Ollama, Strata and any other OpenAI-compatible server at the same time, and gives every app on your network one address with all their models in one list. It comes with a terminal console to watch and manage it, and a web chat page anyone on the network can open.
 
-**Use cases:**
-- **Homes** — Share a single paid OpenRouter account with all family devices, while also running local models
-- **Testing environments** — Developers and QA can access cloud and local AI without managing individual API keys
-- **Cline / AI agents** — Point any agent client to `http://YOUR_PC:8090` and it just works
-- **Private chat** — Anyone on the LAN gets a full chat UI without needing their own account
+It also fixes the things that usually end a long coding-agent run on a local model: tool calls written as text, a model stuck repeating one call, and a chat that outgrows its context window.
 
-## What It Does
+![The console: endpoints, live stats and the request log](screenshots/console.png)
+
+| Live dashboard (`d`) | Settings (`s`) |
+|:---:|:---:|
+| ![Dashboard](screenshots/dashboard.png) | ![Settings](screenshots/settings.png) |
+| **An endpoint's options** | **The web chat page** |
+| ![Endpoint dialog](screenshots/endpoint.png) | ![Web chat page](screenshots/webui.png) |
+
+<sub>Screenshots are from a demo setup with made-up traffic.</sub>
+
+## What you get
+
+- **Every model in one list.** Apps see `openrouter:openai/gpt-5.6-luna`, `lmstudio:qwen3-8b` and the rest side by side, and the gateway sends each request to the right place. API keys stay on the gateway, so apps and family devices need none.
+- **A chat page for everyone.** Open `http://YOUR_PC:8090/` on any phone or laptop: streaming answers, file and image uploads, conversation history and MCP tools, no account needed.
+- **A console that shows what's happening.** Which endpoints are up, what each request cost in tokens and time, how much came from the cache, and a full dashboard on `d`.
+- **Long agent runs that keep going** on local models, with these per-endpoint options (all off until you turn them on):
+  - [Tool call healing](#tool-call-healing): a call the model wrote as text becomes a real one, and risky commands are checked before they run.
+  - [Repeat stop](#a-call-the-model-keeps-repeating): a model stuck on the same call is told so before the app gives up on the task.
+  - [Compact early](#when-a-chat-reaches-the-context-limit): the app is told "context full" while the whole chat still fits, so nothing it cuts is lost.
+  - [Saved chats](#long-chats-on-a-local-engine-kv-session-swap): several long chats share an engine that holds one at a time.
+- **Open or locked, your choice.** By default anyone on your network can use it. Add [access keys](#access-keys) and every app must send one.
+- **Private by design.** The gateway never keeps chat text. Stats, logs and saved files hold counts and names only.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  AI Gateway (192.168.1.100:8090)                             │
-│                                                              │
-│  proxy.py ─┬─► OpenRouter API ──► Cloud AI Models           │
-│            ├─► OrcaRouter API ──► Cloud AI Models           │
-│            ├─► llama.cpp :8080 ──► Local GGUF Models        │
-│            ├─► LM Studio :1234 ──► Local Models             │
-│            ├─► Ollama :11434 ──► Local Models               │
-│            └─► Custom Endpoint ──► Any OpenAI-compatible     │
-│      │                                                       │
-│      ├── Terminal TUI (endpoint mgmt, model switch)         │
-│      └── Web Chat UI (browser-based)                        │
-│                                                              │
-└──────────┬──────────┬──────────┬────────────────────────────┘
-           │          │          │
-     ┌─────┴──┐  ┌────┴───┐  ┌──┴────────┐
-     │ Phone  │  │ Laptop │  │ Cline/Agent│
-     │ Web UI │  │ Web UI │  │ API client │
-     └────────┘  └────────┘  └────────────┘
+                    ┌──────────────────────────────┐
+  Phone / laptop ──►│                              ├──► OpenRouter, OrcaRouter (cloud)
+  (web chat page)   │   AI Gateway  :8090          ├──► LM Studio, llama.cpp, Ollama (local)
+  Cline, Goose, ───►│   console + web chat page    ├──► Strata
+  any OpenAI app    │                              ├──► any OpenAI-compatible server
+                    └──────────────────────────────┘
 ```
 
-**Multiple endpoints, one proxy, zero client configuration.**
+## Quick start
 
-### Screenshots
+You need **Python 3.8+**. The `textual` library installs itself on first run.
 
-| Split-View TUI | Settings | Web Chat UI |
-|:---:|:---:|:---:|
-| ![Split-View TUI](screenshots/ss01.png) | ![Settings](screenshots/ss02.png) | ![Web Chat UI](screenshots/ss03.png) |
+1. Download or clone this project.
+2. Copy `config.example.json` to `config.json` and put in your endpoints and API keys. (`config.json` is gitignored, so your keys never get committed.) You can also add endpoints later in the console's Settings.
+3. Start it:
+   ```bash
+   python gateway_tui.py
+   ```
+   or double-click `run.cmd`. (`python proxy.py` runs the gateway alone, without the [MCP bridge](#mcp-servers-tools-for-the-chat-page).)
 
-### For AI Agent Users (Cline, etc.)
-The gateway exposes both OpenAI-compatible and LM Studio-compatible endpoints. For the best experience with Cline:
+Then open `http://localhost:8090/` for the chat page, or `http://YOUR_PC_IP:8090/` from another device.
 
-1. Select **"LM Studio"** as the API provider in Cline
-2. Set the base URL to `http://YOUR_PC_IP:8090` (no `/v1` needed)
-3. The model dropdown populates automatically
+Local servers on their usual ports (llama.cpp on 8080, LM Studio on 1234, Ollama on 11434) are found on their own.
 
-The proxy handles the API key, model selection, and routing. Switch models from the TUI and all connected agents instantly use the new model.
+## Connect your apps
 
-### For Chat Users
-Open `http://YOUR_PC_IP:8090/` in any browser on the network. Full chat interface with conversation management, file attachments, markdown rendering, and model switching — no account needed.
+| App | Setting |
+|---|---|
+| **Cline** (recommended) | API Provider **LM Studio**, Base URL `http://YOUR_PC_IP:8090` (no `/v1`), API key empty. The model list fills itself. |
+| **Cline**, other way | API Provider **OpenAI Compatible**, Base URL `http://YOUR_PC_IP:8090/v1`, any non-empty API key such as `sk-placeholder` |
+| **Any OpenAI-compatible app** | Base URL `http://YOUR_PC_IP:8090/v1`, API key empty or anything |
+| **Ollama-style apps** | `http://YOUR_PC_IP:8090` |
+| **A browser** | `http://YOUR_PC_IP:8090/` |
 
-## Quick Start
+If the gateway has [access keys](#access-keys), put one in the app's API key field. The chat page asks for it the first time it opens.
 
-```bash
-# 1. Clone or download this project
-# 2. Copy config.example.json to config.json and add your endpoints + API keys
-#    (config.json is gitignored — never commit your real API keys)
-# 3. Run (recommended — split-view TUI: proxy GUI + 1MCP MCP bridge):
-python gateway_tui.py
-#    or just double-click run.cmd
-#    (plain proxy only, no MCP bridge: python proxy.py)
+**For long agent runs on a local model**, open the console's Settings, choose the endpoint, press **Edit** and tick **Heal tool calls**, **Stop a call the model keeps repeating** and **Compact early**. A change applies to the next request, without a restart.
 
-# That's it. Open http://localhost:8090/ for the chat UI.
-# Other devices: http://YOUR_IP:8090/
-```
+<details>
+<summary>Why this matters for Cline</summary>
 
-## Model ID Format
+Cline 4.1.26 can show a 128k window in the chat header while its settings page shows the real one, and then compacts only after the engine refuses the prompt, by dropping messages. With [Compact early](#compacting-early-context_guard) the gateway summarizes what Cline drops, so the run continues from where it was instead of starting over. Cline also ends a task after 5 identical calls in a row; the [repeat stop](#a-call-the-model-keeps-repeating) steps in at the fourth.
 
-Model IDs are `source:model`. The part before the first `:` is the endpoint's name, and it routes the request to that endpoint:
+</details>
+
+## Access keys
+
+Out of the box the gateway is open: anyone who can reach it on your network can use your models and your cloud credit. To lock it, give it one or more keys. Every app must then send one, the way it would send an OpenAI key.
+
+1. Open **Settings** (`s`). Under **Access Keys**, press **+ New key** (or type your own, at least 16 characters).
+2. Press `Ctrl+S`. The main screen now says `Access : API key needed`. No restart is needed.
+3. Give the key to your apps: their **API key** field (Cline, Goose, Open WebUI and any OpenAI app). The web chat page asks for it the first time it opens and remembers it in that browser.
+
+Give each person or device its own key, so you can take one away by deleting it.
+
+<details>
+<summary>Details: what is checked, config form, and limits</summary>
+
+- **Sent as** `Authorization: Bearer <key>` (OpenAI apps), `x-api-key` (Anthropic apps) or `api-key`.
+- **Checked on every API request**: models, chat, `/props`, `/health`, `/stats`, Ollama's paths and `/cors-proxy`. Only the web page's own files load without a key, so the page can open and ask for one.
+- **A wrong or missing key** gets `401` with the OpenAI code `invalid_api_key`. The log notes it once a minute per address (`refused GET /v1/models: no access key`), never with the key.
+- **Your key never goes upstream.** The gateway sends each endpoint its own `api_key` from the config. On `/cors-proxy` it keeps the key too, and passes on only the MCP server's own headers.
+- **In `config.json`** keys are a list. A key can carry a name for your own notes:
+  ```json
+  "access_keys": ["gw-...", {"name": "laptop", "key": "gw-..."}]
+  ```
+  An empty list or no `access_keys` at all leaves the gateway open. A key shorter than 16 characters is ignored, so a typo can't leave the gateway guarded by a guessable key.
+- **The connection isn't encrypted.** The gateway speaks plain HTTP, so keys and chats cross your network readable to anyone who can watch it. That's fine on a home network. To reach it from the internet, put it behind a VPN or an HTTPS reverse proxy instead of opening the port.
+- **Images the chat page loads through `/cors-proxy`** (pictures from other sites in a reply) can't carry the key, so with keys on they don't show.
+
+</details>
+
+## Model names
+
+A model's name is `endpoint:model`. The part before the first `:` is the endpoint's name in your config, and it decides where the request goes:
 
 ```
 openrouter:openai/gpt-5.6-luna        → OpenRouter → openai/gpt-5.6-luna
-openrouter:deepseek/deepseek-v4-flash  → OpenRouter → deepseek/deepseek-v4-flash
-orcarouter:openai/gpt-4o-mini          → OrcaRouter → openai/gpt-4o-mini
 orcarouter:anthropic/claude-sonnet-4.6 → OrcaRouter → anthropic/claude-sonnet-4.6
-llama.cpp:qwen3-8b                     → llama.cpp server → qwen3-8b
-lmstudio:mistral-7b                    → LM Studio → mistral-7b
-ollama:llama3                          → Ollama → llama3
-strata:my-model                        → Strata → my-model
+lmstudio:mistral-7b                    → LM Studio  → mistral-7b
+ollama:llama3                          → Ollama     → llama3
+strata:my-model                        → Strata     → my-model
 ```
 
-The rest is the model ID as the upstream endpoint knows it, and may itself contain `/` or `:`.
+The rest is the model's name as that server knows it, and may contain `/` or `:` itself.
 
-## Features
+<details>
+<summary>How the model list is built</summary>
 
-### Proxy Server
-- Multi-endpoint support (OpenRouter, OrcaRouter, LM Studio, llama.cpp, Ollama, Strata, custom)
-- Health checking every 30 seconds with status display
-- Automatic model aggregation from all online endpoints
-- Smart routing: model ID prefix → correct endpoint
-- SSE streaming for all endpoints
-- Automatic model injection when client doesn't specify one
-- CORS headers for cross-origin access
-- Auto-discovery of local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
-- Answers model questions in OpenAI, LM Studio, llama.cpp and Ollama form, for the list and for one model, so apps learn the context window that is really loaded
-- [Tool call healing](#tool-call-healing), a command guard and a [stop for repeated calls](#a-call-the-model-keeps-repeating-stop_repeats), per endpoint
-- [Context limit handling](#when-a-chat-reaches-the-context-limit): the standard `context_length_exceeded` error, and an optional [context guard](#compacting-early-context_guard) that keeps what an app cuts when it compacts
-- [Thinking on or off](#thinking-on-or-off) passed to LM Studio in the one form it honours
-- [KV session swap](#long-chats-on-a-local-engine-kv-session-swap): several long chats on an engine that holds one
-- [Live stats](#live-stats) and a [log file](#the-log-file) with counts only, never chat text
+On startup, the gateway:
 
-### Terminal Dashboard (TUI)
-- Live proxy log showing all requests
-- Endpoint status panel (online/offline with model counts) and a per-endpoint **load** column — in-flight requests and total requests served (e.g. `⚡ 2 active · 17 total`, `idle · 12 total`, `—` if never used)
-- [Live stats](#live-stats) beside the endpoint list, and a full dashboard on `d`: cache hits, speed, GPU, saved chats, and totals per app and model
-- [Tool calls healed and stopped](#tool-call-healing) are counted beside the other live stats
-- Settings with model selection, port, bind address, fetch top models toggle
-- Footer key bindings: `s` Settings, `d` Dashboard, `q` Quit, `Ctrl+S` Save, `Ctrl+R` Restart
-- Consistent scrollable layout across all screens
-- Save/load settings from `config.json`
+1. Finds local servers (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
+2. Checks every configured endpoint
+3. For OpenRouter and OrcaRouter, lists only the models in your `models` list (not the full catalog of 340+)
+4. For local servers, lists every model they have loaded
+5. Builds one list with the endpoint name in front of each model
+6. Repeats this every 30 seconds
 
-### Split-View TUI (`gateway_tui.py`)
-- Runs the proxy **and** [1MCP](https://github.com/1mcp-app/agent) (an MCP aggregator) in one terminal
-- Top pane: the full proxy GUI (endpoint status, server info, live log, Settings via `s`)
-- Bottom pane: live 1MCP output — **every** server in `mcp.json` aggregated behind ONE streamable-HTTP endpoint on `:8099/mcp`
-- Reuses `proxy.py`'s TUI via subclassing — `proxy.py` is not modified
-- Clean shutdown on `q` (kills the 1MCP process tree, stops the proxy server)
-- Windows-compatible `npx` launch; requires Node.js/npx on PATH
+Apps can ask about models in the OpenAI, LM Studio, llama.cpp and Ollama forms, for the whole list or for one model, and each answer carries the context window the model is loaded with. See **API endpoints** under [Reference](#reference).
 
-### Web Chat UI
-- Powered by [llama.cpp's llama-ui](https://github.com/ggml-org/llama.cpp/tree/master/tools/ui)
-- Streaming responses with real-time token display
-- Model selector with all configured models (from all endpoints)
-- Conversation management (create, branch, edit, delete, search)
-- File attachments (images, PDFs, audio, text)
-- Markdown with syntax highlighting and math formulas
-- Dark/light theme
-- MCP server support (attach tools/resources; "Use llama-server proxy" toggle)
+</details>
 
-#### Displaying Full Raw Model Identifiers
+## The console
 
-By default, the model selector shows parsed, human-friendly model names with badges (e.g. `GLM-4.7-Flash` with a `Q8_0` quantization badge). To see the **full raw model identifier** — including the source prefix and the complete upstream model ID — enable the **"Show raw model names"** option:
+The top of the main screen lists your endpoints, whether each is up, how many models it has and how many requests it is serving. Beside it, **Live** sums up today. Below is the request log: one line per request with tokens in and out, the cached share, time to the first token, speed and how the reply ended.
 
-1. Open the **Settings** screen (gear icon in the sidebar)
-2. Go to the **Display** section
-3. Toggle **"Show raw model names"** on
-
-When enabled, model names are shown in their complete form, e.g.:
-
-```
-openrouter:ggml-org/GLM-4.7-Flash-GGUF:Q8_0
-llama.cpp:mistral-7b-instruct-v0.3
-lmstudio:llama-3.2-8b-instruct
-```
-
-This is especially useful with the AI Gateway's multi-endpoint setup, since the `source:` prefix makes it clear which endpoint serves each model. The setting is saved in the browser's localStorage and applies immediately.
-
-## MCP Servers (Tools & Resources)
-
-The web UI can attach **MCP servers** to the chat so the model can call external tools and read resources. HTTP/S MCP servers (Streamable HTTP or SSE) are added by URL in the MCP Servers screen.
-
-- **"Use llama-server proxy"** — routes the MCP server's traffic through the gateway's `/cors-proxy` endpoint, bypassing browser CORS/mixed-content restrictions. Enable this for local HTTP MCP servers or any server that doesn't send CORS headers. `/cors-proxy` only answers the gateway's own web page (and non-browser clients): a page from another site gets `403`, so it can't use the gateway to reach services that only listen on this PC. Open the web UI by IP, `localhost`, the PC's name (`my-pc`) or a `.local`/`.lan`/`.home` name; a name with a public domain is refused, which blocks DNS-rebinding.
-- **Session support** — the proxy forwards the MCP session handshake (`Mcp-Session-Id`) so stateful MCP servers work.
-
-> **Command/stdio servers** (e.g. ComfyUI's `comfyui_mcp.py`, `@modelcontextprotocol/server-filesystem`) are not spawned by the proxy itself. Instead, list them in **`mcp.json`** (gitignored) and the split-view TUI (`gateway_tui.py`) launches [1MCP](https://github.com/1mcp-app/agent), which aggregates **all** of them behind a single streamable-HTTP endpoint on `:8099/mcp` — one port for any number of MCP servers:
->
-> ```json
-> {
->   "mcpServers": {
->     "comfyui":   { "type": "stdio", "command": "python", "args": ["C:/tools/comfyui/comfyui_mcp.py"] },
->     "filesystem": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/path/to/folder"] }
->   }
-> }
-> ```
->
-> Then add `http://localhost:8099/mcp` as **one** MCP URL with the proxy toggle on — you'll get every server's tools (namespaced `server___tool`).
-
-## Configuration
-
-Edit `config.json`:
-
-```json
-{
-  "endpoints": [
-    {
-      "name": "openrouter",
-      "type": "openrouter",
-      "host": "openrouter.ai",
-      "enabled": true,
-      "api_key": "sk-or-v1-YOUR_KEY_HERE"
-    },
-    {
-      "name": "orcarouter",
-      "type": "orcarouter",
-      "host": "api.orcarouter.ai",
-      "enabled": true,
-      "api_key": "sk-orca-YOUR_KEY_HERE"
-    },
-    {
-      "name": "llama.cpp",
-      "type": "llama-server",
-      "host": "localhost:8080",
-      "enabled": true,
-      "api_key": ""
-    },
-    {
-      "name": "ollama",
-      "type": "ollama",
-      "host": "localhost:11434",
-      "enabled": true,
-      "api_key": ""
-    },
-    {
-      "name": "llamastash",
-      "type": "custom",
-      "host": "localhost:11435",
-      "enabled": true,
-      "api_key": ""
-    }
-  ],
-  "models": [
-    "openrouter:openai/gpt-5.6-luna",
-    "openrouter:deepseek/deepseek-v4-flash-0731",
-    "openrouter:deepseek/deepseek-v4-flash-vision-exp",
-    "openrouter:z-ai/glm-5.3-flash",
-    "openrouter:google/gemini-3.5-flash"
-  ],
-  "default_model": "",
-  "force_default_model": false,
-  "port": 8090,
-  "addr": "0.0.0.0",
-  "fetch_top_models": false
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `endpoints` | List of AI backends (name, type, host, api_key, enabled; optional `timeout` in seconds per upstream read — default 180 for cloud, 600 for local) |
-| `models` | Your curated model list, each as `source:model` |
-| `default_model` | Model ID used when a request names none (empty, or not currently available → the first available model) |
-| `force_default_model` | When `true` (the **Force** checkbox next to Default Model in Settings), every chat request (`…/completions`, `/responses`, `/messages`) uses the default model, whatever model the client asks for; other requests such as embeddings are left alone |
-| `port` | HTTP port (default: 8090) |
-| `addr` | Bind address (`0.0.0.0` = all interfaces) |
-| `fetch_top_models` | When `true`, fetches top 20 intelligent models from OpenRouter and merges with your models |
-| `log_file` | `false` turns off [`gateway.log`](#the-log-file). On by default |
-
-Each endpoint can also carry these. All are off unless you turn them on, and the last two have a checkbox in the endpoint's dialog in Settings:
-
-| Endpoint option | What it does |
-|-----------------|--------------|
-| `"kv_sessions": {"enabled": true}` | [Saves and restores chats](#long-chats-on-a-local-engine-kv-session-swap) on an engine that holds one at a time |
-| `"tool_heal": {"enabled": true}` | [Turns tool calls written as text into real ones](#tool-call-healing) and checks commands before they run (**Heal tool calls**, **Check commands before they run**). With `"stop_repeats": true` it also [stops a call the model keeps repeating](#a-call-the-model-keeps-repeating-stop_repeats) |
-| `"context_guard": {"enabled": true}` | [Says "context full" early](#compacting-early-context_guard) and keeps what the app cuts (**Compact early**) |
-
-A change made in Settings applies to the next request. No restart is needed.
-
-### Endpoint Types
-
-| Type | Description | Health Check |
-|------|-------------|-------------|
-| `openrouter` | OpenRouter cloud API | `GET /api/v1/models` |
-| `orcarouter` | OrcaRouter cloud API | `GET /api/v1/models` |
-| `lmstudio` | LM Studio local server | `GET /v1/models` |
-| `llama-server` | llama.cpp server | `GET /health` |
-| `ollama` | Ollama local server | `GET /api/tags` |
-| `strata` | Strata gateway (default `127.0.0.1:47831`) — vision and context follow the model loaded in Strata | `GET /v1/models` |
-| `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` |
-
-## Long Chats on a Local Engine (KV Session Swap)
-
-A local engine like Strata holds one conversation at a time. If several apps each keep a long chat there, every switch throws the held chat away, and the next request reads the other one again from scratch: 15+ minutes at 500k tokens.
-
-With `kv_sessions` on, the gateway saves the held chat to disk and restores the right one before forwarding each request, so a switch takes seconds. Apps need no changes: chats are recognised by hashes of their messages.
-
-**Turn it on (Strata):**
-
-1. Create a folder for the session files, then add it to the model's run config (`strata-<model>.json`) and load the model again:
-   ```json
-   "slot_save_path": "D:\\Strata\\sessions"
-   ```
-2. Add this to the Strata endpoint in `config.json` and restart the gateway:
-   ```json
-   "kv_sessions": {"enabled": true}
-   ```
-
-The gateway finds the engine's port and key in Strata's own run files on each request. For another engine with the same slot API (`POST /slots/0?action=save|restore`), set `engine` and, if it has one, `engine_api_key`.
-
-| Setting | Default | Meaning |
-|---------|---------|---------|
-| `enabled` | `false` | Turn the swap on for this endpoint |
-| `engine` | found for Strata | `host:port` of the engine's own server |
-| `engine_api_key` | found for Strata | That server's API key |
-| `slot_dir` | found for Strata | The engine's session folder (only needed for `max_gb`) |
-| `min_tokens` | `30000` | A shorter chat is cheap to read again, so it isn't saved |
-| `min_gain_chars` | `4000` | Restore a saved chat only if it matches this many more characters than the held one |
-| `idle_save_s` | `600` | Save the held chat after this many seconds without requests (`0` = off) |
-| `max_gb` | `0` | Keep at most this much on disk, deleting the oldest of its own files first (`0` = never delete) |
-
-**What it costs:**
-
-| | Measured with Strata on an NVMe drive |
+| Key | |
 |---|---|
-| Disk | About 16.7 KB per token: 1.7 GB at 104k tokens, about 8.5 GB at 512k (estimated) |
-| Save / restore | 2.2 s / 3.0 s at 104k tokens, about 11 s / 15 s at 512k (estimated) |
-| Reading the same chat from scratch | 274 s at 104k tokens, over 20 minutes at 370k |
+| `d` | Live dashboard (`d` or `Esc` to go back) |
+| `s` | Settings: endpoints and their options, default model, port, bind address |
+| `Ctrl+S` / `Ctrl+R` | Save settings / restart the server (in Settings) |
+| `q` | Quit |
 
-- There is no limit on the number of swaps or saved chats except disk space. Set `max_gb` to cap it.
-- A save rewrites the whole chat, and only happens if the chat changed since its last save. Switching back and forth often writes a lot to the SSD.
-- The engine still runs one request at a time, so apps take turns.
-- A chat comes back in full only if the app resends the same history. If it trims or rewrites older messages, the part after the first change is read again.
+`gateway_tui.py` runs the same console with a second pane below it for [1MCP](https://github.com/1mcp-app/agent), which serves all your MCP servers on one port. `proxy.py` runs the console alone.
 
-The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. The index also records which chat the engine holds, so restarting the gateway doesn't make it forget. The first request after a restart checks that record against the engine's own token count. If the engine holds a long chat (`min_tokens` or more) that the gateway can't identify, no saved chat is restored over it, because it may be the same chat, newer than its saved copy. If another app uses the engine directly, the next switch back to a saved chat therefore reads it again once. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
+The console's log lines are also written to `gateway.log` beside `config.json`, counts and names only, cut back to its newer half at 5 MB. `"log_file": false` in `config.json` turns it off.
 
-If the engine answers a save or restore with an error 500, swapping turns off until the model is reloaded, or for 30 minutes. Strata 0.1.57 can get into a state where every snapshot fails with `conversation snapshot: invalid K/V extent`. The console then shows **Swap: off until the model is reloaded** with the engine's reason, and `GET /stats` has it under `kv_sessions` as `suspended` and `last_error`. Reloading the model in Strata brings saving back.
+### Live stats
 
-## Live Stats
-
-The console shows what the gateway and its engine are doing, refreshed every second. The main screen has a short **Live** panel beside the endpoint list. Press `d` for the full dashboard, and `d` or `Esc` to go back. Panels stack when the window is narrow.
+<details>
+<summary>What the dashboard panels show, and where the numbers come from</summary>
 
 | Panel | What it shows |
 |-------|---------------|
@@ -318,7 +158,7 @@ The console shows what the gateway and its engine are doing, refreshed every sec
 | **Cache** | Prompt tokens reused, expert hit rate, drafts kept, chats parked in RAM, how each request found its chat (kept, restored, new), swap times, reading time saved |
 | **Speed** | Output speed with a 60-second graph, reading speed, time to first token (median and p95), requests per minute, tokens per day |
 | **Hardware** | GPU load, temperature, power, VRAM, PCIe traffic, CPU, RAM and disk |
-| **Totals** | Requests, errors, tokens, cached share and time saved for this run, today and all time, plus cost when a cloud endpoint reports it |
+| **Totals** | Requests, errors, tokens, cached share, time saved, calls healed and stopped, for this run, today and all time, plus cost when a cloud endpoint reports it |
 | **Saved chats** | Each chat on disk: app, tokens, size, restores, last used. A dot marks the one in the engine |
 | **Endpoints, Models, Apps** | Requests, tokens and cached share for each |
 | **Recent requests** | Time, app, model, tokens, cached share, first token, speed, expert hits, what the swap did, how the reply ended (**End**) and the status |
@@ -348,22 +188,27 @@ No chat text is kept. The gateway reads token counts and timings from responses,
 
 `GET /stats` returns the same numbers as JSON. Like `/health` it needs no key, and it includes client addresses and app names, so anyone who can reach the gateway can read them.
 
-## Tool Call Healing
+</details>
 
-Local models sometimes write a tool call out as plain text instead of making a real tool call. The client shows the text, nothing runs, and the turn ends. Damaged calls can also do harm: a client's own repair can turn `rm -rf C:\Users\me` into `rm -rf C:Usersme`.
+## Tool call healing
 
-Turn healing on per endpoint. In the console, open **Settings**, choose the endpoint, press **Edit** and tick **Heal tool calls**. **Check commands before they run (guard)** is ticked by default, and you can only change it while healing is on. The endpoint table's **Heal** column shows which endpoints have healing on. The change applies to the next request, with no restart. Or set it in `config.json`:
+Local models sometimes write a tool call out as plain text instead of making a real one. The app shows the text, nothing runs, and the agent stops. With **Heal tool calls** on, the gateway turns such a call into a real one, and its **guard** checks every command before the app runs it, so a damaged `rm -rf` never gets there.
+
+Turn it on in Settings → endpoint → **Edit** → **Heal tool calls**. The **Heal** column in the endpoint table shows `✓` where it's on, and `↻` where the repeat stop is on too. Or in `config.json`:
 
 ```json
-{ "name": "strata", "type": "strata", "host": "127.0.0.1:47831", "tool_heal": { "enabled": true } }
+{ "name": "lmstudio", "type": "lmstudio", "host": "localhost:1234", "tool_heal": { "enabled": true } }
 ```
+
+<details>
+<summary>What it changes, and what it leaves alone</summary>
 
 It's off by default, and then every reply passes byte for byte. When it's on, it only touches `/chat/completions` requests that offer tools. A reply with nothing to repair keeps every character, though text that could have started a call may arrive split differently.
 
-| The model replies with | What the client receives |
+| The model replies with | What the app receives |
 |---|---|
 | A complete call written as text, with a real tool name | A proper tool call, which runs |
-| A complete call written as text, with a name the client doesn't have | A proper tool call under that same name. Nothing runs, and the client tells the model which tools exist, so it can correct itself |
+| A complete call written as text, with a name the app doesn't have | A proper tool call under that same name. Nothing runs, and the app tells the model which tools exist, so it can correct itself |
 | No answer and no call, but the reasoning ends with `</think>` followed by complete calls in Gemma 4's format (`<\|tool_call>call:name{…}<tool_call\|>`) | Proper tool calls. This happens with Gemma 4 finetunes on LM Studio: the model closes its thinking with the wrong tag, so the server leaves the call inside the reasoning and the agent stops |
 | A call in a code fence, or a tag mentioned in a sentence | The text, unchanged: that's a quotation |
 | A written call that is incomplete or was cut off | The text, unchanged. It never runs |
@@ -372,13 +217,16 @@ It's off by default, and then every reply passes byte for byte. When it's on, it
 
 Tool names are never guessed, and parameter values are never edited.
 
-### The command guard
+</details>
 
-Every call that would run is checked, healed or not, for accidents that come from errors. It splits commands the way bash, PowerShell or cmd would, using the shell the client's tool says it runs, so `grep -rn "rm -rf" src/` passes and `rm -rf ./dist` passes.
+<details>
+<summary>The command guard: rules and what happens when one fires</summary>
+
+Every call that would run is checked, healed or not, for accidents that come from errors. It splits commands the way bash, PowerShell or cmd would, using the shell the app's tool says it runs, so `grep -rn "rm -rf" src/` passes and `rm -rf ./dist` passes.
 
 | Rule | What it stops | Example |
 |---|---|---|
-| A1 | Broken arguments on a command or file tool, because a client's repair can change what they mean | `{"commands":["rm -rf ./x", ]}` |
+| A1 | Broken arguments on a command or file tool, because an app's repair can change what they mean (Cline's repair turns `rm -rf C:\Users\me` into `rm -rf C:Usersme`) | `{"commands":["rm -rf ./x", ]}` |
 | T1 | A command or file call in a reply that was cut off | `finish_reason: length` |
 | S01 | Deleting a path that is only a variable | `rm -rf "$DIR/"` |
 | S02, S05 | Deleting a root, home, drive, system or top-level folder | `rm -rf ~`, `Remove-Item C:\ -Recurse` |
@@ -392,10 +240,10 @@ Every call that would run is checked, healed or not, for accidents that come fro
 | S17 | Commands that can't be read | `curl … \| sh`, `iex`, `powershell -enc` |
 | S18, S19, S20 | Paths that climb out, unquoted spaces, empty paths | `rm -rf ../..`, `rm -rf ""` |
 
-When a command is stopped, nothing of it reaches the client:
+When a command is stopped, nothing of it reaches the app:
 
-- **If the client offers `ask_question`,** you're shown the command and the reason, and your answer goes back to the model. The guard has no override, so a command you really want is yours to run yourself.
-- **Otherwise, and for A1 and T1,** the model receives a call to a tool named like `gateway_stopped_S02_destructive_command_was_not_run`. The client answers that the tool doesn't exist, and the turn carries on with the rule in view.
+- **If the app offers `ask_question`,** you're shown the command and the reason, and your answer goes back to the model. The guard has no override, so a command you really want is yours to run yourself.
+- **Otherwise, and for A1 and T1,** the model receives a call to a tool named like `gateway_stopped_S02_destructive_command_was_not_run`. The app answers that the tool doesn't exist, and the turn carries on with the rule in view.
 
 Options, inside `tool_heal`:
 
@@ -406,28 +254,9 @@ Options, inside `tool_heal`:
 | `stop_repeats` | `false` | Stop a call the model keeps repeating (below) |
 | `repeat_limit` | `3` | How many identical calls in a row may run (2 to 20) |
 
-### A call the model keeps repeating (`stop_repeats`)
+What it can't do:
 
-A model that is stuck makes the same call again and again. Some apps end the whole task when they see that: Cline 4.1.26 stops with "Detected 5 consecutive identical calls". With `stop_repeats` on, the gateway steps in first:
-
-```json
-{ "name": "lmstudio", "type": "lmstudio", "host": "localhost:1234", "tool_heal": { "enabled": true, "stop_repeats": true } }
-```
-
-Or tick **Stop a call the model keeps repeating** in the endpoint's dialog in Settings.
-
-- **After the same call three times in a row, the fourth isn't sent.** The model gets a call to a tool named `gateway_stopped_R1_same_call_repeated_in_a_row_use_its_result_or_change_the_call` instead. The app answers that the tool doesn't exist, the model reads the name, and the task carries on. Because that call is a different one, the app's own count starts again.
-- **The same call means the same tool and the same arguments.** JSON spacing and key order don't matter. One changed character in an argument is a different call.
-- **The count is read from the request itself,** which carries the chat's earlier calls, so the gateway keeps nothing between turns. Tool results are stepped over. A message from you, an answer in words, or any other call between two turns starts the count again.
-- **The model is told once.** If it makes the call again after that, it runs, and the count starts from one. A call that really must repeat, such as checking on a build, costs one extra turn in four.
-- **One reply that makes the same call more than three times** is stopped as a whole (rule R2). Up to three passes, since pressing a key three times is a real thing to ask for.
-- **You are never asked.** Unlike the command guard, this never uses `ask_question`, so an unattended run goes on.
-
-The console shows `guard R1` for that request and the log says `stopped a tool call: rule R1`.
-
-### What this can't do
-
-- **It catches accidents, not intent.** A command can always hide what it does, for example inside a script or `npm run clean`. Keep your client's approval settings on.
+- **It catches accidents, not intent.** A command can always hide what it does, for example inside a script or `npm run clean`. Keep your app's approval settings on.
 - **It doesn't know the working folder,** so `rm -rf build` in the wrong folder passes.
 - **In bash, a line break can't be told from a damaged `\n`,** because multi-line scripts are normal there. PowerShell and cmd ask you when a delete's path runs straight into a line break, so a script with a delete like that gets a question. Put `-Recurse` last or use `;` to avoid it.
 - **A made-up tool name costs one retry,** and the model has to write the call again.
@@ -436,9 +265,37 @@ The console shows `guard R1` for that request and the log says `stopped a tool c
 
 Nothing about a reply is kept. The log and stats get counts and rule ids only.
 
-## When a Chat Reaches the Context Limit
+</details>
 
-The gateway doesn't shorten or summarize chats. It makes sure your app can do that itself, at the right time:
+### A call the model keeps repeating
+
+A stuck model makes the same call again and again, and some apps then end the whole task (Cline 4.1.26: "Detected 5 consecutive identical calls"). With **Stop a call the model keeps repeating** on, the gateway lets the same call run three times in a row and replaces the fourth with a note to the model, so it changes course and the task carries on. You are never asked, so an unattended run keeps going.
+
+```json
+"tool_heal": { "enabled": true, "stop_repeats": true }
+```
+
+<details>
+<summary>How it decides, exactly</summary>
+
+- **After the same call three times in a row, the fourth isn't sent.** The model gets a call to a tool named `gateway_stopped_R1_same_call_repeated_in_a_row_use_its_result_or_change_the_call` instead. The app answers that the tool doesn't exist, the model reads the name, and the task carries on. Because that call is a different one, the app's own count starts again.
+- **The same call means the same tool and the same arguments.** JSON spacing and key order don't matter. One changed character in an argument is a different call.
+- **The count is read from the request itself,** which carries the chat's earlier calls, so the gateway keeps nothing between turns. Tool results are stepped over. A message from you, an answer in words, or any other call between two turns starts the count again.
+- **The model is told once.** If it makes the call again after that, it runs, and the count starts from one. A call that really must repeat, such as checking on a build, costs one extra turn in four.
+- **One reply that makes the same call more than three times** is stopped as a whole (rule R2). Up to three passes, since pressing a key three times is a real thing to ask for.
+- **You are never asked.** Unlike the command guard, this never uses `ask_question`.
+- `repeat_limit` (2 to 20, default 3) sets how many identical calls in a row may run. Keep it below your app's own limit.
+
+The console shows `guard R1` for that request and the log says `stopped a tool call: rule R1`.
+
+</details>
+
+## When a chat reaches the context limit
+
+The gateway doesn't shorten chats itself. It makes sure your app can, at the right time: apps are told the context window the model is **really loaded with**, and when a chat no longer fits, they get the standard `context_length_exceeded` error that makes them compact and retry instead of stopping. From 90% full, the console shows how full each chat is.
+
+<details>
+<summary>Details: what apps are told, and when</summary>
 
 - **Apps are told the context window that is loaded.** `/v1/models` (`context_length`, `context_window`, `max_model_len`) and `/props` (`n_ctx`) report what the model is loaded with, such as 32,000, and `max_context_length` holds the model's maximum. Agent apps use this number to decide when to compact, so a wrong one means they compact too late.
 - **A lookup of one model is answered too:** `/v1/models/<id>`, `/api/v0/models/<id>` and Ollama's `/api/show`, `/api/tags` and `/api/ps`, by the gateway's id (`strata:model`) or the engine's own. An app that asks about its model this way and gets no answer falls back to a default of its own, often 128,000. The log shows which lookups each app makes (`model lookup: GET /v1/models/<model>`), so you can tell where an app gets its number from.
@@ -446,17 +303,18 @@ The gateway doesn't shorten or summarize chats. It makes sure your app can do th
 - **A full context reaches the app as the standard error.** When an engine answers that the prompt doesn't fit, each says it its own way (llama.cpp: "exceeds the available context size"). The gateway answers `400` with the OpenAI code `context_length_exceeded`, a message with the token counts where the engine gave them, and the engine's own words. Apps with overflow recovery, such as Cline, then compact and retry instead of stopping. `/v1/messages` gets Anthropic's form of the same error. Any other error passes byte for byte.
 - **The console shows it coming.** From 90% of the window, the **In** column of Recent requests shows the share used, for example `241k 92%`, and the log line says `context 92% full`. A request that hit the limit shows `ctx full`.
 
+</details>
+
 ### Compacting early (`context_guard`)
 
-Some apps only compact after the engine refuses the prompt. By then the chat no longer fits, so nothing can read all of it, and what the app cuts is lost. Cline 4.1.26 does this: its emergency compaction drops messages, and its early compaction didn't run here even past the window it believed in.
-
-With the context guard on, the gateway says "full" while the whole chat still fits, then gives the app's next request what it cut:
+Some apps only compact after the engine refuses the prompt. By then the chat no longer fits, so nothing can read all of it, and what the app cuts is lost. With **Compact early** on, the gateway says "full" at 90%, while the whole chat still fits, and then makes sure the app's compaction gets everything it cut, as the full messages or as a summary written by the model.
 
 ```json
-{ "name": "strata", "type": "strata", "host": "127.0.0.1:47831", "context_guard": { "enabled": true } }
+"context_guard": { "enabled": true }
 ```
 
-Or tick **Compact early** in the endpoint's dialog in Settings.
+<details>
+<summary>How it works, settings and log lines</summary>
 
 1. **At 90% of the window**, the gateway answers `context_length_exceeded` without asking the engine, and keeps that request's messages in memory.
 2. **The app's next request** is then one of two things:
@@ -486,15 +344,14 @@ context guard: the request after 'full' has 103 messages, 69 from the full chat 
 context guard: summarised 80 cut messages into 3,961 characters and added them to this turn
 ```
 
-## The Log File
+</details>
 
-The console's log lines are also written to `gateway.log` beside `config.json` (gitignored), so they're still there after the console closes. They hold counts and names only, never chat text. The file is cut back to its newer half at 5 MB. `"log_file": false` in `config.json` turns it off.
+## Thinking on or off
 
-## Thinking On or Off
+Your app decides whether the model thinks, and the gateway makes sure the server hears it. LM Studio only understands one way of saying it, so on LM Studio endpoints the gateway translates your app's choice. Nothing is set in the gateway's own config.
 
-Your app decides whether the model thinks, and the gateway delivers that choice to the endpoint. Nothing is set in the gateway's config.
-
-Apps phrase this in different ways, and LM Studio's `/v1/chat/completions` only understands one of them, `reasoning_effort`. On LM Studio endpoints the gateway therefore copies your app's choice into `reasoning_effort`:
+<details>
+<summary>The translation table</summary>
 
 | Your app sends | LM Studio gets |
 |----------------|----------------|
@@ -511,115 +368,158 @@ This was tested with a Gemma 4 model. With `reasoning_effort: "none"`, LM Studio
 
 Each log line shows what your app asked for, such as `thinking off (asked)`, and `GET /stats` has it as `think`. That shows whether your app sends a choice at all.
 
-## Connecting Clients
+</details>
 
-### Cline (Recommended)
-Use the **LM Studio** provider in Cline for automatic model discovery:
-1. **API Provider**: Select "LM Studio"
-2. **Base URL**: `http://YOUR_PC_IP:8090`
-3. **API Key**: Leave empty — the proxy handles it
+## Long chats on a local engine (KV session swap)
 
-The model dropdown will populate automatically with all models from the gateway.
+A local engine like Strata holds one conversation at a time. When several apps each keep a long chat there, every switch makes the engine read the other chat again from scratch: 15 minutes or more at 500k tokens. With `kv_sessions` on, the gateway saves the held chat to disk and restores the right one before each request, so a switch takes seconds. Apps need no changes.
 
-For long agent runs on a local model, turn on **Heal tool calls** and **Compact early** for that endpoint in Settings. Cline 4.1.26 can show a 128k window in the chat header while its settings page shows the real one, and then compacts only after the engine refuses the prompt, by dropping messages. With [Compact early](#compacting-early-context_guard) the gateway summarizes what Cline drops, so the run continues from where it was instead of starting over.
+<details>
+<summary>Setup, settings and costs</summary>
 
-### Cline (Alternative)
-Use the **OpenAI Compatible** provider:
-- **Base URL**: `http://YOUR_PC_IP:8090/v1`
-- **API Key**: Any non-empty string (e.g., `sk-placeholder`)
+**Turn it on (Strata):**
 
-### Any OpenAI-compatible client
-- **Base URL**: `http://YOUR_PC_IP:8090/v1`
-- **API Key**: Leave empty or use anything — the proxy uses its own key
+1. Create a folder for the session files, then add it to the model's run config (`strata-<model>.json`) and load the model again:
+   ```json
+   "slot_save_path": "D:\\Strata\\sessions"
+   ```
+2. Add this to the Strata endpoint in `config.json` and restart the gateway:
+   ```json
+   "kv_sessions": {"enabled": true}
+   ```
 
-### Web Browser
-Open `http://YOUR_PC_IP:8090/`
+The gateway finds the engine's port and key in Strata's own run files on each request. For another engine with the same slot API (`POST /slots/0?action=save|restore`), set `engine` and, if it has one, `engine_api_key`. Chats are recognised by hashes of their messages.
 
-## Building the Web UI
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `enabled` | `false` | Turn the swap on for this endpoint |
+| `engine` | found for Strata | `host:port` of the engine's own server |
+| `engine_api_key` | found for Strata | That server's API key |
+| `slot_dir` | found for Strata | The engine's session folder (only needed for `max_gb`) |
+| `min_tokens` | `30000` | A shorter chat is cheap to read again, so it isn't saved |
+| `min_gain_chars` | `4000` | Restore a saved chat only if it matches this many more characters than the held one |
+| `idle_save_s` | `600` | Save the held chat after this many seconds without requests (`0` = off) |
+| `max_gb` | `0` | Keep at most this much on disk, deleting the oldest of its own files first (`0` = never delete) |
 
-The web UI only needs to be built once. After building, Python serves the static files directly — no Node.js runtime needed. The bundled `webui/` already contains a pre-built copy, so this step is only required when you want to update it.
+**What it costs:**
 
-```bash
-# First-time setup: clone the llama.cpp source (the build script expects it here)
-git clone https://github.com/ggml-org/llama.cpp.git webui-src
+| | Measured with Strata on an NVMe drive |
+|---|---|
+| Disk | About 16.7 KB per token: 1.7 GB at 104k tokens, about 8.5 GB at 512k (estimated) |
+| Save / restore | 2.2 s / 3.0 s at 104k tokens, about 11 s / 15 s at 512k (estimated) |
+| Reading the same chat from scratch | 274 s at 104k tokens, over 20 minutes at 370k |
 
-# Option A: Build from the cloned llama.cpp source
-build-webui.cmd
+- There is no limit on the number of swaps or saved chats except disk space. Set `max_gb` to cap it.
+- A save rewrites the whole chat, and only happens if the chat changed since its last save. Switching back and forth often writes a lot to the SSD.
+- The engine still runs one request at a time, so apps take turns.
+- A chat comes back in full only if the app resends the same history. If it trims or rewrites older messages, the part after the first change is read again.
 
-# Option B: Use pre-built files from a local llama.cpp build
-# Copy <llama.cpp>/build/tools/ui/dist/ contents to webui/
+The gateway never opens session files, and its index (`kv-sessions-<endpoint>.json`) holds message hashes and counts only, never chat text. The index also records which chat the engine holds, so restarting the gateway doesn't make it forget. The first request after a restart checks that record against the engine's own token count. If the engine holds a long chat (`min_tokens` or more) that the gateway can't identify, no saved chat is restored over it, because it may be the same chat, newer than its saved copy. If another app uses the engine directly, the next switch back to a saved chat therefore reads it again once. `GET /health` shows the sessions, the held chat and the save and restore counts, and the log shows each swap. If the engine has slot saving off, requests are forwarded as usual and the log says what to change.
+
+If the engine answers a save or restore with an error 500, swapping turns off until the model is reloaded, or for 30 minutes. Strata 0.1.57 can get into a state where every snapshot fails with `conversation snapshot: invalid K/V extent`. The console then shows **Swap: off until the model is reloaded** with the engine's reason, and `GET /stats` has it under `kv_sessions` as `suspended` and `last_error`. Reloading the model in Strata brings saving back.
+
+</details>
+
+## The web chat page
+
+The chat page is [llama.cpp's llama-ui](https://github.com/ggml-org/llama.cpp/tree/master/tools/ui), served by the gateway: streaming answers, every model from every endpoint in one picker, conversations you can branch, edit and search, image, PDF, audio and text attachments, markdown with code highlighting and math, and a dark or light theme. Uploads of images, audio and video turn on for models that accept them.
+
+<details>
+<summary>Showing full model names in the picker</summary>
+
+By default the model picker shows short names with badges. To see the full name with its endpoint (`openrouter:z-ai/glm-5.3-flash`), open **Settings** (gear icon) → **Display** → **Show raw model names**. The setting is kept in the browser.
+
+</details>
+
+### MCP servers (tools for the chat page)
+
+The chat page can give the model tools from MCP servers. Add an HTTP MCP server by URL in its MCP Servers screen, with **Use llama-server proxy** on so the gateway passes the traffic through.
+
+For servers that run as a command (stdio), list them in `mcp.json` (gitignored). `gateway_tui.py` starts [1MCP](https://github.com/1mcp-app/agent), which serves **all** of them behind one address, `http://localhost:8099/mcp`. Add that one URL with the proxy toggle on, and every server's tools appear (named `server___tool`). It needs Node.js and `npx` on the PATH.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": { "type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/path/to/folder"] }
+  }
+}
 ```
 
-## Project Structure
+<details>
+<summary>How the proxy toggle is kept safe</summary>
 
+The toggle routes the MCP server's traffic through the gateway's `/cors-proxy`, which gets around the browser's CORS and mixed-content rules. The gateway forwards the MCP session handshake (`Mcp-Session-Id`) so stateful servers work.
+
+`/cors-proxy` only answers the gateway's own page (and non-browser clients): a page from another site gets `403`, so it can't use the gateway to reach services that only listen on this PC. Open the chat page by IP, `localhost`, the PC's name (`my-pc`) or a `.local`/`.lan`/`.home` name; a name with a public domain is refused, which blocks DNS rebinding.
+
+</details>
+
+## Configuration
+
+Most of it can be done in the console's Settings (`s`). It's all kept in `config.json`:
+
+```json
+{
+  "endpoints": [
+    { "name": "openrouter", "type": "openrouter", "host": "openrouter.ai", "enabled": true, "api_key": "sk-or-v1-YOUR_KEY_HERE" },
+    { "name": "lmstudio", "type": "lmstudio", "host": "localhost:1234", "enabled": true, "api_key": "",
+      "tool_heal": { "enabled": true, "stop_repeats": true },
+      "context_guard": { "enabled": true } },
+    { "name": "ollama", "type": "ollama", "host": "localhost:11434", "enabled": true, "api_key": "" }
+  ],
+  "models": ["openrouter:openai/gpt-5.6-luna", "openrouter:z-ai/glm-5.3-flash"],
+  "default_model": "",
+  "port": 8090,
+  "addr": "0.0.0.0"
+}
 ```
-.
-├── proxy.py              # Main application (proxy + TUI + static server)
-├── gateway_tui.py        # Split-view TUI launcher (proxy GUI + 1MCP bridge)
-├── config.example.json   # Committed template — copy to config.json
-├── config.json           # Your settings (endpoints, models, port) — gitignored
-├── mcp.json              # MCP servers aggregated by 1MCP — gitignored
-├── gateway-stats.json    # All-time stats, counts only — written at run time, gitignored
-├── gateway.log           # The console's log lines, counts only — written at run time, gitignored
-├── kv-sessions-*.json    # KV session swap index, hashes and counts only — gitignored
-├── build-webui.cmd       # One-click web UI build script
-├── run.cmd               # Quick-start batch file
-├── webui/                # Built web UI static files
-├── webui-src/            # llama.cpp source (gitignored, see "Building the Web UI")
-├── changelogs/           # Release notes, one file per version (vX.Y.Z.md)
-├── testing/              # Automated test suite (python testing/test_proxy.py)
-├── .gitignore
-└── README.md
-```
 
-## Testing
+<details>
+<summary>Every setting</summary>
 
-The project ships an automated test suite (over 300 tests), using Python's built-in `unittest` (no third-party test runner required):
+| Field | Description |
+|-------|-------------|
+| `endpoints` | Your AI servers (name, type, host, api_key, enabled; optional `timeout` in seconds per upstream read — default 180 for cloud, 600 for local) |
+| `models` | The cloud models to list, each as `endpoint:model` |
+| `default_model` | Model used when a request names none (empty, or not available → the first available model) |
+| `force_default_model` | When `true` (the **Force** checkbox next to Default Model in Settings), every chat request (`…/completions`, `/responses`, `/messages`) uses the default model, whatever model the app asks for; other requests such as embeddings are left alone |
+| `port` | HTTP port (default 8090) |
+| `addr` | Bind address (`0.0.0.0` = all interfaces) |
+| `fetch_top_models` | When `true`, adds the top 20 intelligent models from OpenRouter to your list |
+| `access_keys` | Keys apps must send to use the gateway; empty or missing = open. See [Access keys](#access-keys) |
+| `log_file` | `false` turns off `gateway.log`. On by default |
 
-```bash
-python testing/test_proxy.py
-```
+Options per endpoint, all off unless you turn them on:
 
-The tests spin up in-process mock upstreams and an ephemeral gateway, then make real HTTP requests. They cover model lists and lookups, routing, `/cors-proxy` and the MCP session handshake, KV session swap, live stats, tool call healing and the command guard, the context limit and context guard, the thinking switch and the log file. No running gateway, online model or API key is needed, and all chat text in them is made up.
+| Endpoint option | What it does | Checkbox in Settings |
+|-----------------|--------------|----------------------|
+| `"tool_heal": {"enabled": true}` | [Turns tool calls written as text into real ones](#tool-call-healing) and checks commands before they run | **Heal tool calls**, **Check commands before they run (guard)** |
+| `"tool_heal": {…, "stop_repeats": true}` | [Stops a call the model keeps repeating](#a-call-the-model-keeps-repeating) | **Stop a call the model keeps repeating** |
+| `"context_guard": {"enabled": true}` | [Says "context full" early](#compacting-early-context_guard) and keeps what the app cuts | **Compact early** |
+| `"kv_sessions": {"enabled": true}` | [Saves and restores chats](#long-chats-on-a-local-engine-kv-session-swap) on an engine that holds one at a time | — |
 
-`testing/live_kv_check.py` checks the KV session swap against a real engine. It needs a loaded model, takes a few minutes, and uses only made-up text.
+A change made in Settings applies to the next request. No restart is needed.
 
-## Prerequisites
+**Endpoint types:**
 
-- **Python 3.8+**
-- **Node.js 20+** (only for building the web UI, not for running)
+| Type | Description | Health check |
+|------|-------------|-------------|
+| `openrouter` | OpenRouter cloud API | `GET /api/v1/models` |
+| `orcarouter` | OrcaRouter cloud API | `GET /api/v1/models` |
+| `lmstudio` | LM Studio local server | `GET /v1/models` |
+| `llama-server` | llama.cpp server | `GET /health` |
+| `ollama` | Ollama local server | `GET /api/tags` |
+| `strata` | Strata gateway (default `127.0.0.1:47831`) — vision and context follow the model loaded in Strata | `GET /v1/models` |
+| `custom` | Any OpenAI-compatible server (e.g. llamastash) | `GET /v1/models` |
 
-## How Model Aggregation Works
+</details>
 
-On startup, the proxy:
-1. Auto-discovers local endpoints (llama-server on :8080, LM Studio on :1234, Ollama on :11434)
-2. Checks health of all configured endpoints
-3. For OpenRouter: includes only your curated `models` list (not the full 340+ catalog)
-4. For local endpoints: includes all discovered models (typically 1-5 loaded models)
-5. Builds a unified model list with source-prefixed IDs
-6. Refreshes every 30 seconds via the health check loop
+## Reference
 
-## Tested Backends
+<details>
+<summary>API endpoints</summary>
 
-| Backend | Status | Notes |
-|---------|--------|-------|
-| OpenRouter | ✅ Tested | Full support — streaming, model switching, metadata |
-| OrcaRouter | ✅ Tested | OpenAI-compatible gateway — streaming, tools, vision, multi-provider routing |
-| LM Studio | ✅ Tested | Works as upstream OpenAI-compatible endpoint. Loaded context window reported, thinking switch, tool call healing (Gemma 4 calls after `</think>`), context guard |
-| Strata | ✅ Tested | Vision and context follow the loaded model. KV session swap, engine stats, tool call healing, context guard |
-| llama.cpp server | ✅ Tested | Health check via `/health`, model info via `/props` |
-| Ollama | ✅ Tested | Health check via `/api/tags`, model discovery, OpenAI-compatible chat API |
-| vLLM | ⏳ Pending | Expected to work (OpenAI-compatible API) |
-
-## LM Studio Compatible
-
-This proxy exposes LM Studio-compatible endpoints (`/api/v0/models`, `/api/v1/models`) alongside the standard OpenAI-compatible endpoints (`/v1/models`). This means:
-
-- **Cline's LM Studio provider** can auto-discover models from the gateway
-- **Any LM Studio-compatible client** can connect and get access to cloud models through OpenRouter
-- **The web chat UI** works with all models from all endpoints
-
-### API Endpoints
+With [access keys](#access-keys) on, every one of these needs a key.
 
 | Endpoint | Format | Purpose |
 |----------|--------|---------|
@@ -629,11 +529,86 @@ This proxy exposes LM Studio-compatible endpoints (`/api/v0/models`, `/api/v1/mo
 | `GET /v1/models/<id>`, `GET /api/v0/models/<id>` | OpenAI / LM Studio | One model's entry, by the gateway's id or the engine's own. Apps ask this to learn a model's context window |
 | `GET /api/tags`, `GET /api/ps`, `POST /api/show` | Ollama | Model list and one model's info (`num_ctx`, `<arch>.context_length`), for apps that ask an Ollama-style server |
 | `GET /props` | llama.cpp | Server properties: modalities, loaded context (`n_ctx`), parameters |
-| `POST /v1/chat/completions` | OpenAI standard | Chat completions (proxied to correct endpoint) |
+| `POST /v1/chat/completions` | OpenAI standard | Chat completions (sent to the right endpoint) |
 | `GET /health` | JSON | Endpoint statuses |
 | `GET /stats` | JSON | [Live stats](#live-stats): the gateway's counts, engine numbers and saved chats |
-| `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the web UI's MCP servers, served to the gateway's own page only |
+| `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the chat page's MCP servers, served to the gateway's own page only |
+
+</details>
+
+<details>
+<summary>Tested backends</summary>
+
+| Backend | Status | Notes |
+|---------|--------|-------|
+| OpenRouter | ✅ Tested | Streaming, model switching, metadata |
+| OrcaRouter | ✅ Tested | Streaming, tools, vision, multi-provider routing |
+| LM Studio | ✅ Tested | Loaded context window reported, thinking switch, tool call healing (Gemma 4 calls after `</think>`), context guard |
+| Strata | ✅ Tested | Vision and context follow the loaded model. KV session swap, engine stats, tool call healing, context guard |
+| llama.cpp server | ✅ Tested | Health check via `/health`, model info via `/props` |
+| Ollama | ✅ Tested | Health check via `/api/tags`, model discovery, OpenAI-compatible chat API |
+| vLLM | ⏳ Pending | Expected to work (OpenAI-compatible API) |
+
+</details>
+
+<details>
+<summary>Project structure</summary>
+
+```
+.
+├── proxy.py              # Main application (proxy + console + static server)
+├── gateway_tui.py        # Split-view console (proxy + 1MCP bridge)
+├── config.example.json   # Committed template — copy to config.json
+├── config.json           # Your settings (endpoints, models, port) — gitignored
+├── mcp.json              # MCP servers aggregated by 1MCP — gitignored
+├── gateway-stats.json    # All-time stats, counts only — written at run time, gitignored
+├── gateway.log           # The console's log lines, counts only — written at run time, gitignored
+├── kv-sessions-*.json    # KV session swap index, hashes and counts only — gitignored
+├── build-webui.cmd       # One-click web UI build script
+├── run.cmd               # Quick-start batch file
+├── webui/                # Built web UI static files
+├── webui-src/            # llama.cpp source (gitignored, see "Building the web UI")
+├── changelogs/           # Release notes, one file per version (vX.Y.Z.md)
+├── screenshots/          # The pictures in this README
+├── testing/              # Automated test suite (python testing/test_proxy.py)
+├── .gitignore
+└── README.md
+```
+
+</details>
+
+<details>
+<summary>Building the web UI</summary>
+
+The bundled `webui/` is already built, so this is only needed to update it. After building, Python serves the static files directly, with no Node.js at run time. Building needs **Node.js 20+**.
+
+```bash
+# First time: clone the llama.cpp source (the build script expects it here)
+git clone https://github.com/ggml-org/llama.cpp.git webui-src
+
+# Option A: build from the cloned source
+build-webui.cmd
+
+# Option B: copy <llama.cpp>/build/tools/ui/dist/ from a local llama.cpp build into webui/
+```
+
+</details>
+
+<details>
+<summary>Tests</summary>
+
+Over 300 tests, using Python's built-in `unittest`:
+
+```bash
+python testing/test_proxy.py
+```
+
+They start mock upstreams and a gateway in the same process and make real HTTP requests. They cover model lists and lookups, routing, `/cors-proxy` and the MCP session handshake, KV session swap, live stats, tool call healing, the command guard and the repeat stop, the context limit and context guard, the thinking switch and the log file. No running gateway, online model or API key is needed, and all chat text in them is made up.
+
+`testing/live_kv_check.py` checks the KV session swap against a real engine. It needs a loaded model, takes a few minutes, and uses only made-up text.
+
+</details>
 
 ## License
 
-This project wraps OpenRouter's API. The web UI is from the [llama.cpp](https://github.com/ggml-org/llama.cpp) project (MIT License).
+The gateway works with OpenRouter's and other servers' APIs. The web chat page is from the [llama.cpp](https://github.com/ggml-org/llama.cpp) project (MIT License).

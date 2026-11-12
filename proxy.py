@@ -527,6 +527,94 @@ def _cors_proxy_caller_allowed(headers) -> bool:
     return True
 
 
+# ── Gateway access keys ──────────────────────────────────────────────────
+# Off unless config.json has "access_keys". Then every API request needs one
+# of them, sent the way OpenAI and Anthropic clients send theirs. The web
+# page's own files stay open so it can load and ask for the key (llama-ui
+# does this on a 401 from /props). A key is never passed to an upstream, and
+# never written to the log or the stats: only its name is.
+
+_ACCESS_KEY_MIN = 16
+_ACCESS_KEY_HEADERS = ("x-api-key", "api-key")
+_access_refusals_logged = {}          # client address → last time a refusal was logged
+
+
+def _access_keys() -> list:
+    """[(name, key)] from the config. Strings and {"name", "key"} both work;
+    a key shorter than _ACCESS_KEY_MIN is ignored, so a typo can't open the gateway
+    to one-letter guesses."""
+    out = []
+    raw = get_config("access_keys")
+    if not isinstance(raw, list):
+        return out
+    for i, item in enumerate(raw):
+        if isinstance(item, str):
+            name, key = f"key {i + 1}", item
+        elif isinstance(item, dict):
+            name, key = str(item.get("name") or f"key {i + 1}"), item.get("key")
+        else:
+            continue
+        if isinstance(key, str) and len(key.strip()) >= _ACCESS_KEY_MIN:
+            out.append((name, key.strip()))
+    return out
+
+
+def _presented_key(headers) -> str:
+    """The key a client sent: Authorization: Bearer, x-api-key or api-key."""
+    auth = (headers.get("Authorization") or "").strip()
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    for h in _ACCESS_KEY_HEADERS:
+        val = (headers.get(h) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def access_check(headers):
+    """(allowed, key name). Keys off → (True, None). Every configured key is
+    compared in constant time, so the answer's timing doesn't leak a prefix."""
+    keys = _access_keys()
+    if not keys:
+        return True, None
+    sent = _presented_key(headers).encode()
+    found = None
+    for name, key in keys:
+        if secrets.compare_digest(sent, key.encode()) and found is None:
+            found = name
+    return found is not None, found
+
+
+def _access_keys_result(typed: str, existing):
+    """The access_keys value to save from the Settings field, and how many typed
+    keys were too short. Names already in the config are kept for their keys;
+    an empty field leaves a config that never had keys untouched."""
+    names = {}
+    if isinstance(existing, list):
+        for item in existing:
+            if isinstance(item, dict) and isinstance(item.get("key"), str) and item.get("name"):
+                names[item["key"].strip()] = str(item["name"])
+    keys, short = [], 0
+    for part in (typed or "").replace("\n", ",").split(","):
+        key = part.strip()
+        if not key:
+            continue
+        if len(key) < _ACCESS_KEY_MIN:
+            short += 1
+            continue
+        if key in [k if isinstance(k, str) else k["key"] for k in keys]:
+            continue
+        keys.append({"name": names[key], "key": key} if key in names else key)
+    if not keys and existing is None:
+        return None, short
+    return keys, short
+
+
+def new_access_key() -> str:
+    """A fresh key: 'gw-' and 32 random URL-safe characters."""
+    return "gw-" + secrets.token_urlsafe(24)
+
+
 def _dial_host(host: str) -> str:
     """Address to connect to for `host`: localhost → 127.0.0.1.
 
@@ -4594,6 +4682,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path == "/" or path == "/index.html":
             self._serve_file("index.html")
             return
+        if self._access_denied(path):
+            return
 
         # API endpoints handled locally
         _note_lookup(self.address_string(), "GET", path)
@@ -4651,6 +4741,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if self._access_denied():
+            return
 
         if path == "/v1/streams/lookup":
             self._handle_streams_lookup()
@@ -4669,10 +4761,55 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def do_PUT(self):
-        self._proxy()
+        if not self._access_denied():
+            self._proxy()
 
     def do_DELETE(self):
-        self._proxy()
+        if not self._access_denied():
+            self._proxy()
+
+    def _access_denied(self, path=None) -> bool:
+        """Answer 401 when access keys are on and the request has none of them.
+        True when the request was answered here. With `path`, a file of the web
+        page is still served, so the page can load and ask for the key."""
+        try:
+            ok, _name = access_check(self.headers)
+        except Exception:
+            ok = False                                   # a broken check never opens the gateway
+        if ok:
+            return False
+        if path is not None and self._serve_file(path.lstrip("/")):
+            return True
+        client = self.address_string()
+        now = time.time()
+        if now - _access_refusals_logged.get(client, 0) >= 60:
+            if len(_access_refusals_logged) > 1000:
+                _access_refusals_logged.clear()
+            _access_refusals_logged[client] = now
+            why = "a wrong access key" if _presented_key(self.headers) else "no access key"
+            _queue_log_line(f"[{client}] refused {self.command} {urlparse(self.path).path}: {why} "
+                            "(further refusals from this address are not logged for a minute)")
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if 0 < length <= _REFUSED_BODY_READ:
+                self.rfile.read(length)
+        except (ValueError, OSError):
+            pass
+        body = json.dumps({"error": {"message": "This gateway needs an API key. Send it as "
+                                                "'Authorization: Bearer <key>' or 'x-api-key'.",
+                                     "type": "invalid_request_error", "code": "invalid_api_key"}}).encode()
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("WWW-Authenticate", 'Bearer realm="AI Gateway"')
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+        return True
 
     # ── Static file serving ────────────────────────────────────────────────
     def _serve_file(self, rel_path: str) -> bool:
@@ -5110,10 +5247,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     upstream_headers[name] = value
                     lower_seen.add(name.lower())
         # Second pass: plain headers (session token, auth, etc.), but never
-        # override a header the prefixed headers already provided.
+        # override a header the prefixed headers already provided. With access
+        # keys on, a plain key header is the gateway's own (llama-ui adds it),
+        # so it stays here; the MCP server's auth comes prefixed.
+        keys_on = bool(_access_keys())
         for header, value in self.headers.items():
             h = header.lower()
             if h in hop_by_hop or not value:
+                continue
+            if keys_on and h in ("authorization",) + _ACCESS_KEY_HEADERS:
                 continue
             if h.startswith(prefix):
                 continue
@@ -5332,8 +5474,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
         if api_key:
             fwd_headers["Authorization"] = f"Bearer {api_key}"
-        else:
-            # Still forward any client-provided auth
+        elif not _access_keys():
+            # Still forward any client-provided auth. With access keys on,
+            # the client's key is the gateway's, and never goes upstream.
             auth = self.headers.get("Authorization")
             if auth:
                 fwd_headers["Authorization"] = auth
@@ -5686,7 +5829,7 @@ class EndpointEditScreen(ModalScreen):
                                   "(stop_repeats and repeat_limit in config.json).")
             yield repeat_box
             ctx = (self.endpoint or {}).get("context_guard")
-            ctx_box = Checkbox("Compact early: say 'full' at 90% and keep what the app cuts",
+            ctx_box = Checkbox("Compact early (say 'full' at 90%)",
                                value=bool(isinstance(ctx, dict) and ctx.get("enabled")), id="ep-ctx-checkbox")
             ctx_box.tooltip = ("For apps that only compact after the context overflows. The gateway answers 'context full' "
                                "while the whole chat still fits, then gives the app's next request what it cut "
@@ -5847,6 +5990,17 @@ class SettingsScreen(Screen):
                         placeholder="Bind address (e.g. 0.0.0.0)",
                         id="addr-input",
                     )
+
+            # ── Access keys ────────────────────────────────────────────
+            yield Static("Access Keys", classes="section-title")
+            yield Label("Keys apps must send to use the gateway, separated by commas. Empty = open to everyone on the network.")
+            with Horizontal(id="access-keys-row"):
+                yield Input(
+                    value=", ".join(k for _, k in _access_keys()),
+                    placeholder="Empty: no key needed",
+                    id="access-keys-input",
+                )
+                yield Button("+ New key", id="access-key-new-btn", variant="primary", compact=True)
         yield Footer(show_command_palette=False)
 
     def on_mount(self) -> None:
@@ -5860,6 +6014,11 @@ class SettingsScreen(Screen):
             self._edit_endpoint()
         elif event.button.id == "ep-remove-btn":
             self._remove_endpoint()
+        elif event.button.id == "access-key-new-btn":
+            box = self.query_one("#access-keys-input", Input)
+            current = box.value.strip().rstrip(",").strip()
+            box.value = f"{current}, {new_access_key()}" if current else new_access_key()
+            self.notify("New key added. Press Ctrl+S to save it, then give it to your apps.")
 
     def _selected_endpoint(self) -> dict:
         """Return the endpoint dict for the currently selected table row."""
@@ -6029,6 +6188,18 @@ class SettingsScreen(Screen):
         if addr and addr != get_config("addr"):
             set_config("addr", addr)
             changed = True
+
+        # Access keys
+        typed = self.query_one("#access-keys-input", Input).value
+        result, short = _access_keys_result(typed, get_config("access_keys"))
+        if short:
+            self.notify(f"{short} key(s) shorter than {_ACCESS_KEY_MIN} characters ignored. "
+                        "Press '+ New key' for a strong one.", severity="error")
+        if result != get_config("access_keys"):
+            set_config("access_keys", result)
+            n = len(result or [])
+            _queue_log_line(f"Access keys: {n} key(s), apps must send one" if n
+                            else "Access keys off: the gateway is open to everyone on the network")
 
         save_config()
         if log is not None:
@@ -6680,11 +6851,14 @@ class MainScreen(Screen):
         url = f"http://{display_host}:{port}"
         model = get_current_model()
         forced = "  (forced for all chat requests)" if get_config("force_default_model") else ""
-        info.update(
+        n_keys = len(_access_keys())
+        access = f"API key needed ({n_keys} key{'s' if n_keys != 1 else ''})" if n_keys else "open, no key needed"
+        info.update(RichText(
             f"Listening : {url}\n"
             f"Web UI    : {url}/\n"
-            f"Default   : {model}{forced}"
-        )
+            f"Default   : {model}{forced}\n"
+            f"Access    : {access}"
+        ))
 
     def _update_live_stats(self):
         try:
@@ -6866,6 +7040,10 @@ class ProxyTUI(App):
     }
     #settings-screen #default-model-row Select {
         width: 1fr;
+    }
+    #settings-screen #access-keys-input {
+        width: 1fr;
+        margin-right: 1;
     }
     #settings-screen #force-model-checkbox {
         width: auto;

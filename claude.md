@@ -25,6 +25,7 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 ├── webui/                # Built web UI static files (llama.cpp llama-ui)
 ├── webui-src/            # llama.cpp source (gitignored, for rebuilding the UI)
 ├── changelogs/           # Per-version release notes (vX.Y.Z.md)
+├── screenshots/          # README pictures, from a demo with made-up traffic only
 ├── testing/              # Automated test suite (python testing/test_proxy.py)
 ├── claude.md             # This file — project spec & workflow
 ├── .gitignore
@@ -66,7 +67,19 @@ All are off unless set, and `_new_healer()` / `_ctx_guard_config()` read the con
 | `"tool_heal": {"enabled": true, "guard": true, "stop_repeats": false, "repeat_limit": 3}` | Tool Call Healing | **Heal tool calls**, **Check commands before they run (guard)**, **Stop a call the model keeps repeating** |
 | `"context_guard": {"enabled": true, "at": 0.9, "summary_tokens": 2000}` | Context Limit | **Compact early** |
 
-Top level: `"log_file": false` turns off `gateway.log`.
+Top level: `"log_file": false` turns off `gateway.log`. `"access_keys"` locks the gateway (see Access Keys).
+
+## Access Keys
+
+`"access_keys": ["gw-…", {"name": "laptop", "key": "gw-…"}]` (Settings → **Access Keys**, **+ New key** → `new_access_key()`). `access_check()` runs at the top of `do_GET` / `do_POST` / `do_PUT` / `do_DELETE` through `ProxyHandler._access_denied()`.
+
+Rules that must hold:
+
+1. **Off is unchanged.** No `access_keys`, an empty list, or only keys shorter than `_ACCESS_KEY_MIN` (16): every request goes through as before.
+2. **Everything but the web page's files needs a key**, `/health`, `/stats` and `/cors-proxy` included. `/`, `index.html` and files under `webui/` load without one, because llama-ui asks for the key when `/props` answers 401 and then sends it as `Authorization: Bearer` (also to `/cors-proxy`, for MCP servers with the proxy toggle on).
+3. **The key never goes upstream.** With keys on, `_proxy()` doesn't forward the client's `Authorization`, and `/cors-proxy` drops plain `Authorization` / `x-api-key` / `api-key` (the MCP server's own come prefixed).
+4. **Constant-time comparison** (`secrets.compare_digest`) against every key, and a failure inside the check refuses rather than opens.
+5. **No key in the log.** A refusal is logged once a minute per address with the reason only.
 
 ## Key Invariants — DO NOT REGRESS
 

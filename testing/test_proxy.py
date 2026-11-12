@@ -4417,5 +4417,198 @@ class ThinkingSwitchTests(unittest.TestCase):
         self.assertIsNone(proxy._stats.snapshot()["recent"][0]["think"])
 
 
+# ── Gateway access keys ───────────────────────────────────────────────────
+
+class MockHeaders(BaseHTTPRequestHandler):
+    """Answers like an OpenAI server and records the headers of each request."""
+
+    protocol_version = "HTTP/1.1"
+    seen = []
+
+    def _answer(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length:
+            self.rfile.read(length)
+        MockHeaders.seen.append({k.lower(): v for k, v in self.headers.items()})
+        data = json.dumps({"object": "list", "data": [{"id": "m", "object": "model"}],
+                           "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                           "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = _answer
+
+    def log_message(self, *args):
+        pass
+
+
+class AccessKeyTests(unittest.TestCase):
+    """Keys apps must send to use the gateway (access_keys in config.json)."""
+
+    KEY = "gw-test-key-0123456789abcdef"
+    OTHER = "gw-second-key-zyxwvutsrqpon"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockHeaders)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        proxy._access_refusals_logged.clear()
+        MockHeaders.seen = []
+        proxy.set_config("force_default_model", False)
+        proxy.set_config("endpoints", [{"name": "up", "type": "custom", "host": f"localhost:{self.up_port}",
+                                        "enabled": True, "api_key": ""}])
+        proxy.set_endpoint_status("up", "online")
+        proxy.set_config("access_keys", [self.KEY, {"name": "laptop", "key": self.OTHER}])
+
+    def tearDown(self):
+        proxy._stats.wait_idle()
+        time.sleep(0.1)          # the log file and stats are written just after the reply
+        proxy.set_endpoint_status("up", "disabled")
+        proxy.CONFIG_FILE, proxy._config, proxy._stats = self._saved
+        self._tmp.cleanup()
+
+    def _get(self, path, headers=None):
+        return request(self.gw_port, "GET", path, headers=headers)
+
+    def _chat(self, headers=None):
+        status, _, body = request(self.gw_port, "POST", "/v1/chat/completions",
+                                  body=json.dumps({"model": "up:m", "messages": [{"role": "user", "content": "hi"}]}),
+                                  headers={"Content-Type": "application/json", **(headers or {})})
+        proxy._stats.wait_idle()
+        return status, body
+
+    def test_off_by_default_the_gateway_stays_open(self):
+        proxy._config.pop("access_keys", None)
+        self.assertEqual(self._get("/v1/models")[0], 200)
+        self.assertEqual(self._chat()[0], 200)
+
+    def test_without_a_key_api_requests_are_refused(self):
+        for path in ("/v1/models", "/api/v0/models", "/api/tags", "/props", "/health", "/stats", "/v1/models/up:m"):
+            status, headers, body = self._get(path)
+            self.assertEqual(status, 401, path)
+            self.assertEqual(json.loads(body)["error"]["code"], "invalid_api_key")
+            self.assertIn("bearer", headers.get("www-authenticate", "").lower())
+        status, body = self._chat()
+        self.assertEqual(status, 401)
+        self.assertEqual(MockHeaders.seen, [])            # nothing reached the engine
+        self.assertEqual(request(self.gw_port, "POST", "/api/show", body="{}")[0], 401)
+        self.assertEqual(request(self.gw_port, "DELETE", "/v1/files/x")[0], 401)
+
+    def test_a_wrong_key_is_refused(self):
+        self.assertEqual(self._get("/v1/models", {"Authorization": "Bearer gw-wrong-key-000000000000"})[0], 401)
+        self.assertEqual(self._get("/v1/models", {"Authorization": "Bearer " + self.KEY[:-1]})[0], 401)
+        self.assertEqual(self._get("/v1/models", {"Authorization": self.KEY})[0], 401)   # no "Bearer"
+
+    def test_any_configured_key_works_in_the_usual_headers(self):
+        for headers in ({"Authorization": f"Bearer {self.KEY}"}, {"Authorization": f"bearer {self.OTHER}"},
+                        {"x-api-key": self.KEY}, {"api-key": self.OTHER}):
+            self.assertEqual(self._get("/v1/models", headers)[0], 200, headers)
+        self.assertEqual(self._chat({"Authorization": f"Bearer {self.KEY}"})[0], 200)
+
+    def test_the_key_never_reaches_the_engine(self):
+        self.assertEqual(self._chat({"Authorization": f"Bearer {self.KEY}"})[0], 200)
+        self.assertEqual(self._chat({"x-api-key": self.OTHER})[0], 200)
+        for seen in MockHeaders.seen:
+            self.assertNotIn(self.KEY, json.dumps(seen))
+            self.assertNotIn(self.OTHER, json.dumps(seen))
+
+    def test_the_endpoints_own_key_is_still_sent(self):
+        eps = proxy.get_config("endpoints")
+        eps[0]["api_key"] = "sk-upstream"
+        self.assertEqual(self._chat({"Authorization": f"Bearer {self.KEY}"})[0], 200)
+        self.assertEqual(MockHeaders.seen[-1]["authorization"], "Bearer sk-upstream")
+
+    def test_the_web_page_loads_without_a_key(self):
+        self.assertEqual(self._get("/")[0], 200)
+        names = [n for n in os.listdir(proxy.WEBUI_DIR) if os.path.isfile(os.path.join(proxy.WEBUI_DIR, n))
+                 and n != "index.html"]
+        if names:
+            self.assertEqual(self._get("/" + names[0])[0], 200)
+
+    def test_cors_proxy_needs_the_key_and_does_not_pass_it_on(self):
+        target = urllib.parse.quote(f"http://127.0.0.1:{self.up_port}/mcp", safe="")
+        self.assertEqual(self._get(f"/cors-proxy?url={target}")[0], 401)
+        status, _, _ = self._get(f"/cors-proxy?url={target}", {
+            "Authorization": f"Bearer {self.KEY}",
+            "x-llama-server-proxy-header-authorization": "Bearer mcp-token"})
+        self.assertEqual(status, 200)
+        self.assertEqual(MockHeaders.seen[-1].get("authorization"), "Bearer mcp-token")
+        self.assertNotIn(self.KEY, json.dumps(MockHeaders.seen[-1]))
+
+    def test_short_keys_never_close_or_open_by_accident(self):
+        proxy.set_config("access_keys", ["abc", ""])
+        self.assertEqual(proxy._access_keys(), [])
+        self.assertEqual(self._get("/v1/models")[0], 200)      # only short keys: open, as if none were set
+        proxy.set_config("access_keys", "not-a-list-0123456789")
+        self.assertEqual(self._get("/v1/models")[0], 200)
+
+    def test_a_refusal_is_logged_without_the_key(self):
+        while not proxy._log_queue.empty():
+            proxy._log_queue.get_nowait()
+        self._get("/v1/models", {"Authorization": "Bearer gw-guess-0000000000000000"})
+        self._get("/v1/models", {"Authorization": "Bearer gw-guess-0000000000000001"})
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(str(proxy._log_queue.get_nowait()))
+        refused = [ln for ln in lines if "refused" in ln]
+        self.assertEqual(len(refused), 1)                          # once a minute per address
+        self.assertIn("a wrong access key", refused[0])
+        self.assertNotIn("gw-guess", "\n".join(lines))
+
+    def test_settings_field_keeps_names_and_drops_short_keys(self):
+        existing = [{"name": "laptop", "key": self.OTHER}, self.KEY]
+        result, short = proxy._access_keys_result(f"{self.OTHER}, {self.KEY}, abc, {self.KEY}", existing)
+        self.assertEqual(result, [{"name": "laptop", "key": self.OTHER}, self.KEY])
+        self.assertEqual(short, 1)
+        self.assertEqual(proxy._access_keys_result("", None), (None, 0))   # never had keys: untouched
+        self.assertEqual(proxy._access_keys_result("", existing), ([], 0))  # emptied: open again
+        key = proxy.new_access_key()
+        self.assertTrue(key.startswith("gw-") and len(key) >= proxy._ACCESS_KEY_MIN)
+        self.assertNotEqual(key, proxy.new_access_key())
+
+    def test_settings_screen_makes_and_saves_a_key(self):
+        import asyncio
+        from textual.widgets import Input
+
+        proxy._config.pop("access_keys", None)
+        proxy.set_models(["up:m"])
+        seen = {}
+
+        async def run():
+            app = proxy.ProxyTUI()
+            async with app.run_test(size=(120, 50)) as pilot:
+                screen = proxy.SettingsScreen()
+                await app.push_screen(screen)
+                await pilot.pause()
+                screen.query_one("#access-key-new-btn").press()
+                await pilot.pause()
+                seen["typed"] = screen.query_one("#access-keys-input", Input).value
+                screen.action_save_settings()
+                await pilot.pause()
+
+        asyncio.run(run())
+        self.assertTrue(seen["typed"].startswith("gw-"))
+        self.assertEqual(proxy.get_config("access_keys"), [seen["typed"]])
+        with open(proxy.CONFIG_FILE, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["access_keys"], [seen["typed"]])
+        self.assertEqual(self._get("/v1/models")[0], 401)
+        self.assertEqual(self._get("/v1/models", {"Authorization": f"Bearer {seen['typed']}"})[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

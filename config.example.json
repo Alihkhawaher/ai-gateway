@@ -71,5 +71,6 @@
   "force_default_model": false,
   "port": 8090,
   "addr": "0.0.0.0",
-  "fetch_top_models": false
+  "fetch_top_models": false,
+  "access_keys": []
 }
