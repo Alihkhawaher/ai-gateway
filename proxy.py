@@ -4200,6 +4200,44 @@ def _context_overflow(raw: bytes, status: int, path: str = ""):
     return json.dumps(body, ensure_ascii=False).encode("utf-8"), info
 
 
+def _find_model_entry(entries: list, wanted: str):
+    """The entry a client means by a model name: the gateway's id (endpoint:model), or the engine's own id
+    when only one endpoint offers it. None when nothing matches, or the bare name is offered by several."""
+    wanted = (wanted or "").strip()
+    for entry in entries:
+        if entry.get("id") == wanted:
+            return entry
+    bare = [e for e in entries if parse_model_id(str(e.get("id") or ""))[1] == wanted]
+    return bare[0] if len(bare) == 1 else None
+
+
+_LOOKUP_PATHS = ("/v1/models", "/models", "/api/v0/models", "/api/v1/models", "/props", "/api/tags", "/api/ps", "/api/show")
+_LOOKUP_LOG_EVERY_S = 600
+_lookup_seen = {}
+_lookup_lock = threading.Lock()
+
+
+def _note_lookup(client: str, method: str, path: str):
+    """Log which model lookups an app makes: that is how to tell where it gets a model's context window
+    from (or that it never asks). One line per client and kind of lookup every ten minutes; the model
+    name in a per-model lookup is left out of the key so a poll can't flood the log."""
+    try:
+        base = next((p for p in sorted(_LOOKUP_PATHS, key=len, reverse=True) if path == p or path.startswith(p + "/")), None)
+        if base is None:
+            return
+        kind = f"{method} {base}" + ("/<model>" if path != base else "")
+        now = time.time()
+        with _lookup_lock:
+            if now - _lookup_seen.get((client, kind), 0) < _LOOKUP_LOG_EVERY_S:
+                return
+            _lookup_seen[(client, kind)] = now
+            for key in [k for k, t in _lookup_seen.items() if now - t > 6 * _LOOKUP_LOG_EVERY_S]:
+                del _lookup_seen[key]
+        _queue_log_line(f"[{client}] model lookup: {kind}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _context_window(ep_name: str, model: str):
     """How many tokens the model at this endpoint can hold as loaded now, or None when unknown."""
     try:
@@ -4468,11 +4506,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         # API endpoints handled locally
+        _note_lookup(self.address_string(), "GET", path)
         if path == "/v1/models" or path == "/models":
             self._handle_models()
             return
         if path == "/api/v0/models" or path == "/api/v1/models":
             self._handle_lmstudio_models()
+            return
+        for prefix, handler in (("/v1/models/", self._handle_models), ("/models/", self._handle_models),
+                                ("/api/v0/models/", self._handle_lmstudio_models),
+                                ("/api/v1/models/", self._handle_lmstudio_models)):
+            if path.startswith(prefix) and len(path) > len(prefix):
+                handler(only=path[len(prefix):])
+                return
+        if path == "/api/tags":
+            self._handle_ollama_tags()
+            return
+        if path == "/api/ps":
+            self._handle_ollama_tags(loaded_only=True)
             return
         if path == "/props":
             query_params = {k: v[0] for k, v in parse_qs(parsed.query).items()} if parsed.query else {}
@@ -4513,6 +4564,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/streams/lookup":
             self._handle_streams_lookup()
+            return
+        if path == "/api/show":
+            _note_lookup(self.address_string(), "POST", path)
+            self._handle_ollama_show()
             return
         if path in ("/models/load", "/models/unload"):
             self._handle_model_load()
@@ -4574,8 +4629,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return True
 
     # ── API: /v1/models ────────────────────────────────────────────────────
-    def _handle_models(self):
-        """Return aggregated model list from all online endpoints."""
+    def _handle_models(self, only=None):
+        """Return aggregated model list from all online endpoints (or, with `only`, that one model)."""
         entries = []
         for m in get_models():
             meta = get_model_meta(m)
@@ -4657,10 +4712,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 },
             }
             entries.append(entry)
+        if only is not None:
+            return self._send_one_model(entries, only)
         self._send_json({"object": "list", "data": entries})
 
+    def _send_one_model(self, entries, wanted):
+        """GET <list>/<model id>: that model's entry, as apps ask for it before a chat to learn its context
+        window. Without this the lookup was forwarded to an engine and came back as an error, and the app
+        fell back to its own default (128,000 in Cline and Goose)."""
+        match = _find_model_entry(entries, wanted)
+        if match is None:
+            self._send_json({"error": {"message": f"The model '{wanted}' does not exist", "type": "invalid_request_error",
+                                       "param": "model", "code": "model_not_found"}}, 404)
+        else:
+            self._send_json(match)
+
     # ── API: /api/v0/models (LM Studio compatible) ────────────────────────
-    def _handle_lmstudio_models(self):
+    def _handle_lmstudio_models(self, only=None):
         """Return aggregated model list in LM Studio /api/v0/models format.
 
         Cline's LM Studio provider calls GET {baseUrl}/api/v0/models and
@@ -4710,7 +4778,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if capabilities:
                 entry["capabilities"] = capabilities
             entries.append(entry)
+        if only is not None:
+            return self._send_one_model(entries, only)
         self._send_json({"object": "list", "data": entries})
+
+    # ── Ollama-style model info, for apps that ask an Ollama server what a model can hold ──
+    def _ollama_models(self):
+        out = []
+        for m in get_models():
+            meta = get_model_meta(m)
+            window = meta.get("loaded_context_length") or meta.get("context_length") or 128000
+            out.append({"name": m, "model": m, "window": int(window), "arch": str(meta.get("arch") or "llm"),
+                        "quantization": str(meta.get("quantization") or ""),
+                        "tools": "tool_use" in (meta.get("capabilities") or [])
+                                 or "tools" in ((meta.get("supported_parameters") or []))})
+        return out
+
+    def _handle_ollama_tags(self, loaded_only=False):
+        models = [{"name": m["name"], "model": m["model"], "size": 0, "digest": "",
+                   "details": {"format": "gguf", "family": m["arch"], "quantization_level": m["quantization"]},
+                   **({"context_length": m["window"]} if loaded_only else {})} for m in self._ollama_models()]
+        self._send_json({"models": models})
+
+    def _handle_ollama_show(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            asked = json.loads(self.rfile.read(length) or b"{}") if length <= _MAX_BODY_SIZE else {}
+        except ValueError:
+            asked = {}
+        wanted = str((asked.get("model") or asked.get("name") or "") if isinstance(asked, dict) else "")
+        match = _find_model_entry([{"id": m["name"], **m} for m in self._ollama_models()], wanted)
+        if match is None:
+            self._send_json({"error": f"model '{wanted}' not found"}, 404)
+            return
+        arch = match["arch"]
+        self._send_json({
+            "details": {"format": "gguf", "family": arch, "quantization_level": match["quantization"]},
+            "model_info": {"general.architecture": arch, f"{arch}.context_length": match["window"]},
+            "parameters": f"num_ctx {match['window']}",
+            "capabilities": ["completion"] + (["tools"] if match["tools"] else []),
+        })
 
     # ── API: /props ────────────────────────────────────────────────────────
     def _handle_props(self, model_id=None):

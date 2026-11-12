@@ -3616,6 +3616,98 @@ class ContextLimitTests(unittest.TestCase):
         self.assertIsNone(proxy._stats.snapshot()["recent"][0]["window"])
 
 
+class ModelLookupTests(unittest.TestCase):
+    """Apps ask about one model by name to learn its context window. An unanswered lookup makes them
+    fall back to a default of their own (128,000 in Cline and Goose)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy.get_models(), dict(proxy._model_meta))
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy.set_config("endpoints", [{"name": "st", "type": "strata", "host": "localhost:1", "enabled": True, "api_key": ""},
+                                       {"name": "lm", "type": "lmstudio", "host": "localhost:1", "enabled": True, "api_key": ""}])
+        proxy.set_models(["st:swift-iq3", "lm:orion@q4", "lm:shared", "st:shared"])
+        with proxy._model_meta_lock:
+            proxy._model_meta.clear()
+            proxy._model_meta.update({"st:swift-iq3": {"context_length": 262144},
+                                      "lm:orion@q4": {"context_length": 262144, "loaded_context_length": 32000, "arch": "gemma4",
+                                                      "quantization": "Q4_K_M", "capabilities": ["tool_use"]},
+                                      "lm:shared": {"context_length": 8192}, "st:shared": {"context_length": 4096}})
+        proxy._lookup_seen.clear()
+        while not proxy._log_queue.empty():
+            proxy._log_queue.get_nowait()
+
+    def tearDown(self):
+        proxy.CONFIG_FILE, proxy._config, models, meta = self._saved
+        proxy.set_models(models)
+        with proxy._model_meta_lock:
+            proxy._model_meta.clear()
+            proxy._model_meta.update(meta)
+        self._tmp.cleanup()
+
+    def _get(self, path):
+        status, _h, body = request(self.gw_port, "GET", path)
+        return status, json.loads(body)
+
+    def test_one_model_in_the_openai_form(self):
+        for path in ("/v1/models/st:swift-iq3", "/v1/models/st%3Aswift-iq3", "/models/st:swift-iq3", "/v1/models/swift-iq3"):
+            status, entry = self._get(path)
+            self.assertEqual((status, entry["id"], entry["context_length"], entry["context_window"]),
+                             (200, "st:swift-iq3", 262144, 262144), path)
+        status, entry = self._get("/v1/models/lm:orion@q4")
+        self.assertEqual((entry["context_length"], entry["max_context_length"]), (32000, 262144))   # as loaded
+
+    def test_one_model_in_the_lm_studio_form(self):
+        for path in ("/api/v0/models/lm:orion@q4", "/api/v1/models/orion@q4"):
+            status, entry = self._get(path)
+            self.assertEqual((status, entry["id"], entry["loaded_context_length"], entry["max_context_length"]),
+                             (200, "lm:orion@q4", 32000, 262144), path)
+
+    def test_an_unknown_or_ambiguous_name_is_a_clear_404(self):
+        for path in ("/v1/models/nope", "/api/v0/models/nope", "/v1/models/shared"):    # "shared" is on two endpoints
+            status, body = self._get(path)
+            self.assertEqual((status, body["error"]["code"]), (404, "model_not_found"), path)
+        self.assertEqual(self._get("/v1/models/lm:shared")[1]["context_length"], 8192)   # the full id still works
+
+    def test_the_lists_are_unchanged(self):
+        status, body = self._get("/v1/models")
+        self.assertEqual((status, len(body["data"])), (200, 4))
+        self.assertEqual(len(self._get("/api/v0/models")[1]["data"]), 4)
+
+    def test_ollama_style_lookups(self):
+        status, tags = self._get("/api/tags")
+        self.assertEqual((status, [m["name"] for m in tags["models"]]), (200, ["st:swift-iq3", "lm:orion@q4", "lm:shared", "st:shared"]))
+        self.assertEqual(self._get("/api/ps")[1]["models"][1]["context_length"], 32000)
+        for name in ("lm:orion@q4", "orion@q4"):
+            status, _h, body = request(self.gw_port, "POST", "/api/show", body=json.dumps({"model": name}),
+                                       headers={"Content-Type": "application/json"})
+            show = json.loads(body)
+            self.assertEqual((status, show["model_info"]["gemma4.context_length"], show["parameters"]), (200, 32000, "num_ctx 32000"))
+            self.assertIn("tools", show["capabilities"])
+        status, _h, body = request(self.gw_port, "POST", "/api/show", body=json.dumps({"name": "nope"}),
+                                   headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 404)
+
+    def test_lookups_are_logged_once_per_kind(self):
+        for path in ("/v1/models", "/v1/models", "/v1/models/st:swift-iq3", "/v1/models/lm:shared", "/api/v0/models/orion@q4", "/props"):
+            request(self.gw_port, "GET", path)
+        lines = []
+        while not proxy._log_queue.empty():
+            lines.append(proxy._log_queue.get_nowait())
+        looked = [line.split("model lookup: ")[1] for line in lines if "model lookup: " in line]
+        self.assertEqual(looked, ["GET /v1/models", "GET /v1/models/<model>", "GET /api/v0/models/<model>", "GET /props"])
+        self.assertFalse(any("swift" in line or "orion" in line for line in lines if "model lookup" in line))
+
+
 class ContextGuardTests(unittest.TestCase):
     """An app that only compacts after an overflow: the gateway says "full" while the chat still fits,
     then gives the app's next request what it cut."""
