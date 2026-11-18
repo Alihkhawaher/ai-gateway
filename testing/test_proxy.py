@@ -4610,5 +4610,171 @@ class AccessKeyTests(unittest.TestCase):
         self.assertEqual(self._get("/v1/models", {"Authorization": f"Bearer {seen['typed']}"})[0], 200)
 
 
+class MockSlowStream(BaseHTTPRequestHandler):
+    """An upstream that streams made-up SSE events with pauses, and notes whether it was cut off."""
+
+    protocol_version = "HTTP/1.1"
+    events = []          # (seconds to wait first, bytes)
+    finished = None      # True when every event was sent, False when the gateway hung up
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            for wait, data in MockSlowStream.events:
+                time.sleep(wait)
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            MockSlowStream.finished = True
+        except OSError:
+            MockSlowStream.finished = False
+
+    def log_message(self, *args):
+        pass
+
+
+def sse_event(i):
+    return ('data: {"choices":[{"index":0,"delta":{"content":"part ' + str(i) + '"}}]}\n\n').encode()
+
+
+class StreamReplayTests(unittest.TestCase):
+    """The web UI resumes an answer after its connection drops (STREAM REPLAY)."""
+
+    CID = "conv-test-1::up:m"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockSlowStream)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats, proxy._REPLAY_GRACE_S, proxy._REPLAY_KEEP_S)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        proxy._config.pop("access_keys", None)
+        proxy.set_config("force_default_model", False)
+        proxy.set_config("endpoints", [{"name": "up", "type": "custom", "host": f"localhost:{self.up_port}",
+                                        "enabled": True, "api_key": ""}])
+        proxy.set_endpoint_status("up", "online")
+        with proxy._replay_lock:
+            proxy._replay_streams.clear()
+        MockSlowStream.finished = None
+
+    def tearDown(self):
+        proxy._stats.wait_idle()
+        time.sleep(0.1)
+        proxy.set_endpoint_status("up", "disabled")
+        (proxy.CONFIG_FILE, proxy._config, proxy._stats, proxy._REPLAY_GRACE_S, proxy._REPLAY_KEEP_S) = self._saved
+        self._tmp.cleanup()
+
+    def _body(self):
+        return json.dumps({"model": "up:m", "stream": True, "messages": [{"role": "user", "content": "made-up"}]})
+
+    def _chat(self, cid=None):
+        headers = {"Content-Type": "application/json"}
+        if cid:
+            headers["X-Conversation-Id"] = cid
+        return request(self.gw_port, "POST", "/v1/chat/completions", body=self._body(), headers=headers)
+
+    def _open(self, cid):
+        conn = HTTPConnection("127.0.0.1", self.gw_port, timeout=10)
+        conn.request("POST", "/v1/chat/completions", body=self._body(),
+                     headers={"Content-Type": "application/json", "X-Conversation-Id": cid})
+        return conn, conn.getresponse()
+
+    @staticmethod
+    def _without_keepalives(data: bytes) -> bytes:
+        return data.replace(proxy._KEEPALIVE, b"")
+
+    def test_without_the_header_the_stream_is_byte_for_byte(self):
+        MockSlowStream.events = [(0, sse_event(0)), (1.6, sse_event(1)), (0, b"data: [DONE]\n\n")]
+        status, _, data = self._chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(data, sse_event(0) + sse_event(1) + b"data: [DONE]\n\n")
+
+    def test_web_ui_gets_keepalives_during_silence_and_the_same_events(self):
+        MockSlowStream.events = [(2.5, sse_event(0)), (0, b"data: [DONE]\n\n")]
+        status, headers, data = self._chat(self.CID)
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(data.count(proxy._KEEPALIVE), 2)
+        self.assertTrue(data.startswith(proxy._KEEPALIVE), "the silence before the first token is filled")
+        self.assertEqual(self._without_keepalives(data), sse_event(0) + b"data: [DONE]\n\n")
+
+    def test_a_dropped_stream_is_resumed_from_its_byte_offset(self):
+        MockSlowStream.events = [(0, sse_event(0)), (1.5, sse_event(1)), (0.5, sse_event(2)), (0, b"data: [DONE]\n\n")]
+        conn, resp = self._open(self.CID)
+        got = b""
+        while sse_event(0) not in got:
+            got += resp.read1(65536)
+        conn.close()                                   # the browser drops after the first event
+        time.sleep(0.3)
+        status, _, rest = request(self.gw_port, "GET", f"/v1/stream?conv_id={self.CID}&from={len(got)}")
+        self.assertEqual(status, 200)
+        whole = self._without_keepalives(got + rest)
+        self.assertEqual(whole, sse_event(0) + sse_event(1) + sse_event(2) + b"data: [DONE]\n\n")
+        proxy._stats.wait_idle()
+        self.assertTrue(MockSlowStream.finished, "the engine's reply was read to its end")
+        # replaying from 0 gives the same bytes again
+        status, _, again = request(self.gw_port, "GET", f"/v1/stream?conv_id={self.CID}&from=0")
+        self.assertEqual(self._without_keepalives(again), whole)
+
+    def test_lookup_reports_running_and_finished_answers(self):
+        MockSlowStream.events = [(0, sse_event(0)), (1.2, b"data: [DONE]\n\n")]
+        conn, resp = self._open(self.CID)
+        resp.read1(65536)
+        status, _, data = request(self.gw_port, "POST", "/v1/streams/lookup",
+                                  body=json.dumps({"conversation_ids": [self.CID, "never-seen"]}),
+                                  headers={"Content-Type": "application/json"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data), [{"conversation_id": self.CID, "is_done": False}])
+        resp.read()
+        conn.close()
+        proxy._stats.wait_idle()
+        _, _, data = request(self.gw_port, "POST", "/v1/streams/lookup",
+                             body=json.dumps({"conversation_ids": [self.CID]}), headers={"Content-Type": "application/json"})
+        self.assertEqual(json.loads(data), [{"conversation_id": self.CID, "is_done": True}])
+
+    def test_unknown_conversation_is_404_and_another_address_cannot_read(self):
+        status, _, _ = request(self.gw_port, "GET", "/v1/stream?conv_id=nothing-here&from=0")
+        self.assertEqual(status, 404)
+        rs = proxy._replay_open("someone::m", "10.0.0.9")
+        rs.add(b"data: made-up\n\n")
+        self.assertIsNone(proxy._replay_get("someone::m", "127.0.0.1"))
+        self.assertIs(proxy._replay_get("someone::m", "10.0.0.9"), rs)
+
+    def test_nobody_comes_back_so_the_engine_is_let_go(self):
+        proxy._REPLAY_GRACE_S = 0.5
+        MockSlowStream.events = [(0, sse_event(0))] + [(0.3, sse_event(i)) for i in range(1, 30)]
+        conn, resp = self._open(self.CID)
+        got = b""
+        while sse_event(0) not in got:
+            got += resp.read1(65536)
+        conn.close()
+        deadline = time.time() + 8
+        while MockSlowStream.finished is None and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(MockSlowStream.finished, "the gateway hung up on the engine")
+        proxy._stats.wait_idle()
+
+    def test_finished_answers_are_forgotten(self):
+        proxy._REPLAY_KEEP_S = 0
+        MockSlowStream.events = [(0, sse_event(0)), (0, b"data: [DONE]\n\n")]
+        self._chat(self.CID)
+        proxy._stats.wait_idle()
+        time.sleep(0.05)
+        self.assertIsNone(proxy._replay_get(self.CID, "127.0.0.1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -424,6 +424,8 @@ If the engine answers a save or restore with an error 500, swapping turns off un
 
 The chat page is [llama.cpp's llama-ui](https://github.com/ggml-org/llama.cpp/tree/master/tools/ui), served by the gateway: streaming answers, every model from every endpoint in one picker, conversations you can branch, edit and search, image, PDF, audio and text attachments, markdown with code highlighting and math, and a dark or light theme. Uploads of images, audio and video turn on for models that accept them.
 
+An answer survives a dropped connection: if you switch tabs during a long prompt, the network blips or you reload the page, the page picks the answer up where it left off. The gateway keeps the stream alive while the model is silent, and keeps the answer in memory for 5 minutes after it ends (never on disk). Pressing Stop still stops the model, after 30 seconds.
+
 <details>
 <summary>Showing full model names in the picker</summary>
 

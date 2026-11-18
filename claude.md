@@ -242,6 +242,19 @@ Rules that must hold:
 3. **Only LM Studio's `/chat/completions` is changed.** Every other endpoint type and path gets the body as sent. A failure while translating forwards the request unchanged.
 4. **Stats keep only the name of the choice** (`think`: a level from `_THINK_EFFORTS`, `on` or `other`), never a value the client invented.
 
+## Stream Replay (web UI)
+
+The bundled llama-ui tags each chat request with `X-Conversation-Id` (`<conversation>::<model>`). When its tab becomes visible after more than 3 s without bytes, or the connection breaks, it cancels the stream and asks `GET /v1/stream?conv_id=…&from=<bytes>`; after a page reload it asks `POST /v1/streams/lookup` (`{"conversation_ids": [...]}` → `[{"conversation_id", "is_done"}]`). Before v2.16.0 the gateway had neither, the replay fell through to another endpoint, and the page said "Stream connection lost and could not be resumed".
+
+`_replay_id()` picks the requests that carry the header; `_stream_replayable()` streams them: a pump thread reads the engine, every byte sent goes into a `_ReplayStream`, and `_KEEPALIVE` (`: keep-alive`) goes out after each `_KEEPALIVE_S` without output.
+
+Rules that must hold:
+
+1. **Without the header nothing changes.** Other clients get the old loop and the stream byte for byte (`test_without_the_header_the_stream_is_byte_for_byte`).
+2. **The buffer is exactly what was sent, keep-alives included.** The UI resumes by byte offset, so anything sent on any connection that isn't in the buffer would shift every later offset.
+3. **A dropped browser doesn't lose the answer, and Stop still stops.** The engine's reply is read on after the drop; when no replay reader has been attached for `_REPLAY_GRACE_S` (30 s), `_ClientGone` ends the request and the engine is let go.
+4. **The answer stays in memory**, readable only from the address that asked, and is forgotten `_REPLAY_KEEP_S` (5 min) after it ends; at most `_REPLAY_MAX_STREAMS`, each up to `_REPLAY_MAX_BYTES`. Never on disk, in the log or in stats.
+
 ## API Endpoints
 
 | Endpoint | Format | Purpose |
@@ -256,6 +269,7 @@ Rules that must hold:
 | `GET /health` | — | Endpoint statuses |
 | `GET /stats` | JSON | Live stats: the gateway's counts, engine numbers and saved chats |
 | `GET/POST /cors-proxy` | llama.cpp | CORS proxy for the web UI's external fetches |
+| `GET /v1/stream?conv_id=…&from=N`, `POST /v1/streams/lookup` | llama.cpp | The web UI resumes or reattaches to an answer (see Stream Replay) |
 
 ## Testing Convention
 

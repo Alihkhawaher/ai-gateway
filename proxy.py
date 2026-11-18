@@ -4658,6 +4658,134 @@ def _lmstudio_thinking(data) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  STREAM REPLAY — the web UI resumes an answer after its connection drops
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The bundled llama-ui tags each chat request with X-Conversation-Id. When it
+# comes back to a tab after more than 3 s without bytes, or its connection
+# breaks, it cancels the stream and asks GET /v1/stream?conv_id=…&from=<bytes>
+# for the rest; after a page reload it asks POST /v1/streams/lookup which
+# answers are still running. Only requests carrying that header take this path:
+#   - every byte sent is kept in memory (_ReplayStream), keep-alive comments
+#     included, so a byte offset means the same thing on every connection;
+#   - a ": keep-alive" comment goes out after each second without output, so
+#     the UI never sees a quiet stream (SSE comments are ignored by readers);
+#   - when the browser drops, the engine's reply is still read to the end and
+#     kept, unless nobody reattaches within _REPLAY_GRACE_S (the user pressed Stop).
+# The reply stays in memory only and is forgotten _REPLAY_KEEP_S after it ends.
+# Without the header nothing changes: other clients get the stream byte for byte.
+
+_REPLAY_KEEP_S = 300
+_REPLAY_GRACE_S = 30
+_REPLAY_MAX_STREAMS = 16
+_REPLAY_MAX_BYTES = 32 * 1024 * 1024
+_KEEPALIVE_S = 1.0
+_KEEPALIVE = b": keep-alive\n\n"
+_REPLAY_ID_RE = re.compile(r"^[\x21-\x7e]{1,300}$")
+
+
+class _ClientGone(Exception):
+    """The browser left and nobody reattached: stop reading the engine."""
+
+
+class _ReplayStream:
+    def __init__(self, cid: str, addr: str):
+        self.cid, self.addr = cid, addr
+        self.data = bytearray()
+        self.done = False
+        self.overflow = False       # past _REPLAY_MAX_BYTES: no longer replayable
+        self.ended_at = None
+        self.readers = 0
+        self.last_reader = 0.0      # when the last replay reader left
+        self.cond = threading.Condition()
+
+    def add(self, chunk: bytes):
+        if not chunk:
+            return
+        with self.cond:
+            if not self.overflow:
+                if len(self.data) + len(chunk) > _REPLAY_MAX_BYTES:
+                    self.overflow = True
+                    self.data = bytearray()
+                else:
+                    self.data.extend(chunk)
+            self.cond.notify_all()
+
+    def finish(self):
+        with self.cond:
+            if not self.done:
+                self.done = True
+                self.ended_at = time.time()
+            self.cond.notify_all()
+
+    def attach(self):
+        with self.cond:
+            self.readers += 1
+
+    def detach(self):
+        with self.cond:
+            self.readers -= 1
+            self.last_reader = time.time()
+
+    def read_from(self, pos: int, wait: float):
+        """(bytes after pos, done). Waits up to `wait` seconds for more."""
+        with self.cond:
+            if len(self.data) <= pos and not self.done and not self.overflow:
+                self.cond.wait(wait)
+            return bytes(self.data[pos:]), self.done or self.overflow
+
+    def abandoned(self, gone_at: float) -> bool:
+        """The browser left at gone_at, no replay reader is attached, and none has been for the grace time."""
+        with self.cond:
+            return self.readers == 0 and time.time() - max(gone_at, self.last_reader) > _REPLAY_GRACE_S
+
+
+_replay_lock = threading.Lock()
+_replay_streams = {}   # conversation id → _ReplayStream
+
+
+def _replay_prune_locked(now: float):
+    for cid, rs in list(_replay_streams.items()):
+        if rs.done and rs.ended_at and now - rs.ended_at > _REPLAY_KEEP_S:
+            del _replay_streams[cid]
+    while len(_replay_streams) >= _REPLAY_MAX_STREAMS:
+        finished = [(rs.ended_at or 0, cid) for cid, rs in _replay_streams.items() if rs.done]
+        if not finished:
+            break
+        del _replay_streams[min(finished)[1]]
+
+
+def _replay_id(headers, method: str, path: str):
+    """The web UI's conversation id for a chat request, or None."""
+    if method != "POST" or not urlparse(path).path.rstrip("/").endswith("/chat/completions"):
+        return None
+    cid = (headers.get("X-Conversation-Id") or "").strip()
+    return cid if _REPLAY_ID_RE.match(cid) else None
+
+
+def _replay_open(cid: str, addr: str):
+    """A new buffer for this conversation's answer; one already there (an older turn) ends."""
+    rs = _ReplayStream(cid, addr)
+    with _replay_lock:
+        _replay_prune_locked(time.time())
+        old = _replay_streams.get(cid)
+        if len(_replay_streams) >= _REPLAY_MAX_STREAMS and old is None:
+            return None               # 16 answers running at once: this one isn't replayable
+        _replay_streams[cid] = rs
+    if old is not None:
+        old.finish()
+    return rs
+
+
+def _replay_get(cid: str, addr: str):
+    with _replay_lock:
+        _replay_prune_locked(time.time())
+        rs = _replay_streams.get(cid or "")
+    # Only the address that asked may read it back: it holds that chat's answer.
+    return rs if rs is not None and rs.addr == addr else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  PROXY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4723,6 +4851,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/cors-proxy":
             self._handle_cors_proxy()
+            return
+        if path == "/v1/stream":
+            self._handle_stream_replay(parse_qs(parsed.query))
             return
 
         # Try to serve as static web UI file
@@ -5139,7 +5270,62 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json([])
 
     def _handle_streams_lookup(self):
-        self._send_json({})
+        """Which of the web UI's conversations have an answer here (see STREAM REPLAY)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = 0
+        if length > _MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            ids = json.loads(raw).get("conversation_ids") if raw else []
+        except (ValueError, AttributeError):
+            ids = []
+        found = []
+        for cid in ids if isinstance(ids, list) else []:
+            if not isinstance(cid, str):
+                continue
+            rs = _replay_get(cid, self.address_string())
+            if rs is not None and not rs.overflow:
+                found.append({"conversation_id": cid, "is_done": bool(rs.done)})
+        self._send_json(found)
+
+    def _handle_stream_replay(self, query):
+        """GET /v1/stream?conv_id=…&from=N: the answer from byte N, then live to its end."""
+        cid = (query.get("conv_id") or [""])[0]
+        try:
+            pos = max(0, int((query.get("from") or ["0"])[0]))
+        except ValueError:
+            pos = 0
+        rs = _replay_get(cid, self.address_string())
+        if rs is None or rs.overflow:
+            self._send_json({"error": {"message": "no answer to resume for this conversation",
+                                       "type": "not_found", "code": 404}}, 404)
+            return
+        rs.attach()
+        try:
+            self.send_response(200)
+            for k, v in CORS_HEADERS.items():
+                self.send_header(k, v)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            while True:
+                data, done = rs.read_from(pos, 5.0)
+                if data:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    pos += len(data)
+                elif done:
+                    break
+        except OSError:
+            pass
+        finally:
+            rs.detach()
 
     def _handle_model_load(self):
         """Handle /models/load and /models/unload from the web UI.
@@ -5562,6 +5748,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if stat and guard:
             stat.body_size = _ctx_size(body, req_json)      # with the reply's token count: bytes per token
         healer = _new_healer(target_endpoint, self.command, path, req_json)
+        replay_id = _replay_id(self.headers, self.command, self.path)
+        rs = None                   # the web UI's replay buffer (see STREAM REPLAY)
         try:
             # Before forwarding: put the right conversation in the engine's slot
             # (kv_sessions endpoints only; holds the engine until _kv_end).
@@ -5634,12 +5822,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(replaced)))
             self.end_headers()
             headers_sent = True
+            if replay_id and streaming and response.status == 200 and replaced is None:
+                rs = _replay_open(replay_id, self.address_string())
             if ctx_note and streaming and response.status == 200:
                 first = {"id": "chatcmpl-gateway-context", "object": "chat.completion.chunk", "created": int(time.time()),
                          "model": str(req_json.get("model") or ""),
                          "choices": [{"index": 0, "delta": {"role": "assistant", "content": ctx_note + "\n\n"}, "finish_reason": None}]}
-                self.wfile.write(b"data: " + json.dumps(first, ensure_ascii=False).encode("utf-8") + b"\n\n")
+                first_line = b"data: " + json.dumps(first, ensure_ascii=False).encode("utf-8") + b"\n\n"
+                if rs:
+                    rs.add(first_line)
+                self.wfile.write(first_line)
                 self.wfile.flush()
+
+            if rs:
+                client_gone = self._stream_replayable(response, rs, stat, healer, ep_name)
+                if healer and stat:
+                    stat.heal = healer.result
+                return
 
             # Stream response body (SSE-safe): read1 hands over whatever has
             # arrived instead of waiting for a full buffer, so tokens reach
@@ -5681,10 +5880,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._log(f"→ {ep_name} [{response.status}]")
 
         except Exception as e:
+            if isinstance(e, _ClientGone):
+                client_gone = True
             if stat:
                 stat.failed = not client_gone
                 stat.cancelled = client_gone
-            self._log(f"Error → {ep_name}: {e}")
+            if isinstance(e, _ClientGone):
+                self._log(f"{ep_name}: the web UI left and did not come back for {_REPLAY_GRACE_S} s: answer stopped")
+            else:
+                self._log(f"Error → {ep_name}: {e}")
+            if rs and streaming and not isinstance(e, _ClientGone):
+                rs.add(f"data: {json.dumps({'error': {'message': f'Bad Gateway ({ep_name}): {e}'}})}\n\n".encode())
             try:
                 if not headers_sent:
                     # OpenAI-style JSON, not an HTML error page: API clients
@@ -5706,10 +5912,64 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
             self.close_connection = True
         finally:
+            if rs:
+                rs.finish()
             conn.close()
             bump_endpoint_load_end(ep_name)
             _kv_end(kv_ticket, kv_ok)
             _stats.end(stat)
+
+    def _stream_replayable(self, response, rs, stat, healer, ep_name) -> bool:
+        """Stream to the web UI with keep-alives, keeping every byte for replay (see STREAM REPLAY).
+        Returns True when the browser that asked left before the end (the answer was still kept)."""
+        chunks = queue.Queue()
+
+        def pump():   # reads the engine; never touches the client
+            try:
+                while True:
+                    chunk = response.read1(65536)
+                    chunks.put(chunk)
+                    if not chunk:
+                        return
+            except BaseException as exc:  # noqa: BLE001 -- handed to the request's thread
+                chunks.put(exc)
+
+        threading.Thread(target=pump, daemon=True, name="replay-pump").start()
+        state = {"client": True, "gone_at": 0.0}
+
+        def send(data: bytes):
+            if not data:
+                return
+            rs.add(data)
+            if not state["client"]:
+                return
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except OSError:
+                state["client"], state["gone_at"] = False, time.time()
+                self._log(f"{ep_name}: the web UI's connection dropped; the answer goes on and is kept for it to resume")
+
+        while True:
+            try:
+                item = chunks.get(timeout=_KEEPALIVE_S)
+            except queue.Empty:
+                send(_KEEPALIVE)
+                if not state["client"] and rs.abandoned(state["gone_at"]):
+                    raise _ClientGone()
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            if not item:
+                break
+            if stat:
+                stat.tap.feed(item, True)
+            send(healer.feed(item) if healer else item)
+            if not state["client"] and rs.abandoned(state["gone_at"]):
+                raise _ClientGone()
+        if healer:
+            send(healer.finish())
+        return not state["client"]
 
     def _log(self, msg: str):
         """Queue a request log line for the TUI (thread-safe)."""
