@@ -48,6 +48,8 @@ AI Gateway is a **multi-endpoint OpenAI-compatible proxy** with a Textual TUI an
 | `strata` | Strata gateway (default `127.0.0.1:47831`) | `GET /v1/models` | `/v1/models` + `/api/native` (per loaded model: vision, context, label) |
 | `custom` | Any OpenAI-compatible endpoint (e.g. llamastash) | `GET /v1/models` | `/v1/models` |
 
+A `llama-server` endpoint serves one model at a time, whatever a request names. Before a generation request, `_proxy()` asks it which model is loaded (`_llama_loaded_names()`: the `/props` GGUF file name and `--alias`, cached `_LLAMA_NAMES_TTL_S`), and a request naming another model gets `404 model_not_found` with the loaded model's ID. If `/props` can't be read, the request goes through.
+
 ### Model ID Format
 
 Model IDs are `source:model` (`parse_model_id()`). The part before the first `:` is the endpoint `name`; the rest is the original upstream model ID, which may itself contain `/` or `:`.

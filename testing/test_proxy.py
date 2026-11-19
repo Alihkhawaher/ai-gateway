@@ -2487,6 +2487,97 @@ class MockLlamaServer(BaseHTTPRequestHandler):
             self._send(404, b"{}")
 
 
+class MockOneModel(BaseHTTPRequestHandler):
+    """A llama-server with one model loaded: /props says which, and any chat is answered by it."""
+
+    protocol_version = "HTTP/1.1"
+    props = {"model_alias": "qwen3.8-27b", "model_path": "C:\\w\\Qwen3.8-27B-UD-IQ3_S.gguf"}
+    props_status = 200
+    chats = 0
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/props":
+            self._send(MockOneModel.props_status, MockOneModel.props)
+        else:
+            self._send(404, {})
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        MockOneModel.chats += 1
+        self._send(200, {"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
+
+
+class LoadedModelCheckTests(unittest.TestCase):
+    """A llama-server serves one model: a chat naming another one is refused, not answered by the wrong model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.up_srv, cls.up_t, cls.up_port = start_server(MockOneModel)
+        cls.gw_srv, cls.gw_t, cls.gw_port = start_server(proxy.ProxyHandler)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw_srv.shutdown(); cls.gw_srv.server_close()
+        cls.up_srv.shutdown(); cls.up_srv.server_close()
+
+    def setUp(self):
+        self._saved = (proxy.CONFIG_FILE, proxy._config, proxy._stats)
+        proxy._config = dict(proxy._config)
+        self._tmp = tempfile.TemporaryDirectory()
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._stats = proxy.GatewayStats()
+        proxy._config.pop("access_keys", None)
+        proxy.set_config("force_default_model", False)
+        proxy.set_config("endpoints", [{"name": "p40", "type": "llama-server", "host": f"localhost:{self.up_port}",
+                                        "enabled": True, "api_key": ""}])
+        proxy.set_endpoint_status("p40", "online")
+        self._tmp.cleanup()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)   # the log file may still be open
+        proxy.CONFIG_FILE = os.path.join(self._tmp.name, "config.json")
+        proxy._llama_names_cache.clear()
+        MockOneModel.props_status, MockOneModel.chats = 200, 0
+
+    def tearDown(self):
+        proxy.set_endpoint_status("p40", "disabled")
+        proxy._stats.wait_idle()
+        proxy.CONFIG_FILE, proxy._config, proxy._stats = self._saved
+        self._tmp.cleanup()
+
+    def _chat(self, model):
+        status, _, body = request(self.gw_port, "POST", "/v1/chat/completions",
+                                  body=json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                                  headers={"Content-Type": "application/json"})
+        return status, json.loads(body)
+
+    def test_the_loaded_model_is_served(self):
+        self.assertEqual(self._chat("p40:Qwen3.8-27B-UD-IQ3_S")[0], 200)
+        self.assertEqual(self._chat("p40:qwen3.8-27b")[0], 200)          # its --alias
+        self.assertEqual(MockOneModel.chats, 2)
+
+    def test_another_model_is_refused_with_the_loaded_ones_name(self):
+        status, body = self._chat("p40:Cydonia-24B-v4zg-Q4_K_M")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "model_not_found")
+        self.assertIn("p40:Qwen3.8-27B-UD-IQ3_S", body["error"]["message"])
+        self.assertEqual(MockOneModel.chats, 0)                          # the wrong model never answered
+
+    def test_when_the_server_cant_be_asked_the_request_goes_through(self):
+        MockOneModel.props_status = 500
+        self.assertEqual(self._chat("p40:Cydonia-24B-v4zg-Q4_K_M")[0], 200)
+        self.assertEqual(MockOneModel.chats, 1)
+
+
 def llama_slot(busy=True, decoded=10, prompt=1000, processed=100, cache=900, task=7):
     return {"id": 0, "n_ctx": 262144, "is_processing": busy, "id_task": task, "n_prompt_tokens": prompt,
             "n_prompt_tokens_processed": processed, "n_prompt_tokens_cache": cache,

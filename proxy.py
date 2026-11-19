@@ -899,6 +899,45 @@ def fetch_lmstudio_models(host: str) -> list:
     return models
 
 
+_llama_names_cache = {}            # host → (time, names): what a llama-server answered to, a few seconds ago
+_LLAMA_NAMES_TTL_S = 5.0
+
+
+def _llama_loaded_names(host: str, api_key: str = ""):
+    """The names the llama-server at `host` has loaded right now: its GGUF's file name, with and
+    without .gguf (the gateway's model id), and its --alias. None when it can't be asked."""
+    now = time.time()
+    hit = _llama_names_cache.get(host)
+    if hit and now - hit[0] < _LLAMA_NAMES_TTL_S:
+        return hit[1]
+    names = None
+    try:
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=3)
+        try:
+            conn.request("GET", "/props", headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
+            resp = conn.getresponse()
+            raw = resp.read()
+        finally:
+            conn.close()
+        props = json.loads(raw) if resp.status == 200 else None
+        if isinstance(props, dict):
+            found = set()
+            path = props.get("model_path")
+            if isinstance(path, str) and path.strip():
+                base = re.split(r"[\\/]", path.strip())[-1]
+                found.add(base)
+                if base.lower().endswith(".gguf"):
+                    found.add(base[:-5])
+            alias = props.get("model_alias")
+            if isinstance(alias, str) and alias.strip():
+                found.add(alias.strip())
+            names = found or None
+    except Exception:  # noqa: BLE001 - not knowing is never a reason to refuse
+        names = None
+    _llama_names_cache[host] = (now, names)
+    return names
+
+
 def fetch_llama_server_models(host: str) -> list:
     """Fetch model info from llama.cpp server."""
     try:
@@ -5910,6 +5949,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
         api_key = target_endpoint.get("api_key", "")
         ep_name = target_endpoint.get("name", "unknown")
         ep_type = target_endpoint.get("type", "")
+
+        # A llama-server serves the one model it has loaded, whatever a request names. A chat that names
+        # another model (an app still set to the model before a switch) is refused with the loaded model's
+        # name, instead of being answered by a model the client didn't ask for.
+        if (ep_type == "llama-server" and requested_source and original_id and self.command == "POST"
+                and urlparse(self.path).path.rstrip("/").endswith(_STATS_PATHS)):
+            loaded = _llama_loaded_names(host, api_key)
+            if loaded and original_id not in loaded:
+                now_id = next((n for n in sorted(loaded) if not n.lower().endswith(".gguf")), sorted(loaded)[0])
+                self._log(f"{ep_name}: refused a request for a model it doesn't have loaded")
+                self._send_json({"error": {
+                    "message": (f"The model '{requested_source}:{original_id}' is not loaded. '{ep_name}' serves one model "
+                                f"at a time and is running '{ep_name}:{now_id}' now. Choose that model, "
+                                f"or load this one in the server's launcher."),
+                    "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}, 404)
+                return
 
         # The client's thinking choice, in the form LM Studio honours (see THINKING SWITCH).
         if (ep_type == "lmstudio" and isinstance(req_json, dict)
