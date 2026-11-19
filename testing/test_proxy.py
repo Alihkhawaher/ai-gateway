@@ -3256,7 +3256,10 @@ class LiveToolCallTests(unittest.TestCase):
         self.assertNotIn(b"web_search", early)                # R1 may stop it: held
         rest = healer.feed(_sse(_delta({}, "tool_calls")) + _sse(b"[DONE]")) + healer.finish()
         self.assertEqual(healer.result.get("rule"), "R1")
-        self.assertNotIn(b"web_search", rest)
+        calls = read_reply(early + rest)["calls"]
+        self.assertEqual(len(calls), 1)
+        self.assertRegex(calls[0]["name"], r"^gateway_stopped_R1_")     # the call itself never went out
+        self.assertIn("3 times in a row", json.loads(calls[0]["arguments"])["note"])
 
     def test_which_tools_may_stream(self):
         self.assertTrue(proxy._live_tool(SEARCH_TOOL["function"]))
@@ -3538,8 +3541,29 @@ class ToolGuardReplyTests(unittest.TestCase):
         healer, out = run_healer(sse_native("run_commands", self.RM), tools=NO_ASK_TOOLS)
         view = read_reply(out)
         self.assertRegex(view["calls"][0]["name"], r"^gateway_stopped_S02_[a-z_]+$")
-        self.assertEqual(view["calls"][0]["arguments"], "{}")
+        note = json.loads(view["calls"][0]["arguments"])["note"]
+        self.assertIn("run_commands", note)
+        self.assertIn("nothing ran", note)
+        self.assertIn("tell the user", note)
+        self.assertNotIn("rm -rf", note)                    # the command goes only into a question to the user
         self.assertEqual(healer.result["rule"], "S02")
+
+    def test_a_cut_off_call_tells_the_model_the_limit_and_what_to_tell_the_user(self):
+        healer = proxy.ToolHealer({"enabled": True}, {"tools": CLINE_TOOLS, "max_tokens": 4096})
+        out = healer.feed(sse_native("run_commands", '{"commands":["npm te', finish="length")) + healer.finish()
+        call = read_reply(out)["calls"][0]
+        self.assertRegex(call["name"], r"^gateway_stopped_T1_")
+        note = json.loads(call["arguments"])["note"]
+        for words in ("run_commands", "4,096 tokens", "nothing ran", "smaller pieces", "Tell the user", "32768"):
+            self.assertIn(words, note)
+        self.assertNotIn("npm", note)
+
+    def test_a_cut_off_call_with_a_large_limit_gives_no_setting_advice(self):
+        healer = proxy.ToolHealer({"enabled": True}, {"tools": CLINE_TOOLS, "max_tokens": 32768})
+        out = healer.feed(sse_native("run_commands", '{"commands":["npm te', finish="length")) + healer.finish()
+        note = json.loads(read_reply(out)["calls"][0]["arguments"])["note"]
+        self.assertIn("32,768 tokens", note)
+        self.assertNotIn("raising it", note)
 
     def test_a_healed_call_is_judged_like_any_other(self):
         block = '<tool_call>\n<function=run_commands>\n<parameter=commands>\n["rm -rf /"]\n</parameter>\n</function>\n</tool_call>'

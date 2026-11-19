@@ -4118,6 +4118,9 @@ class ToolHealer:
         except Exception:  # noqa: BLE001 - a chat this can't read is a chat it leaves alone
             self.repeat_limit = 0
         self.result = {}            # counts and a rule id, for stats and the log
+        self.max_out = next((n for n in (data.get("max_tokens"), data.get("max_completion_tokens"))
+                             if isinstance(n, int) and not isinstance(n, bool) and n > 0), None)
+        self._culprit = ""          # the name of the tool whose call was stopped, for the note to the model
         self._line = bytearray()
         self._event_lines = []
         self._tail = ""             # sent content stops here: this much could still start a call
@@ -4167,7 +4170,35 @@ class ToolHealer:
                 "question": f"The gateway stopped a command because {reason} (rule {rule}).{shown}\n\nWhat should happen next?",
                 "options": ["Skip it and try another way", "I'll run it myself"]}, ensure_ascii=False)}
         slug = _STOP_NAMES.get(rule, "destructive_command_was_not_run")
-        return {"name": f"gateway_stopped_{rule}_{slug}", "arguments": "{}"}
+        # The client answers "unavailable tool", and the model reads this call back from the chat: the
+        # note in its arguments says what happened and what to do. Counts and names only, no command.
+        return {"name": f"gateway_stopped_{rule}_{slug}",
+                "arguments": json.dumps({"note": self._stop_note(rule, reason)}, ensure_ascii=False)}
+
+    def _stop_note(self, rule: str, reason: str) -> str:
+        tool = f" to `{self._culprit}`" if self._culprit else ""
+        if rule == "T1":
+            limit = f" of {self.max_out:,} tokens" if self.max_out else ""
+            fix = (f" Tell the user: the app's max output tokens is {self.max_out:,}, too small for this; raising it "
+                   f"to 32768 or more in the model settings (then restarting the app) stops these cut-offs."
+                   if self.max_out and self.max_out < 16384 else
+                   " If it keeps happening, tell the user the app's max output tokens setting is too small for these calls.")
+            return (f"The AI Gateway stopped your call{tool}: your reply was cut off at the output limit{limit} "
+                    f"before the call was complete, so nothing ran. Send it again in smaller pieces: one file per "
+                    f"call, small edits instead of rewriting a whole file, or a long file in parts." + fix)
+        if rule == "A1":
+            return (f"The AI Gateway stopped your call{tool}: its arguments were not valid JSON, and repairing them "
+                    f"could change what runs, so nothing ran. Send the call again with valid JSON (in Windows paths, "
+                    f"write each backslash as \\\\).")
+        if rule == "R1":
+            return (f"The AI Gateway stopped your call{tool}: you made exactly this call {self._run_count} times in a "
+                    f"row and already have its result, so it didn't run again. Use that result, or change the call. "
+                    f"If you are stuck, tell the user what is blocking you.")
+        if rule == "R2":
+            return (f"The AI Gateway stopped your reply: it made the same call{tool} more than {self.repeat_limit} "
+                    f"times, so nothing ran. Send the call once.")
+        return (f"The AI Gateway stopped your call{tool} because {reason} (rule {rule}), so nothing ran. Do it "
+                f"another way, or tell the user what you wanted to run and why, so they can run it themselves.")
 
     # ── the verdict ─────────────────────────────────────────────────────
     def _judge(self, calls: list):
@@ -4175,8 +4206,12 @@ class ToolHealer:
             for call in calls:
                 rule, command = guard_tool_call(call["name"], call["arguments"], self.shell, self.allow)
                 if rule:
+                    self._culprit = str(call["name"])[:64]
                     return rule, command
-        return self._repeated(calls), None
+        rule = self._repeated(calls)
+        if rule and calls:
+            self._culprit = str(calls[0]["name"])[:64]
+        return rule, None
 
     def _repeated(self, calls: list):
         """R1: these exact calls were the chat's last `repeat_limit` turns already. R2: one reply makes
@@ -4211,6 +4246,7 @@ class ToolHealer:
         if self.allow is not None and self._was_cut() and "T1" not in self.allow:
             for call in calls:
                 if call["name"].lower() in _GUARDED_TOOLS or any(f'"{k}"' in call["arguments"] for k in _COMMAND_KEYS):
+                    self._culprit = str(call["name"])[:64]
                     return self._stop("T1", None, start)
         rule, command = self._judge(calls)
         if rule:
@@ -4533,7 +4569,10 @@ class ToolHealer:
                     found.append({"name": str(function.get("name") or ""), "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)})
                 rule, command = self._judge(found)
                 if not rule and self.allow is not None and finish == "length":
-                    rule = "T1" if any(c["name"].lower() in _GUARDED_TOOLS for c in found) and "T1" not in self.allow else None
+                    cut = next((c for c in found if c["name"].lower() in _GUARDED_TOOLS), None)
+                    rule = "T1" if cut and "T1" not in self.allow else None
+                    if rule:
+                        self._culprit = str(cut["name"])[:64]
                 if rule:
                     return self._stopped_body(obj, choice, message, rule, command, None)
                 if any(not isinstance((c.get("function") or {}).get("arguments", ""), str) for c in calls):
