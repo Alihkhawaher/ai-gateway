@@ -78,6 +78,8 @@ STATIC_BASE_URL = {"openrouter": "https://openrouter.ai/api"}
 
 # provider id -> legacy globalState key that holds a context size as a string
 LEGACY_CONTEXT_KEY = {"lmstudio": "lmStudioMaxTokens"}
+DEFAULT_MAX_OUT = 32768     # max output tokens per reply for OpenAI Compatible (Cline's default 4096 cuts long writes)
+MIN_MAX_OUT = 16384         # below this, "Show current" warns
 
 THINKING_CHOICES = ("default", "off", "low", "medium", "high")
 
@@ -242,6 +244,9 @@ def describe(files: ClineFiles, provider: str, modes=("plan", "act")) -> list[st
         f"vision             : {_vision_of(record)}",
         f"thinking           : {current_thinking(files, provider)}",
     ]
+    if provider == "openai-compatible":
+        lines.append("max output tokens  : " + ", ".join(
+            f"{m}={(st.get(m + 'ModeOpenAiModelInfo') or {}).get('maxTokens', '<unset>')}" for m in modes))
     return lines
 
 
@@ -266,6 +271,12 @@ def mismatches(files: ClineFiles, provider: str, modes) -> list[str]:
         record = model_record(files.models, provider, effective)
         if not record.get("contextWindow") or record.get("contextWindow") == 128000:
             found.append(f"models.json has no real context window for {effective!r}: Cline will assume 128,000")
+    if provider == "openai-compatible":
+        for m in modes:
+            limit = (files.state.get(f"{m}ModeOpenAiModelInfo") or {}).get("maxTokens")
+            if isinstance(limit, int) and 0 < limit < MIN_MAX_OUT:
+                found.append(f"{m} mode: max output tokens is {limit:,}: a long file write is cut off mid-call "
+                             f"(the gateway stops it as T1). Use {DEFAULT_MAX_OUT:,} or more.")
     return found
 
 
@@ -362,7 +373,7 @@ def vscode_running() -> int:
 # ── the change ───────────────────────────────────────────────────────────
 def apply_choice(files: ClineFiles, provider: str, model: str, *, window=None, vision=None,
                  modes=("plan", "act"), gateway_root=None, activate=False, thinking=None,
-                 generic=True) -> list[str]:
+                 generic=True, max_out=None) -> list[str]:
     """Write the choice into the loaded files (in memory). Returns what changed, one line each.
     Call files.save() to back up and write them."""
     if provider not in PROVIDERS:
@@ -453,6 +464,8 @@ def apply_choice(files: ClineFiles, provider: str, model: str, *, window=None, v
         if vision is False and "images" in caps:
             caps.remove("images")
         put(record, "capabilities", caps, f"models.json {provider}.{model}.capabilities")
+        if max_out:
+            put(record, "maxTokens", int(max_out), f"models.json {provider}.{model}.maxTokens")
         # The settings page's "model info" for OpenAI Compatible (globalState), kept in step.
         for m in modes:
             info = st.get(f"{m}ModeOpenAiModelInfo")
@@ -462,10 +475,15 @@ def apply_choice(files: ClineFiles, provider: str, model: str, *, window=None, v
                 new_info["contextWindow"] = int(window)
             if vision is not None:
                 new_info["supportsImages"] = bool(vision)
+            if max_out:
+                # Cline sends this as max_tokens: at 4096 a long file write is cut off mid-call
+                # (the gateway then stops the call with rule T1).
+                new_info["maxTokens"] = int(max_out)
             if new_info != info:
                 changes.append(f"{m}ModeOpenAiModelInfo: context {info.get('contextWindow', '<unset>')} -> "
                                f"{new_info.get('contextWindow', '<unset>')}, images {info.get('supportsImages', '<unset>')} -> "
-                               f"{new_info.get('supportsImages', '<unset>')}")
+                               f"{new_info.get('supportsImages', '<unset>')}, max output {info.get('maxTokens', '<unset>')} -> "
+                               f"{new_info.get('maxTokens', '<unset>')}")
                 st[f"{m}ModeOpenAiModelInfo"] = new_info
     else:
         if vision is not None:
@@ -489,6 +507,7 @@ class App(tk.Tk):
         self.gateway = tk.StringVar(value=DEFAULT_GATEWAY)
         self.key = tk.StringVar()
         self.context = tk.StringVar()
+        self.max_out = tk.StringVar(value=str(DEFAULT_MAX_OUT))   # OpenAI Compatible only; empty leaves it
         self.vision = tk.StringVar(value="as reported")
         self.thinking = tk.StringVar(value="keep")
         self.mode = tk.StringVar(value="both")
@@ -537,6 +556,8 @@ class App(tk.Tk):
         opts.pack(fill="x", **pad)
         ttk.Label(opts, text="Context window").pack(side="left")
         ttk.Entry(opts, textvariable=self.context, width=10).pack(side="left", padx=(4, 16))
+        ttk.Label(opts, text="Max output").pack(side="left")
+        ttk.Entry(opts, textvariable=self.max_out, width=8).pack(side="left", padx=(4, 16))
         ttk.Label(opts, text="Vision").pack(side="left")
         ttk.Combobox(opts, textvariable=self.vision, width=11, state="readonly",
                      values=("as reported", "yes", "no")).pack(side="left", padx=(4, 16))
@@ -666,6 +687,10 @@ class App(tk.Tk):
         if raw and not raw.isdigit():
             messagebox.showerror("Cline model setup", "The context window must be a number of tokens.")
             return
+        out_raw = self.max_out.get().replace(",", "").strip()
+        if out_raw and not out_raw.isdigit():
+            messagebox.showerror("Cline model setup", "Max output must be a number of tokens.")
+            return
         if not self.read_files():
             return
         vision = {"yes": True, "no": False}.get(self.vision.get(), m.get("vision"))
@@ -674,7 +699,8 @@ class App(tk.Tk):
         try:
             changes = apply_choice(self.files, p, m["id"], window=int(raw) if raw else None,
                                         vision=vision, modes=self.modes(), gateway_root=self.gateway.get(),
-                                        activate=self.activate.get(), thinking=thinking)
+                                        activate=self.activate.get(), thinking=thinking,
+                                        max_out=int(out_raw) if out_raw else None)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Cline model setup", str(exc))
             return
