@@ -2833,15 +2833,106 @@ def _engine_view(m: dict) -> dict:
     }
 
 
+# llama-server (type "llama-server"): /slots for the live slot, /metrics (needs --metrics) for the totals.
+# Only these Prometheus counters are read; every value goes through _engine_view's allow-list.
+_LLAMA_METRICS = ("prompt_tokens_total", "prompt_tokens_cached_total", "prompt_seconds_total", "tokens_predicted_total",
+                  "tokens_predicted_seconds_total", "spec_decode_num_draft_tokens_total",
+                  "spec_decode_num_accepted_tokens_total", "requests_processing", "requests_deferred")
+_LLAMA_HISTORY = 30                  # tok_s samples kept for the sparkline (one per poll)
+
+
+def _llama_prometheus(text: str) -> dict:
+    """The allow-listed llamacpp:* numbers from a Prometheus page."""
+    out = {}
+    for line in (text or "").splitlines():
+        if not line.startswith("llamacpp:") or "{" in line:
+            continue
+        parts = line.split()
+        name = parts[0][len("llamacpp:"):]
+        if name in _LLAMA_METRICS and len(parts) >= 2:
+            try:
+                out[name] = float(parts[1])
+            except ValueError:
+                pass
+    return out
+
+
+def _llama_slot(slots) -> dict:
+    """The slot to show: the one working, else the first. Numbers only."""
+    if not isinstance(slots, list):
+        return {}
+    rows = [x for x in slots if isinstance(x, dict)]
+    busy = [x for x in rows if x.get("is_processing")]
+    slot = (busy or rows or [{}])[0]
+    nxt = slot.get("next_token")
+    nxt = nxt[0] if isinstance(nxt, list) and nxt and isinstance(nxt[0], dict) else (nxt if isinstance(nxt, dict) else {})
+    params = slot.get("params") if isinstance(slot.get("params"), dict) else {}
+
+    def num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return {"n_ctx": num(slot.get("n_ctx")), "busy": bool(slot.get("is_processing")),
+            "task": num(slot.get("id_task")), "prompt": num(slot.get("n_prompt_tokens")),
+            "processed": num(slot.get("n_prompt_tokens_processed")), "cached": num(slot.get("n_prompt_tokens_cache")),
+            "decoded": num(nxt.get("n_decoded")), "max_tokens": num(params.get("max_tokens"))}
+
+
+def _llama_metrics_dict(slot: dict, prom: dict, model: str, prev: dict, history: list, now: float) -> dict:
+    """llama-server's numbers in the shape of Strata's /metrics, so _engine_view and the panels read both.
+    `prev` is the last poll's {"t", "task", "decoded", "read"}; live speeds come from the change since then."""
+    read = None
+    if slot.get("prompt") is not None:
+        read = min(slot["prompt"], (slot.get("cached") or 0) + (slot.get("processed") or 0))
+    same = prev and prev.get("task") == slot.get("task") and slot.get("task") is not None
+    dt = now - prev["t"] if same else 0
+    tok_s = read_rate = None
+    if dt > 0:
+        if slot.get("decoded") is not None and prev.get("decoded") is not None:
+            tok_s = max(0.0, (slot["decoded"] - prev["decoded"]) / dt)
+        if read is not None and prev.get("read") is not None:
+            read_rate = max(0.0, (read - prev["read"]) / dt)
+    p_tok, p_s = prom.get("prompt_tokens_total"), prom.get("prompt_seconds_total")
+    mean_read = p_tok / p_s if p_tok and p_s else None
+    if not slot.get("busy"):
+        state = "idle"
+    elif not slot.get("decoded"):
+        state = "reading"
+    else:
+        state = "generating"
+    if state == "generating" and tok_s is not None:
+        history.append(round(tok_s, 1))
+    elif state != "generating":
+        history.append(0)
+    del history[:-_LLAMA_HISTORY]
+    cached = prom.get("prompt_tokens_cached_total")
+    live = {"state": state, "queued": prom.get("requests_deferred"),
+            "prompt_tokens": slot.get("prompt"), "prompt_read": read if state == "reading" else None,
+            "prompt_total": slot.get("prompt") if state == "reading" else None,
+            "generated": slot.get("decoded") if slot.get("busy") else None, "max_tokens": slot.get("max_tokens"),
+            "tok_s": tok_s if state == "generating" else None,
+            "prefill_tok_s_mean": read_rate if state == "reading" and read_rate else mean_read}
+    totals = {"prompt_tokens": (p_tok or 0) + (cached or 0) if p_tok is not None else None, "reused": cached,
+              "output_tokens": prom.get("tokens_predicted_total"),
+              "prompt_ms": p_s * 1000 if p_s is not None else None,
+              "decode_ms": prom["tokens_predicted_seconds_total"] * 1000 if prom.get("tokens_predicted_seconds_total") is not None else None,
+              "drafts_offered": prom.get("spec_decode_num_draft_tokens_total"),
+              "drafts_accepted": prom.get("spec_decode_num_accepted_tokens_total")}
+    return {"engine": {"model": model, "max_context": slot.get("n_ctx")}, "live": live, "totals": totals,
+            "history": {"tok_s": list(history)}}
+
+
 class EngineProbe:
     """Polls the /metrics of engines that have one (Strata), only while someone
-    is looking, and answers from memory so the console never waits on it."""
+    is looking, and answers from memory so the console never waits on it.
+    A llama-server endpoint is read through /slots and its Prometheus /metrics."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.data = {}          # endpoint name → {"ok", "at", ...view}
         self.last_read = 0.0
         self.thread = None
+        self.llama_prev = {}    # endpoint name → last poll's slot numbers (llama-server)
+        self.llama_hist = {}    # endpoint name → recent tok_s samples
+        self.llama_model = {}   # host → (time, model alias)
 
     @staticmethod
     def _target(ep: dict, model: str = ""):
@@ -2873,8 +2964,54 @@ class EngineProbe:
         finally:
             conn.close()
 
+    @staticmethod
+    def _llama_get(host: str, key: str, path: str):
+        """(status, body) of one GET to the llama-server."""
+        conn = http.client.HTTPConnection(_dial_host(host), timeout=3)
+        try:
+            conn.request("GET", path, headers={"Authorization": f"Bearer {key}"} if key else {})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def _llama_metrics(self, ep: dict) -> dict:
+        name, host, key = ep.get("name", ""), ep.get("host", ""), ep.get("api_key", "")
+        status, raw = self._llama_get(host, key, "/slots")
+        if status != 200:
+            raise ValueError(f"/slots HTTP {status}")
+        slot = _llama_slot(json.loads(raw))
+        status, raw = self._llama_get(host, key, "/metrics")
+        prom = _llama_prometheus(raw.decode("utf-8", "replace")) if status == 200 else {}
+        cached_model = self.llama_model.get(host)
+        if not cached_model or time.time() - cached_model[0] > 60:
+            model = ""
+            try:
+                status, raw = self._llama_get(host, key, "/props")
+                props = json.loads(raw) if status == 200 else {}
+                model = props.get("model_alias") or os.path.basename(str(props.get("model_path") or ""))
+            except Exception:
+                pass
+            cached_model = (time.time(), model)
+            self.llama_model[host] = cached_model
+        now = time.time()
+        history = self.llama_hist.setdefault(name, [])
+        m = _llama_metrics_dict(slot, prom, cached_model[1], self.llama_prev.get(name) or {}, history, now)
+        read = m["live"].get("prompt_read")
+        self.llama_prev[name] = {"t": now, "task": slot.get("task"), "decoded": slot.get("decoded"),
+                                 "read": read if read is not None else slot.get("prompt")}
+        return m  # without --metrics the totals stay empty and the live slot still shows
+
     def _poll_one(self, ep: dict, model: str = ""):
         name = ep.get("name", "")
+        if ep.get("type") == "llama-server" and ep.get("host"):
+            try:
+                view = {"ok": True, "at": time.time(), **_engine_view(self._llama_metrics(ep))}
+            except Exception as e:
+                view = {"ok": False, "at": time.time(), "error": str(e)[:120]}
+            with self.lock:
+                self.data[name] = view
+            return view
         target = self._target(ep, model)
         if not target:
             return None
@@ -6594,6 +6731,12 @@ def _main_engine(snap: dict):
     """(endpoint name, engine view) of the engine to feature: the first that
     answers, or (name, None) when one is configured but silent."""
     engines = snap.get("engines") or {}
+    gw = snap.get("gateway") or {}
+    busy = [a.get("endpoint") for a in gw.get("active") or [] if isinstance(a, dict)]
+    recent = [r.get("endpoint") for r in (gw.get("recent") or [])[:1] if isinstance(r, dict)]
+    for name in busy + recent:
+        if name in engines and (engines[name] or {}).get("ok"):
+            return name, engines[name]
     for name, view in engines.items():
         if view.get("ok"):
             return name, view

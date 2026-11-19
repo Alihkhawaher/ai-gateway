@@ -166,7 +166,7 @@ The console's log lines are also written to `gateway.log` beside `config.json`, 
 Where the numbers come from:
 
 - **Tokens and speed** are read from each response as it passes through, in the OpenAI, Anthropic, DeepSeek and Responses API formats, and from llama.cpp's `timings`. If an upstream reports no usage, streamed pieces are counted instead and shown with a `~`.
-- **Engine, Hardware and the expert and draft figures** need an engine that publishes `/metrics`, which today means Strata. Other endpoints still get the gateway's own counts.
+- **Engine, Hardware and the expert and draft figures** need an engine that publishes its numbers: Strata's `/metrics`, or a `llama-server` endpoint started with `--metrics` (state, prompt progress, live speed, context size, prompt-cache reuse and draft acceptance; llama-server reports no hardware). Other endpoints still get the gateway's own counts. The console shows whichever engine is serving the current request.
 - **The app name** comes from the `X-Title` header. Without one, a browser on the gateway's own page shows as `Web UI`, then the referer's host is used, then the `User-Agent` product.
 - **Time saved is an estimate:** cached tokens divided by the reading speed measured on that endpoint.
 - **A client pressing stop** counts as stopped, not as an error.

@@ -2417,6 +2417,149 @@ def _as_text(renderable, width=120) -> str:
 _PANELS = [p[2] for p in proxy._DASHBOARD_PANELS]
 
 
+class MockLlamaServer(BaseHTTPRequestHandler):
+    """llama-server's /slots, Prometheus /metrics (501 when off) and /props, with made-up numbers."""
+
+    protocol_version = "HTTP/1.1"
+    slots = []
+    prometheus = None   # None → 501, as without --metrics
+    props = {"model_alias": "qwen-test", "model_path": "C:/m/model.gguf"}
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status, body: bytes, ctype="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/slots":
+            self._send(200, json.dumps(MockLlamaServer.slots).encode())
+        elif self.path == "/metrics":
+            if MockLlamaServer.prometheus is None:
+                self._send(501, b'{"error":{"message":"metrics not enabled"}}')
+            else:
+                self._send(200, MockLlamaServer.prometheus.encode(), "text/plain")
+        elif self.path == "/props":
+            self._send(200, json.dumps(MockLlamaServer.props).encode())
+        else:
+            self._send(404, b"{}")
+
+
+def llama_slot(busy=True, decoded=10, prompt=1000, processed=100, cache=900, task=7):
+    return {"id": 0, "n_ctx": 262144, "is_processing": busy, "id_task": task, "n_prompt_tokens": prompt,
+            "n_prompt_tokens_processed": processed, "n_prompt_tokens_cache": cache,
+            "params": {"max_tokens": 4096, "temperature": 0.7, "grammar": "SECRET", "speculative.types": "x"},
+            "prompt": "SECRET PROMPT TEXT",
+            "next_token": [{"has_next_token": True, "n_remain": 100, "n_decoded": decoded, "text": "SECRET"}]}
+
+
+PROM = """# HELP llamacpp:prompt_tokens_total x
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 3000
+llamacpp:prompt_tokens_cached_total 9000
+llamacpp:prompt_seconds_total 10
+llamacpp:tokens_predicted_total 500
+llamacpp:tokens_predicted_seconds_total 25
+llamacpp:spec_decode_num_draft_tokens_total 400
+llamacpp:spec_decode_num_accepted_tokens_total 300
+llamacpp:requests_deferred 2
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 99
+llamacpp:secret_text_total SECRET
+"""
+
+
+class LlamaServerProbeTests(unittest.TestCase):
+    """Live engine numbers from a llama-server endpoint (/slots + Prometheus /metrics)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv, cls.t, cls.port = start_server(MockLlamaServer)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown(); cls.srv.server_close()
+
+    def setUp(self):
+        MockLlamaServer.slots = [llama_slot()]
+        MockLlamaServer.prometheus = PROM
+        self.probe = proxy.EngineProbe()
+        self.ep = {"name": "p40", "type": "llama-server", "host": f"127.0.0.1:{self.port}"}
+
+    def test_reads_slot_and_totals(self):
+        view = self.probe._poll_one(self.ep)
+        self.assertTrue(view["ok"], view)
+        self.assertEqual(view["model"], "qwen-test")
+        self.assertEqual(view["info"]["max_context"], 262144)
+        self.assertEqual(view["live"]["state"], "generating")
+        self.assertEqual(view["live"]["generated"], 10)
+        self.assertEqual(view["live"]["queued"], 2)
+        t = view["totals"]
+        self.assertEqual((t["prompt_tokens"], t["reused"], t["output_tokens"]), (12000, 9000, 500))
+        self.assertEqual((t["prompt_ms"], t["decode_ms"]), (10000, 25000))
+        self.assertEqual((t["drafts_offered"], t["drafts_accepted"]), (400, 300))
+        self.assertEqual(self.probe.read_speed("p40"), 300.0)   # 3000 read tokens in 10 s
+
+    def test_no_text_reaches_the_view(self):
+        view = self.probe._poll_one(self.ep)
+        self.assertNotIn("SECRET", json.dumps(view))
+
+    def test_live_speed_comes_from_the_change_between_polls(self):
+        self.probe._poll_one(self.ep)
+        self.probe.llama_prev["p40"]["t"] -= 1.0          # as if the last poll was a second ago
+        MockLlamaServer.slots = [llama_slot(decoded=30)]
+        view = self.probe._poll_one(self.ep)
+        self.assertAlmostEqual(view["live"]["tok_s"], 20.0, delta=1.0)
+        self.assertTrue(view["history"]["tok_s"])
+
+    def test_a_new_request_does_not_borrow_the_last_ones_count(self):
+        self.probe._poll_one(self.ep)
+        MockLlamaServer.slots = [llama_slot(decoded=500, task=8)]
+        self.assertIsNone(self.probe._poll_one(self.ep)["live"]["tok_s"])
+
+    def test_reading_a_prompt_shows_progress(self):
+        MockLlamaServer.slots = [llama_slot(decoded=0, prompt=1000, processed=300, cache=200)]
+        live = self.probe._poll_one(self.ep)["live"]
+        self.assertEqual((live["state"], live["prompt_read"], live["prompt_total"]), ("reading", 500, 1000))
+        self.assertEqual(live["prefill_tok_s_mean"], 300.0)     # all-time mean until a second poll
+
+    def test_idle(self):
+        MockLlamaServer.slots = [llama_slot(busy=False)]
+        live = self.probe._poll_one(self.ep)["live"]
+        self.assertEqual(live["state"], "idle")
+        self.assertIsNone(live["generated"])
+
+    def test_without_metrics_the_slot_still_shows(self):
+        MockLlamaServer.prometheus = None
+        view = self.probe._poll_one(self.ep)
+        self.assertTrue(view["ok"])
+        self.assertEqual(view["live"]["state"], "generating")
+        self.assertIsNone(view["totals"]["prompt_tokens"])
+
+    def test_odd_slots_do_not_break_it(self):
+        for slots in ([], [None, 5], [{"is_processing": True, "next_token": "x", "params": []}], {"a": 1}):
+            MockLlamaServer.slots = slots
+            self.assertTrue(self.probe._poll_one(self.ep)["ok"], slots)
+
+    def test_a_dead_server_is_not_ok(self):
+        view = self.probe._poll_one({"name": "x", "type": "llama-server", "host": "127.0.0.1:1"})
+        self.assertFalse(view["ok"])
+
+    def test_the_console_features_the_engine_that_is_serving(self):
+        snap = {"engines": {"strata": {"ok": True, "live": {}}, "p40": {"ok": True, "live": {"state": "generating"}}},
+                "gateway": {"active": [{"endpoint": "p40", "app": "a"}], "recent": []}}
+        self.assertEqual(proxy._main_engine(snap)[0], "p40")
+        snap["gateway"] = {"active": [], "recent": [{"endpoint": "strata"}]}
+        self.assertEqual(proxy._main_engine(snap)[0], "strata")
+        snap["gateway"] = {}
+        self.assertEqual(proxy._main_engine(snap)[0], "strata")
+        render = proxy.render_live({"engines": {"p40": self.probe._poll_one(self.ep)}, "gateway": {}, "kv_sessions": {}})
+        self.assertIn("generating", render.plain)
+
+
 class ConsoleRenderTests(unittest.TestCase):
     """The console's panels, from a snapshot to text."""
 
