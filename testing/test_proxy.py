@@ -1283,6 +1283,44 @@ class KVSessionSwapTests(unittest.TestCase):
         self.assertEqual({c[0] for c in MockEngine.calls}, {"chat"})    # not even /slots, which would say 0
         self.assertEqual(proxy.kv_status_all()["eng"]["errors"], 1)
 
+    def test_a_chat_is_never_restored_under_another_model(self):
+        self._chat(self._conv("a"), model="eng:m1")
+        self._chat(self._conv("b"), model="eng:m1")        # a is saved, tagged m1
+        a_file = self._names("save")[0]
+        MockEngine.calls.clear()
+        self.assertEqual(self._chat(self._conv("a", "ok", "more"), model="eng:m2")[0], 200)
+        self.assertNotIn(a_file, self._names("restore"))     # m2 can't read a file m1 wrote
+        MockEngine.calls.clear()
+        self._chat(self._conv("a", "ok", "more"), model="eng:m1")
+        self.assertEqual(self._names("restore"), [a_file])   # m1 still can
+        tags = {e["file"]: e.get("model") for e in proxy._kv_managers["eng"].index.values()}
+        self.assertEqual(tags[a_file], "m1")
+
+    def test_a_file_the_engine_refuses_is_not_asked_for_again(self):
+        self._chat(self._conv("a"))
+        self._chat(self._conv("b"))
+        a_file = self._names("save")[0]
+        MockEngine.fail = {"restore": (400, "session file: saved with another model (model fingerprint differs)")}
+        self.assertEqual(self._chat(self._conv("a", "ok", "more"))[0], 200)   # swapping never breaks a request
+        self.assertEqual(self._names("restore"), [a_file])
+        kv = proxy.kv_status_all()["eng"]
+        self.assertTrue(next(c for c in kv["chats"] if c["id"] == a_file[3:-4])["stale"])
+        self.assertIsNone(kv["suspended"])                   # only that file, not all swapping
+        MockEngine.fail = {}
+        MockEngine.calls.clear()
+        self._chat(self._conv("c"))
+        self._chat(self._conv("a", "ok", "more", "again"))
+        self.assertNotIn(a_file, self._names("restore"))     # never asked again (its newer copy may be)
+        with open(proxy._kv_managers["eng"]._index_path(), encoding="utf-8") as f:
+            self.assertIn(a_file, f.read())                  # still indexed, so max_gb can delete it
+
+    def test_an_untagged_chat_from_before_tags_may_still_be_restored(self):
+        same = proxy.KVSessionManager._same_model
+        self.assertTrue(same("", "m1"))
+        self.assertTrue(same("m1", ""))
+        self.assertTrue(same("m1", "m1"))
+        self.assertFalse(same("m1", "m2"))
+
     def test_a_broken_restore_does_the_same(self):
         self._chat(self._conv("a"))
         self._chat(self._conv("b"))
@@ -1465,7 +1503,7 @@ class KVSessionSwapTests(unittest.TestCase):
         with open(self._index_file(), encoding="utf-8") as f:
             text = f.read()
         held = json.loads(text)["held"]
-        self.assertEqual(sorted(held), ["app", "chain", "dirty", "engine", "id", "lens", "tokens"])
+        self.assertEqual(sorted(held), ["app", "chain", "dirty", "engine", "id", "lens", "model", "tokens"])
         for words in ("You help.", "a" * 50, "more"):
             self.assertNotIn(words, text)
 
@@ -3028,6 +3066,117 @@ def run_healer(stream: bytes, tools=None, step=None, **cfg):
 
 READ_BLOCK = '<tool_call>\n<function=read_files>\n<parameter=files>\n[{"path": "c:\\\\demo\\\\src\\\\app.mjs", "start_line": 10}]\n</parameter>\n</function>\n</tool_call>'
 READ_ARGS = {"files": [{"path": "c:\\demo\\src\\app.mjs", "start_line": 10}]}
+
+
+SEARCH_TOOL = {"type": "function", "function": {"name": "web_search", "parameters": {
+    "type": "object", "properties": {"query": {"type": "string"}, "count": {"type": "integer"}}}}}
+WRITE_TOOL = {"type": "function", "function": {"name": "write_file", "parameters": {
+    "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}
+ACT_TOOL = {"type": "function", "function": {"name": "act", "parameters": {
+    "type": "object", "properties": {"action": {"type": "string"}, "params": {"type": "object"}}}}}
+
+
+class InFlightStatsTests(unittest.TestCase):
+    """A running request shows its counts while it runs, a held tool call included."""
+
+    def _req(self):
+        return proxy._RequestStats({"name": "up"}, "/v1/chat/completions", "m", "127.0.0.1", "Cline", True)
+
+    def test_a_tool_call_being_written_shows_counts_and_speed(self):
+        req = self._req()
+        req.tap.feed(sse_native("execute_command", '{"command": "dir", "requires_approval": false}', finish=None, done=False), True)
+        req.tap.first_token -= 2.0                           # as if the pieces came over two seconds
+        view = proxy._active_view(req, time.time())
+        self.assertEqual(view["phase"], "tool call")
+        self.assertEqual(view["calls"], 1)
+        self.assertGreaterEqual(view["out"], 2)
+        self.assertIn("tok_s", view)
+        self.assertNotIn("dir", json.dumps(view))            # counts only, never the text
+
+    def test_before_the_first_byte_it_is_waiting(self):
+        view = proxy._active_view(self._req(), time.time())
+        self.assertEqual((view["phase"], view["out"]), ("waiting", 0))
+
+    def test_the_console_lists_running_requests(self):
+        snap = {"gateway": {"active": [{"endpoint": "lmstudio", "model": "m", "app": "[/]odd", "elapsed_s": 12.0,
+                                        "phase": "tool call", "out": 1234, "tok_s": 21.5, "calls": 1}]}}
+        text = proxy.panel_engine(snap).plain
+        self.assertIn("tool call", text)
+        self.assertIn("21.5 t/s", text)
+        self.assertIn("[/]odd", text)                        # a client's name is never markup
+
+
+class LiveToolCallTests(unittest.TestCase):
+    """Structured calls to tools that can't run or write anything stream as they are written."""
+
+    TOOLS = [SEARCH_TOOL, WRITE_TOOL, ACT_TOOL] + CLINE_TOOLS
+
+    def _before_finish(self, name, args, **cfg):
+        """What the client has before the engine says the reply is over."""
+        healer = proxy.ToolHealer({"enabled": True, **cfg}, {"tools": self.TOOLS})
+        return healer, healer.feed(sse_native(name, args, finish=None, done=False))
+
+    def test_a_search_call_streams_live_and_ends_the_same(self):
+        args = json.dumps({"query": "weather riyadh", "count": 3})
+        healer, early = self._before_finish("web_search", args)
+        self.assertIn(b'"web_search"', early)
+        self.assertIn(b"riyadh", early)                       # the arguments too, as written
+        whole = early + healer.feed(_sse(_delta({}, "tool_calls")) + _sse(b"[DONE]")) + healer.finish()
+        self.assertEqual(whole, sse_native("web_search", args))   # byte for byte
+        self.assertEqual(healer.result, {})
+
+    def test_command_and_file_tools_are_still_held(self):
+        for name, args in (("execute_command", '{"command": "dir", "requires_approval": false}'),
+                           ("write_file", '{"path": "c:\\\\demo\\\\a.txt", "content": "x"}'),
+                           ("act", '{"action": "run_powershell", "params": {"script": "Get-Date"}}'),
+                           ("not_declared", '{"query": "x"}')):
+            _h, early = self._before_finish(name, args)
+            self.assertNotIn(name.encode(), early, name)
+
+    def test_a_held_call_after_a_live_one_is_still_judged(self):
+        healer = proxy.ToolHealer({"enabled": True}, {"tools": self.TOOLS})
+        live = _sse(_delta({"tool_calls": [{"index": 0, "id": "up_1", "type": "function",
+                                             "function": {"name": "web_search", "arguments": '{"query": "x"}'}}]}))
+        risky = _sse(_delta({"tool_calls": [{"index": 1, "id": "up_2", "type": "function",
+                                              "function": {"name": "execute_command",
+                                                           "arguments": '{"command": "rm -rf /", "requires_approval": false}'}}]}))
+        early = healer.feed(live + risky)
+        self.assertIn(b"web_search", early)
+        self.assertNotIn(b"rm -rf", early)
+        rest = healer.feed(_sse(_delta({}, "tool_calls")) + _sse(b"[DONE]")) + healer.finish()
+        view = read_reply(early + rest)
+        self.assertEqual(view["calls"][0]["name"], "web_search")
+        self.assertTrue(view["calls"][1]["name"].startswith("gateway_stopped_") or view["calls"][1]["name"] == "ask_question")
+        self.assertNotIn("execute_command", [c["name"] for c in view["calls"]])   # never sent to run
+        self.assertEqual(healer.result["stopped"], 1)
+
+    def test_a_cut_off_live_call_goes_out_as_it_came(self):
+        healer, early = self._before_finish("web_search", '{"query": "par')
+        self.assertIn(b"par", early)
+        self.assertEqual(early + healer.finish(), sse_native("web_search", '{"query": "par', finish=None, done=False))
+
+    def test_no_live_calls_while_a_repeat_stop_could_apply(self):
+        args = '{"query": "x"}'
+        turn = {"role": "assistant", "content": None,
+                "tool_calls": [{"id": "c", "type": "function", "function": {"name": "web_search", "arguments": args}}]}
+        messages = [{"role": "user", "content": "go"}] + [turn, {"role": "tool", "tool_call_id": "c", "content": "r"}] * 3
+        healer = proxy.ToolHealer({"enabled": True, "stop_repeats": True}, {"tools": self.TOOLS, "messages": messages})
+        early = healer.feed(sse_native("web_search", args, finish=None, done=False))
+        self.assertNotIn(b"web_search", early)                # R1 may stop it: held
+        rest = healer.feed(_sse(_delta({}, "tool_calls")) + _sse(b"[DONE]")) + healer.finish()
+        self.assertEqual(healer.result.get("rule"), "R1")
+        self.assertNotIn(b"web_search", rest)
+
+    def test_which_tools_may_stream(self):
+        self.assertTrue(proxy._live_tool(SEARCH_TOOL["function"]))
+        self.assertTrue(proxy._live_tool({"name": "now"}))
+        for tool in (WRITE_TOOL, ACT_TOOL):
+            self.assertFalse(proxy._live_tool(tool["function"]), tool["function"]["name"])
+        self.assertFalse(proxy._live_tool({"name": "bash", "parameters": {"type": "object", "properties": {}}}))
+        self.assertFalse(proxy._live_tool({"name": "x", "parameters": {"type": "object", "properties": {}, "additionalProperties": True}}))
+        self.assertFalse(proxy._live_tool({"name": "x", "parameters": {"type": "object", "properties": {"q": {"anyOf": [{"type": "string"}]}}}}))
+        self.assertTrue(proxy._live_tool({"name": "x", "parameters": {"type": "object", "properties": {
+            "tags": {"type": "array", "items": {"type": "string"}}, "mode": {"enum": ["a", "b"]}}}}))
 
 
 class ToolTextTests(unittest.TestCase):

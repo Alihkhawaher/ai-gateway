@@ -1544,6 +1544,7 @@ class KVSessionManager:
         self._idle_thread = None
         self._last_target = None
         self._slot_dir = ""
+        self._refused = {}          # session id → the engine load (host, key) that refused to restore it; memory only
 
     # ── logging and persistence ─────────────────────────────────────────
     def _log(self, msg: str):
@@ -1588,7 +1589,7 @@ class KVSessionManager:
             return {"chain": list(chain), "lens": [int(n) for n in lens],
                     "id": sid if isinstance(sid, str) and sid else None, "tokens": tokens,
                     "dirty": bool(rec.get("dirty", True)), "app": str(rec.get("app") or ""),
-                    "engine": str(rec.get("engine") or "")}
+                    "engine": str(rec.get("engine") or ""), "model": str(rec.get("model") or "")}
         except (TypeError, ValueError):
             return None
 
@@ -1599,7 +1600,7 @@ class KVSessionManager:
             return None
         return {"chain": list(cur["chain"]), "lens": list(cur["lens"]), "id": cur.get("id"),
                 "tokens": int(cur.get("tokens") or 0), "dirty": bool(cur.get("dirty")),
-                "app": cur.get("app", ""), "engine": cur.get("engine", "")}
+                "app": cur.get("app", ""), "engine": cur.get("engine", ""), "model": cur.get("model", "")}
 
     def _held_signature(self):
         rec = self._held_record()
@@ -1712,19 +1713,34 @@ class KVSessionManager:
         self._log("trying session swap again: " + ("the model was reloaded" if s["load"] != tuple(target[:2]) else "time is up"))
         return False
 
+    # ── which saved chats this request may use ──────────────────────────
+    @staticmethod
+    def _same_model(tag, model: str) -> bool:
+        """A chat saved under one model can't be restored under another (Strata: "saved with
+        another model (model fingerprint differs)"). An untagged chat, from before tags, may try."""
+        return not tag or not model or tag == model
+
+    def _usable(self, e: dict, model: str, load) -> bool:
+        return (self._same_model(e.get("model"), model) and not e.get("stale")
+                and (load is None or self._refused.get(e.get("id")) != load))
+
     # ── the decision (pure: no I/O) ─────────────────────────────────────
-    def _plan(self, cur, req: KVChain) -> dict:
+    def _plan(self, cur, req: KVChain, model: str = "", load=None) -> dict:
         cfg = self.cfg
         cur_chars = 0
         cur_total = 0
-        if cur and cur.get("chain"):
+        # Another model's chat is never "this chat" (it is still saved, under its own model).
+        same = bool(cur and cur.get("chain") and self._same_model(cur.get("model"), model))
+        if same:
             _n, cur_chars = _kv_common(cur["chain"], cur["lens"], req.hashes)
             cur_total = cur["lens"][-1]
-        if cur and cur.get("chain") and cur_chars >= _KV_KEEP_RATIO * cur_total:
+        if same and cur_chars >= _KV_KEEP_RATIO * cur_total:
             return {"keeps": True, "save": False, "restore": None}
         save = bool(cur and cur.get("chain") and cur.get("dirty") and cur["tokens"] >= cfg["min_tokens"])
         best, best_chars = None, 0
         for e in self.index.values():
+            if not self._usable(e, model, load):
+                continue
             _n, chars = _kv_common(e["chain"], e["lens"], req.hashes)
             if chars > best_chars or (best and chars == best_chars and e.get("last_used", 0) > best.get("last_used", 0)):
                 best, best_chars = e, chars
@@ -1749,6 +1765,7 @@ class KVSessionManager:
             "tokens": int(r.get("n_saved") or cur["tokens"]), "bytes": int(r.get("n_written") or 0),
             "saved_at": now, "last_used": now, "app": cur.get("app") or before.get("app", ""),
             "restores": int(before.get("restores", 0)),
+            "model": cur.get("model") or before.get("model", ""),
         }
         cur["id"] = sid
         cur["dirty"] = False
@@ -1762,19 +1779,22 @@ class KVSessionManager:
         self._evict()
         return took
 
-    def _restore(self, target, entry):
+    def _restore(self, target, entry, model: str = ""):
         t0 = time.time()
         r = self._slot_action(target, "restore", entry["file"])
         took = time.time() - t0
         entry["last_used"] = time.time()
         entry["restores"] = int(entry.get("restores", 0)) + 1
+        if model and not entry.get("model"):
+            entry["model"] = model      # an untagged chat from before tags: it restores under this model
         held = self._slot_state(target)
         self.stats["restores"] += 1
         self.stats["restore_s"] += took
         self.stats["restored_tokens"] += int(r.get("n_restored") or 0)
         self.current = {"chain": list(entry["chain"]), "lens": list(entry["lens"]), "id": entry["id"],
                         "tokens": held[0] if held else int(r.get("n_restored") or entry.get("tokens", 0)),
-                        "dirty": False, "app": entry.get("app", ""), "engine": target[0]}
+                        "dirty": False, "app": entry.get("app", ""), "engine": target[0],
+                        "model": entry.get("model", "")}
         self._save_index()
         self.last_event = f"restored {entry['id']}: {int(r.get('n_restored') or 0):,} tokens in {took:.1f} s"
         self._log(self.last_event)
@@ -1794,7 +1814,8 @@ class KVSessionManager:
             self._log("over max_gb but the engine's session folder is unknown (set slot_dir): nothing deleted")
             return
         keep = self.current.get("id") if self.current else None
-        for e in sorted(self.index.values(), key=lambda x: x.get("last_used", 0)):
+        # Chats the engine refuses to restore go first: they can't be used again.
+        for e in sorted(self.index.values(), key=lambda x: (not x.get("stale"), x.get("last_used", 0))):
             if total <= limit:
                 break
             name = e.get("file", "")
@@ -1811,6 +1832,16 @@ class KVSessionManager:
             del self.index[e["id"]]
             self._log(f"deleted {name} (over {self.cfg['max_gb']:g} GB)")
         self._save_index()
+
+    def _refuse(self, entry: dict, target, error):
+        """The engine wouldn't restore this chat. Don't ask again for this engine load; when it said
+        the file belongs to another model or config ("fingerprint differs"), never again. The entry
+        stays in the index, so max_gb eviction can still delete its file."""
+        self._refused[entry["id"]] = tuple(target[:2])
+        if "fingerprint" in str(error).lower() and not entry.get("stale"):
+            entry["stale"] = "fingerprint"
+            self._save_index()
+            self._log(f"saved chat {entry['id']} can't be restored by this engine (fingerprint differs): not tried again")
 
     def _revalidate(self, target):
         """After something went wrong: keep `current` only if the engine still
@@ -1859,7 +1890,7 @@ class KVSessionManager:
                     or held == 0 or abs(held - cur["tokens"]) > max(64, 0.02 * cur["tokens"])):
             self._log("the engine no longer holds the conversation tracked here (restarted, or used directly): not saving it")
             cur = self.current = None
-        plan = self._plan(cur, t.chain)
+        plan = self._plan(cur, t.chain, t.model, tuple(target[:2]))
         if plan["restore"] and cur is None and held >= self.cfg["min_tokens"]:
             # The engine holds a long chat this gateway can't name: it may be this very chat, newer
             # than any saved copy. A restore would throw it away unsaved, so let the engine reuse it.
@@ -1877,7 +1908,7 @@ class KVSessionManager:
                 t.swap_s += self._save_current(target)
             if plan["restore"]:
                 doing = "restore"
-                t.swap_s += self._restore(target, plan["restore"])
+                t.swap_s += self._restore(target, plan["restore"], t.model)
                 t.event = "restored"
         except _KVError as e:
             self.stats["errors"] += 1
@@ -1895,11 +1926,13 @@ class KVSessionManager:
             if e.status == 404 and plan["restore"]:
                 self.index.pop(plan["restore"]["id"], None)
                 self._save_index()
+            elif doing == "restore" and plan["restore"]:
+                self._refuse(plan["restore"], target, e)
             self._log(f"swap failed: {e}")
             self._revalidate(target)
         # Does this request continue what the engine holds now? Then it inherits its session id.
         cur = self.current
-        if cur and cur.get("chain"):
+        if cur and cur.get("chain") and self._same_model(cur.get("model"), t.model):
             _n, chars = _kv_common(cur["chain"], cur["lens"], t.chain.hashes)
             if chars >= _KV_KEEP_RATIO * cur["lens"][-1]:
                 t.inherit_id = cur.get("id")
@@ -1913,7 +1946,7 @@ class KVSessionManager:
                 if ok and st:
                     self.current = {"chain": list(t.chain.hashes), "lens": list(t.chain.lens),
                                     "id": t.inherit_id, "tokens": st[0], "dirty": True, "app": t.app,
-                                    "engine": t.target[0]}
+                                    "engine": t.target[0], "model": t.model}
                     if t.event in ("continued", "new"):
                         self.stats[t.event] += 1
                 else:
@@ -1995,7 +2028,7 @@ class KVSessionManager:
             "last_event": self.last_event,
             "chats": [{"id": e["id"], "app": e.get("app", ""), "tokens": int(e.get("tokens", 0)),
                        "bytes": int(e.get("bytes", 0)), "last_used": e.get("last_used", 0),
-                       "restores": int(e.get("restores", 0))} for e in recent],
+                       "restores": int(e.get("restores", 0)), "stale": bool(e.get("stale"))} for e in recent],
             **self.stats,
         }
 
@@ -2421,6 +2454,27 @@ class _RequestStats:
         self.heal = None            # what the tool call healer did: counts and a rule id
 
 
+def _active_view(r, now: float) -> dict:
+    """A request still running, as the console shows it: counts read from the reply as it passes
+    the gateway, before the healer, so a call held back is counted too. Never any text."""
+    view = {"endpoint": r.ep_name, "model": r.model, "app": r.app, "elapsed_s": round(now - r.started, 1)}
+    try:
+        tap = r.tap
+        first, last, pieces = tap.first_token, tap.last_token, tap.deltas
+        view["out"] = int(tap.usage.get("out") or pieces or 0)
+        view["calls"] = tap.calls
+        if first is None:
+            view["phase"] = "waiting" if tap.first_byte is None else "reading"
+        else:
+            view["phase"] = "tool call" if tap.calls else ("thinking" if tap.reasoning_chars and not tap.text_chars else "writing")
+            view["ttft_s"] = round(first - r.started, 2)
+            if last and last - first >= 0.5 and pieces > 1:
+                view["tok_s"] = round((pieces - 1) / (last - first), 1)
+    except Exception:  # noqa: BLE001 - a number it can't read is a number it leaves out
+        pass
+    return view
+
+
 class GatewayStats:
     """Everything the console shows about traffic. Thread-safe, in memory, with
     the all-time totals in gateway-stats.json beside config.json (gitignored)."""
@@ -2660,8 +2714,7 @@ class GatewayStats:
             per_minute = {m[0]: m for m in self.minutes}
             return {
                 "uptime_s": round(now - self.started),
-                "active": [{"endpoint": r.ep_name, "model": r.model, "app": r.app, "elapsed_s": round(now - r.started, 1)}
-                           for r in self.active.values()],
+                "active": [_active_view(r, now) for r in self.active.values()],
                 "session": dict(self.session),
                 "today": dict(today),
                 "all_time": {k: self.life[k] for k in list(_new_agg()) + ["since"]},
@@ -3950,6 +4003,44 @@ def _decode_params(call: dict, tools: dict) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+# A structured call to a tool that can't run or write anything may stream live (see ToolHealer).
+# Its parameters must all be plain values, and none may have a name that carries a command, a
+# path, code or free-form arguments: the guard reads those from any tool's arguments.
+_LIVE_SCALARS = {"string", "number", "integer", "boolean"}
+_LIVE_BLOCKED_KEYS = set(_COMMAND_KEYS) | {
+    "path", "file_path", "target_file", "files", "edits", "paths", "file_paths",
+    "code", "args", "arguments", "input", "content", "diff", "patch", "source", "destination",
+    "sql", "program", "expression", "body"}
+
+
+def _live_tool(function) -> bool:
+    """Can calls to this declared tool stream as they are written? Conservative: unsure is no."""
+    try:
+        if not isinstance(function, dict) or str(function.get("name") or "").lower() in _GUARDED_TOOLS:
+            return False
+        params = function.get("parameters")
+        if params is None:
+            return True                                     # takes nothing
+        if not isinstance(params, dict) or params.get("additionalProperties"):
+            return False
+        props = params.get("properties") or {}
+        if not isinstance(props, dict):
+            return False
+        for name, spec in props.items():
+            if str(name).lower() in _LIVE_BLOCKED_KEYS or not isinstance(spec, dict):
+                return False
+            kind = spec.get("type")
+            if kind == "array":
+                items = spec.get("items")
+                if not isinstance(items, dict) or items.get("type") not in _LIVE_SCALARS:
+                    return False
+            elif kind not in _LIVE_SCALARS and not (kind is None and isinstance(spec.get("enum"), list)):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _tools_shell(tools: dict) -> str:
     """Which shell the client runs commands in, from how its tool describes itself."""
     for function in tools.values():
@@ -3996,6 +4087,8 @@ class ToolHealer:
         self._text = None           # held content, from where a call seems to start
         self._text_size = 0
         self._native = {}           # index -> id, name, arguments of structured calls
+        self._live = set()          # indexes of structured calls that stream as written (see _decide)
+        self._hold_rest = False     # a call had to be held: everything after it is held too
         self._held = []             # raw events that wait for the verdict
         self._after = []            # raw events after the finish reason
         self._finish = None
@@ -4016,10 +4109,11 @@ class ToolHealer:
                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **(extra or {})}
         return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
-    def _tool_chunks(self, calls: list) -> bytes:
+    def _tool_chunks(self, calls: list, start: int = 0) -> bytes:
+        """The calls as stream events, from index `start` on (after any calls already sent live)."""
         out = [self._chunk({"tool_calls": [{"index": i, "id": f"call_gw_{i + 1}", "type": "function",
                                             "function": {"name": call["name"], "arguments": call["arguments"]}}]})
-               for i, call in enumerate(calls)]
+               for i, call in enumerate(calls, start)]
         usage = {k: self._finish_obj[k] for k in ("usage", "timings") if k in self._finish_obj}
         out.append(self._chunk({}, "tool_calls", usage))
         return b"".join(out) + b"".join(self._after)
@@ -4061,26 +4155,61 @@ class ToolHealer:
             pass
         return None
 
-    def _stop(self, rule: str, command=None) -> bytes:
+    def _stop(self, rule: str, command=None, start: int = 0) -> bytes:
         self.result = {"stopped": 1, "rule": rule}
-        return self._tool_chunks([self._stopped_call(rule, command)])
+        return self._tool_chunks([self._stopped_call(rule, command)], start)
 
     def _was_cut(self) -> bool:
         """An engine may leave the finish reason out: [DONE] then says the reply ended well."""
         return self._finish not in ("stop", "tool_calls", "function_call") if self._finish else not self._done
 
     def _resolve_native(self) -> bytes:
-        calls = [self._native[i] for i in sorted(self._native)]
+        held = [i for i in sorted(self._native) if i not in self._live]
+        if not held:                    # every call went out live: only the finish may wait here
+            return b"".join(self._held) + b"".join(self._after)
+        calls = [self._native[i] for i in held]
+        start = held[0] if self._live else 0
         if self.allow is not None and self._was_cut() and "T1" not in self.allow:
             for call in calls:
                 if call["name"].lower() in _GUARDED_TOOLS or any(f'"{k}"' in call["arguments"] for k in _COMMAND_KEYS):
-                    return self._stop("T1")
+                    return self._stop("T1", None, start)
         rule, command = self._judge(calls)
         if rule:
-            return self._stop(rule, command)
+            return self._stop(rule, command, start)
         if self._rewrite_native:
-            return self._tool_chunks(calls)
+            return self._tool_chunks(calls, start)
         return b"".join(self._held) + b"".join(self._after)
+
+    # ── calls that stream as they are written ───────────────────────────
+    def _live_ok(self, index: int, name: str) -> bool:
+        """May this structured call go to the client as it is written? Only when no verdict could
+        change it: a declared tool that can't run or write anything (_live_tool), and never while
+        a repeat stop could still apply (R1: the chat is at the limit; R2: this many calls in one reply)."""
+        if self.repeat_limit and (self._run_count >= self.repeat_limit or index >= self.repeat_limit):
+            return False
+        if self.allow is None:          # no guard: only the repeat stop could have changed it
+            return True
+        return name in self.tools and _live_tool(self.tools[name])
+
+    def _decide(self) -> bytes:
+        """Settle calls whose name is complete (their arguments began, or a later call did). While
+        every call so far may stream live, hand over what waited for that; the first call that may
+        not is held with everything after it, until the reply is judged."""
+        if self._hold_rest or self._text is not None or self._tail:
+            return b""
+        last = max(self._native) if self._native else None
+        for i in sorted(self._native):
+            if i in self._live:
+                continue
+            call = self._native[i]
+            if i == last and not call["arguments"]:
+                return b""              # the name may still be arriving
+            if not self._live_ok(i, call["name"]):
+                self._hold_rest = True
+                return b""
+            self._live.add(i)
+        out, self._held = b"".join(self._held), []
+        return out
 
     def _resolve_text(self) -> bytes:
         text = "".join(self._text)
@@ -4151,7 +4280,7 @@ class ToolHealer:
 
     # ── one SSE event ───────────────────────────────────────────────────
     def _holding(self) -> bool:
-        return self._text is not None or bool(self._native)
+        return self._text is not None or any(i not in self._live for i in self._native)
 
     def _event(self, raw: bytes) -> bytes:
         data = None
@@ -4209,14 +4338,24 @@ class ToolHealer:
                                                       ensure_ascii=False).encode("utf-8") + b"\n\n")
         calls = delta.get("tool_calls")
         finish_in_held = False
+        finish_sent = False
         if isinstance(calls, list) and calls:
             self._note_native(calls)
             if pass_raw:                # the raw event carries any finish reason with it
-                self._held.append(raw)
-                finish_in_held = True
+                event = raw
             else:
-                self._held.append(b"data: " + json.dumps({**obj, "choices": [{**choice, "delta": {"tool_calls": calls}, "finish_reason": None}]},
-                                                         ensure_ascii=False).encode("utf-8") + b"\n\n")
+                event = (b"data: " + json.dumps({**obj, "choices": [{**choice, "delta": {"tool_calls": calls}, "finish_reason": None}]},
+                                                ensure_ascii=False).encode("utf-8") + b"\n\n")
+            indexes = {item.get("index", 0) for item in calls if isinstance(item, dict)}
+            if self._text is None and indexes and indexes <= self._live:
+                out.append(event)       # a call already streaming live
+                finish_sent = pass_raw
+            else:
+                self._held.append(event)
+                finish_in_held = pass_raw
+                out.append(self._decide())
+                if finish_in_held and not self._held:
+                    finish_in_held, finish_sent = False, True   # it went out with the calls
             pass_raw = False
         finish = choice.get("finish_reason")
         if finish:
@@ -4231,7 +4370,7 @@ class ToolHealer:
                 if rescued is not None:
                     self._resolved = True
                     return b"".join(out) + rescued
-            if not pass_raw:
+            if not pass_raw and not finish_sent:
                 out.append(self._finish_event(obj, choice))
         return raw if pass_raw else b"".join(out)
 
@@ -6866,6 +7005,19 @@ def render_live(snap: dict) -> RichText:
     return _lines(rows)
 
 
+def _active_parts(a: dict):
+    """One running request: where it is going, what it is doing and how fast, counts only."""
+    route = f"  {str(a.get('app') or '')[:14]} → {str(a.get('endpoint') or '')[:12]} "  # _line appends it as plain text
+    phase = a.get("phase") or "waiting"
+    bits = [phase]
+    if a.get("out"):
+        bits.append(f"{fmt_count(a['out'])} out")
+    if a.get("tok_s"):
+        bits.append(f"{a['tok_s']:.1f} t/s")
+    bits.append(fmt_secs(a.get("elapsed_s")))
+    return route, (" · ".join(bits), _YELLOW if phase == "tool call" else "dim")
+
+
 def panel_engine(snap: dict):
     gw = snap.get("gateway") or {}
     name, engine = _main_engine(snap)
@@ -6887,6 +7039,8 @@ def panel_engine(snap: dict):
     queued = (engine.get("live", {}).get("queued") or 0) if engine else 0
     if active:
         rows.append(_line("In flight", f"{len(active)} · " + ", ".join(sorted({a['app'][:14] for a in active}))[:60]))
+        for a in sorted(active, key=lambda a: -(a.get("elapsed_s") or 0))[:3]:
+            rows.append(_line("", *_active_parts(a)))
     else:
         rows.append(_line("In flight", ("none", "dim")))
     if queued:

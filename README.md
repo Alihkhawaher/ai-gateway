@@ -212,7 +212,8 @@ It's off by default, and then every reply passes byte for byte. When it's on, it
 | No answer and no call, but the reasoning ends with `</think>` followed by complete calls in Gemma 4's format (`<\|tool_call>call:name{…}<tool_call\|>`) | Proper tool calls. This happens with Gemma 4 finetunes on LM Studio: the model closes its thinking with the wrong tag, so the server leaves the call inside the reasoning and the agent stops |
 | A call in a code fence, or a tag mentioned in a sentence | The text, unchanged: that's a quotation |
 | A written call that is incomplete or was cut off | The text, unchanged. It never runs |
-| A proper tool call that is safe | The same bytes, held until the whole call has arrived |
+| A proper call to a tool that can't run or write anything (search, fetch, read-style tools with plain parameters) | The same bytes, streamed as they're written |
+| A proper call to a command, file or other tool | The same bytes, held until the whole call has arrived and been checked |
 | A command the guard stops | A question to you, or a message to the model (below) |
 
 Tool names are never guessed, and parameter values are never edited.
@@ -260,7 +261,7 @@ What it can't do:
 - **It doesn't know the working folder,** so `rm -rf build` in the wrong folder passes.
 - **In bash, a line break can't be told from a damaged `\n`,** because multi-line scripts are normal there. PowerShell and cmd ask you when a delete's path runs straight into a line break, so a script with a delete like that gets a question. Put `-Recurse` last or use `;` to avoid it.
 - **A made-up tool name costs one retry,** and the model has to write the call again.
-- **Calls are held until they're complete,** so a long file edit appears all at once rather than streaming. Keep-alive chunks are sent while it waits.
+- **Calls that could run or write something are held until they're complete,** so a long file edit appears all at once rather than streaming. Keep-alive chunks are sent while it waits, and the console's **In flight** line shows the call's tokens and speed while it's written. Calls to tools that can't run or write anything stream live.
 - **It only reads `/chat/completions` replies.** `/v1/messages` and `/v1/responses` pass untouched, and so does anything the engine serves directly.
 
 Nothing about a reply is kept. The log and stats get counts and rule ids only.
